@@ -8,7 +8,8 @@ import re
 import socket
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import (HTTPDefaultErrorHandler, HTTPErrorProcessor, HTTPHandler,
+                            HTTPRedirectHandler, OpenerDirector, Request, build_opener)
 
 from .model_reasoning import reasoning_settings
 from .model_definitions import validate_catalog, selected_definition, MAX_CAPACITY
@@ -34,6 +35,16 @@ RESPONSE_SCHEMA = {
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+def _model_opener(request):
+    if request.type == 'https':
+        return build_opener(_NoRedirect())
+    # Validated HTTP endpoints are local. Avoid proxying them or initializing
+    # the system TLS certificate store for a plain HTTP request.
+    opener = OpenerDirector()
+    for handler in (HTTPHandler(), HTTPDefaultErrorHandler(), _NoRedirect(), HTTPErrorProcessor()):
+        opener.add_handler(handler)
+    return opener
 
 
 def load_api_config(config_file=None, *, base_url=None, model=None, api_key_env=None, protocol=None):
@@ -160,7 +171,7 @@ def generate_api(prompt, destination, *, config_file=None, base_url=None, model=
     # Never forward the key to a redirect destination. Do not log error bodies,
     # request headers or arbitrary provider fields that could contain credentials.
     try:
-        with build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
+        with _model_opener(request).open(request, timeout=timeout) as response:
             raw = response.read(256 * 1024 + 1)
     except HTTPError as exc:
         status = exc.code

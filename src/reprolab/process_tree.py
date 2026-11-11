@@ -4,12 +4,14 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import uuid
 
 
 class WindowsJob:
     def __init__(self):
         import win32job
-        self.handle = win32job.CreateJobObject(None, None)
+        # pywin32 requires a Unicode name even though Win32 accepts NULL.
+        self.handle = win32job.CreateJobObject(None, f"Local\\ReproLab-{uuid.uuid4().hex}")
         try:
             info = win32job.QueryInformationJobObject(self.handle, win32job.JobObjectExtendedLimitInformation)
             info['BasicLimitInformation']['LimitFlags'] |= win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
