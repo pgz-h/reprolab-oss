@@ -10,6 +10,8 @@ import subprocess
 import sys
 import tomllib
 
+from verify_desktop_payload import verify_desktop_payload
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -35,6 +37,7 @@ def main():
     executable = app/'ReproLab.exe'
     if not executable.is_file():
         raise RuntimeError('PyInstaller did not create the expected Windows executable.')
+    verify_desktop_payload(executable)
     subprocess.run([sys.executable, '-X', 'utf8', str(source/'packaging/verify_windows.py'),
         '--exe', str(executable), '--output', str(work/'acceptance')], cwd=source, env=env, check=True)
     # Only publish the portable bundle after all native acceptance checks pass.

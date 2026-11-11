@@ -26,7 +26,7 @@ The development branch includes CLI previews for [Vitest](docs/vitest.md) in Jav
 
 The **0.19.0a21 Alpha candidate** focuses on Python and pytest. It includes the desktop workbench, a single-command CLI review and evidence bundles with review history. Vitest 4 is available as a CLI preview. See the [changes](CHANGELOG.md), [platform status](docs/platforms.md) and [validation notes](docs/release-readiness.md).
 
-The macOS arm64 desktop build uses an ad-hoc signature. Windows x64 native validation and packaging are pending. Downloadable builds are listed in Releases.
+The macOS arm64 desktop build uses an ad-hoc signature. A Windows x64 development candidate passed native checks and frozen executable acceptance in GitHub Actions. The unsigned candidate is available as an Actions artifact. Downloadable builds are listed in Releases.
 
 ## Choose a workflow
 
@@ -82,7 +82,7 @@ See [runtime variables](docs/runtime-variables.md) for configuration and support
 
 ## Boundaries
 
-Trusted code only: collection, configuration, fixtures and tests may execute arbitrary code with current-user file and network access. Subprocesses and copies are not a security sandbox. Windows is unsupported; runtime behavior outside the local macOS arm64 environment remains unverified.
+Trusted code only: collection, configuration, fixtures and tests may execute arbitrary code with current-user file and network access. Subprocesses and copies are not a security sandbox. See the [validation notes](docs/release-readiness.md) for the platforms and workflows exercised.
 
 Evidence consistency, the ability to rerun a check, and repeated identical results are different properties. Dependencies, external services, time and randomness are not fully frozen.
 

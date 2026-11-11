@@ -47,4 +47,4 @@
 
 环境、凭据、本机设置、工作项目、完整日志及安装产物留在源码仓库之外。公开源码审阅副本由现有发布脚本按白名单生成，不包含开发 Git 历史或本机 AGENTS.md；它是交付材料，唯一开发目录继续保留。
 
-新公开仓库地址尚未确定，文档使用相对链接。确定地址并实际发布后再添加仓库和下载入口，不放虚构徽章、下载量或未发生的发布记录。
+公开源码和预发行包见 [ReproLab 公开仓库](https://github.com/pgz-h/reprolab-oss)及其 [Releases](https://github.com/pgz-h/reprolab-oss/releases)。

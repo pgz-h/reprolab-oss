@@ -1,6 +1,6 @@
 # Windows x64 指南
 
-Windows x64 与 macOS 共用源码。当前 **0.19.0a21** 的 Windows 原生验收与 `.exe` 构建待执行。
+Windows x64 与 macOS 共用源码。开发分支的 `90bf648` 已在 Windows x64 GitHub Actions 通过原生检查和实际 `.exe` 验收，生成未签名便携候选包。 [验收记录](https://github.com/pgz-h/reprolab-oss/actions/runs/43006106781#artifacts)
 
 ## 已整理的适配
 
@@ -11,7 +11,7 @@ Windows x64 与 macOS 共用源码。当前 **0.19.0a21** 的 Windows 原生验�
 - 明确文本文件和隔离 Python 的 UTF-8 设置，覆盖中文及带空格路径；虚拟环境使用 `Scripts/python.exe`。
 - 增加 Windows x64 构建脚本、实际冻结 exe 验收脚本和自动构建工作流。
 
-以上 Windows API 路径仍需在 Windows 上执行测试；当前 Mac 检查不能代替原生结果。源码副本和 Job Object 不是安全沙箱，只运行可信项目。
+源码副本和 Job Object 不是安全沙箱，只运行可信项目。
 
 ## 从源码试用
 
@@ -34,9 +34,9 @@ py -3 -m venv .venv
 
 1. 文件锁、受保护文件 DACL、取消和正常退出后的子进程清理。
 2. 冻结应用的内置与历史案例、中文路径、项目比较、证据导出导入和重放。
-3. 冻结应用的 Qt 基础、首次接入、可撤销配置，以及本地模拟模型流程。
+3. 从构建环境中已安装的 Python 包运行 Qt 离屏检查，覆盖首次接入、可撤销配置和本地模拟模型流程。
 
-只有验收通过才生成 `ReproLab-0.19.0a21-Windows-x64.zip` 便携包，内含 `ReproLab/ReproLab.exe` 与依赖文件。解压整个目录后启动 exe；不要只复制单个 exe。
+只有验收通过才生成 `ReproLab-<version>-Windows-x64.zip` 便携包，内含 `ReproLab/ReproLab.exe` 与依赖文件。解压整个目录后启动 exe；不要只复制单个 exe。
 
 工作流产物位于 Actions 的 Artifacts，**不会自动发布 GitHub Release**。原生失败记录单独保留。Windows runner 的 Qt offscreen 检查仍需补充实际用户桌面安装、输入与界面验收。
 
@@ -46,7 +46,7 @@ py -3 -m venv .venv
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install "PyInstaller==6.22.3" "build>=1.2"
-.\.venv\Scripts\python.exe -X utf8 packaging/build_windows.py --work-root "$env:TEMP\reprolab-build-a19" --output-dir "$env:TEMP\reprolab-release-a19"
+.\.venv\Scripts\python.exe -X utf8 packaging/build_windows.py --work-root "$env:TEMP\reprolab-build-candidate" --output-dir "$env:TEMP\reprolab-release-candidate"
 ```
 
 脚本调用 `verify_windows.py` 检查实际 exe，失败时停止，不生成可分发 ZIP。当前构建为未签名便携包，不生成安装向导或 MSI；签名与安装器可在核心原生流程通过后增加。
@@ -55,4 +55,4 @@ PyInstaller 需要在目标系统上构建，见[官方说明](https://pyinstall
 
 ## 当前边界
 
-Windows 原生测试、构建、签名和独立用户验收尚未执行；Windows ARM64 未包含。POSIX 权限与 Windows ACL 含义不同，跨系统证据包迁移及重放兼容性尚未验证，不能承诺已有 Mac 证据在 Windows 上直接重放。当前实际结果见[验证说明](release-readiness.md)。
+当前候选为未签名的 Windows x64 便携包。独立用户桌面验收、Windows ARM64 和跨平台重放仍待验证。POSIX 权限与 Windows ACL 含义不同，跨系统证据包迁移及重放兼容性尚未验证，不能承诺已有 Mac 证据在 Windows 上直接重放。当前实际结果见[验证说明](release-readiness.md)。
