@@ -1,0 +1,68 @@
+name: Test and build distribution
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-distribution:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: '3.11'
+            pytest: 'pytest>=8,<9'
+          - python: '3.14'
+            pytest: 'pytest>=9,<10'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install CLI and test runtime
+        run: python -m pip install . '${{ matrix.pytest }}'
+      - name: Check execution, comparison and evidence contracts
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: >-
+          python -m pytest -q -p no:cacheprovider
+          tests/test_runner.py tests/test_execution_boundary.py
+          tests/test_input_stability.py tests/test_result_persistence.py
+          tests/test_environment.py tests/test_evidence_bundle.py
+          tests/test_project_environment.py tests/test_project_recheck.py
+          tests/test_project_failure.py tests/test_pytest_profile.py
+          tests/test_project_conditions.py tests/test_recheck_shortcut.py
+          tests/test_environment_groups.py tests/test_project_diagnostics.py
+          tests/test_project_progress.py tests/test_project_config.py tests/test_execution_settings.py
+          tests/test_processing_history.py tests/test_release_preparation.py tests/test_desktop_store.py
+          tests/test_runtime_environment.py
+          tests/test_collection_recovery.py tests/test_recheck_progress.py
+          tests/test_environment_recovery.py tests/test_repair_drafts.py
+          tests/test_snapshot_children.py tests/test_conditional_xfail.py
+          tests/test_ai_api.py tests/test_model_catalog.py tests/test_model_reasoning.py tests/test_model_definitions.py tests/test_platform_support.py
+      - name: Install build tools
+        run: python -m pip install 'build>=1.2' 'setuptools>=77'
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Verify installed wheel outside the checkout
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/reprolab-wheel-env"
+          "$RUNNER_TEMP/reprolab-wheel-env/bin/python" -m pip install dist/*.whl '${{ matrix.pytest }}'
+          "$RUNNER_TEMP/reprolab-wheel-env/bin/python" -I packaging/verify_install.py --output "$RUNNER_TEMP/reprolab-install-check"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-${{ matrix.python }}-distribution
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            ${{ runner.temp }}/reprolab-install-check/installation-check.json
+          if-no-files-found: error
+          retention-days: 14

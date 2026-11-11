@@ -1,0 +1,36 @@
+{
+  "project": "humanize",
+  "license": "MIT",
+  "scope": "Unmodified standalone filesize.py modules, not complete package installations",
+  "upstream_fix": "https://github.com/python-humanize/humanize/pull/250",
+  "files": {
+    "before/filesize.py": {
+      "upstream_path": "src/humanize/filesize.py",
+      "version": "4.12.2",
+      "commit": "15230fbfdcae5ca46fa831f656378b2275b88f53",
+      "url": "https://raw.githubusercontent.com/python-humanize/humanize/15230fbfdcae5ca46fa831f656378b2275b88f53/src/humanize/filesize.py",
+      "sha256": "8290c6257eb4cc58897e7c2294db4e81e92d6ff1048869a907e6a8cfb4512f7d"
+    },
+    "before/LICENCE": {
+      "upstream_path": "LICENCE",
+      "version": "4.12.2",
+      "commit": "15230fbfdcae5ca46fa831f656378b2275b88f53",
+      "url": "https://raw.githubusercontent.com/python-humanize/humanize/15230fbfdcae5ca46fa831f656378b2275b88f53/LICENCE",
+      "sha256": "8ba6c18112a431400ad3c743f70670079b302545d98884fc2f28a91c383a0380"
+    },
+    "after/filesize.py": {
+      "upstream_path": "src/humanize/filesize.py",
+      "version": "4.12.3",
+      "commit": "2968d44280a68f775db73ddeb2f2fc6c05edac84",
+      "url": "https://raw.githubusercontent.com/python-humanize/humanize/2968d44280a68f775db73ddeb2f2fc6c05edac84/src/humanize/filesize.py",
+      "sha256": "9ee01027cf001fb4259d7b36afcb95e8d8a14d3d1a7d15f5819b67bcfc28e87e"
+    },
+    "after/LICENCE": {
+      "upstream_path": "LICENCE",
+      "version": "4.12.3",
+      "commit": "2968d44280a68f775db73ddeb2f2fc6c05edac84",
+      "url": "https://raw.githubusercontent.com/python-humanize/humanize/2968d44280a68f775db73ddeb2f2fc6c05edac84/LICENCE",
+      "sha256": "8ba6c18112a431400ad3c743f70670079b302545d98884fc2f28a91c383a0380"
+    }
+  }
+}

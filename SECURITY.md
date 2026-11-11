@@ -1,0 +1,21 @@
+# Execution boundary
+
+ReproLab executes **trusted local Python code**. Subprocesses and temporary directories are not a security sandbox. Code can access files and network with the permissions of the launching user. Do not feed it arbitrary public repositories or tests from unknown contributors.
+
+The runner copies allowed source files before executing, disables pytest plugin autoload, skips project conftest/configuration in standalone mode, and forwards a small operational environment-variable allowlist plus explicitly declared project variables. Public values are saved with source evidence; required local values are supplied from the launching environment or supported desktop memory-only inputs. Missing local values stop execution. It does not automatically install dependencies or run installation hooks. These controls improve reproducibility; they do not contain hostile Python code.
+
+On POSIX, the worker process group is terminated after normal completion, timeout or interruption, so ordinary background helpers do not outlive a run. This is lifecycle cleanup, not a full CPU/memory/disk/network quota. Deliberately detached sessions are outside the trusted-code scope. Windows process-tree containment is not implemented and Windows is not a supported platform.
+
+HTML reports escape dynamic text and load no remote assets. Project Workbench reports include local inline JavaScript for search and filtering; this does not contact a service. Source snapshots, raw test output and test exception messages may still contain sensitive data. Review evidence before sharing.
+
+Use the repository Security tab to report a vulnerability privately when that feature is enabled. If no private reporting channel is available, open an issue requesting one without including sensitive details. Do not post credentials, private code or a sensitive reproduction in public issues. Maintainers should enable private vulnerability reporting before the first public release.
+
+Project mode intentionally executes trusted project conftest and explicitly declared plugins. Plugin autoload and configured addopts remain disabled. Static list-tests/init discovery parses source and does not import the project; selecting a Python environment does run that interpreter to inspect its Python/pytest availability. Saved recipes pin Git commits but do not lock all dependencies.
+
+AI drafting is opt-in. prepare reads selected committed text without contacting a model; generate sends the saved prompt to the explicitly configured OpenAI-compatible endpoint. Remote endpoints require HTTPS; HTTP is allowed only for loopback hostnames. Redirects are not followed and requests are not automatically retried. Store credentials in a local environment variable or a protected configuration file outside the source repository. Credentials and raw HTTP error bodies are not copied to drafts/reports; selected source and model responses may still contain project data. Context filtering is not a complete secret scanner.
+
+Generated code is untrusted until reviewed. The static draft validator rejects obvious structural mistakes but does not prove useful coverage or safe execution. Only run a reviewed draft you trust. Model provenance is informational, including author-declared provenance for external responses, and never changes the verifier verdict.
+
+Evidence ZIP import validates normalized relative paths, duplicates, file types, entry/size limits, manifest hashes and replay consistency before publishing a new directory. It does not execute imported code or install dependencies. Bundles contain project source/logs and are not redacted. SHA-256 manifests detect content mismatches, not author identity; a party able to replace both content and manifest can rewrite them. Review and trust code separately before replaying it.
+
+Runtime local values are not serialized by ReproLab into project configuration, desktop settings or condition metadata. Trusted test code can still print them into logs, exceptions or observations; exports are not automatically redacted. Reserved interpreter/plugin/loader variables cannot be overridden through runtime-variable declarations. Local-value equality across historical runs is unknown.

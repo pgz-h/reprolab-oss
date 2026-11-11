@@ -1,0 +1,49 @@
+name: 问题反馈 / Bug report
+description: 提供复现步骤与实际结果，帮助定位使用问题。
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请勿上传 API Key、私有源码或未经检查的完整证据包。
+        涉及凭据、隐私或安全漏洞时，请先查看仓库的 SECURITY.md。
+  - type: input
+    id: version
+    attributes:
+      label: ReproLab 版本
+      placeholder: 例如 0.19.0a14
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 使用环境
+      description: 操作系统、芯片架构、安装方式，以及项目 Python／pytest 版本。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 操作步骤
+      description: 说明从哪个入口开始、选择了什么版本，以及何时出现问题。
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 预期与实际结果
+      description: 包括界面状态、失败阶段和必要的错误消息。
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 已检查的日志片段或截图
+      description: 可选。请先去除凭据、个人路径与敏感项目内容。
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 分享检查
+      options:
+        - label: 我已检查提交内容，不包含凭据或不适合公开的数据。
+          required: true

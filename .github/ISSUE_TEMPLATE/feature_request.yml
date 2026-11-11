@@ -1,0 +1,21 @@
+name: 功能建议 / Feature request
+description: 描述想完成的任务与目前遇到的阻碍。
+labels: [enhancement]
+body:
+  - type: textarea
+    id: task
+    attributes:
+      label: 想完成什么任务？
+      description: 请描述实际场景，而不只是按钮或实现方式。
+    validations:
+      required: true
+  - type: textarea
+    id: friction
+    attributes:
+      label: 现在卡在哪里？
+    validations:
+      required: true
+  - type: textarea
+    id: expectation
+    attributes:
+      label: 希望怎样操作或看到什么结果？

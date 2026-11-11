@@ -1,0 +1,12 @@
+{
+  "title": "中文文件名让导出功能报错",
+  "description": "有人反馈：将报表保存为“销售报表.csv”时，程序报错，文件无法生成。修复方案移除旧代码对文件路径的 ASCII 限制。我们使用同一份测试检查修复前后的行为。",
+  "before": "before",
+  "after": "after",
+  "test": "regression.py",
+  "expected_failure": {
+    "type": "UnicodeEncodeError",
+    "message_contains": "ascii"
+  },
+  "demo": true
+}

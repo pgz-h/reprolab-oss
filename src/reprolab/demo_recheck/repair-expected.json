@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "kind": "authored_report_repair_expectations",
+  "runtime_verified": false,
+  "test_id": "tests/test_cart.py::test_money_display",
+  "fault_source": "source_report.after",
+  "candidate_source": "working_tree_frozen_at_preparation",
+  "test_source": "source_report.shared_tests",
+  "scenarios": {
+    "fix_business_source": {"patch": "fix-money-display.patch", "strict_status": "verified", "test_change": "same"},
+    "weaken_same_test": {"patch": "change-money-test.patch", "strict_status": "still_failing", "test_change": "changed", "uses_original_check": true},
+    "batch_only_failure": {"strict_status": "not_reproduced", "history_after_status": "failed"},
+    "fixture_dependency_skip_timeout_cancel_incomplete": {"direct_case_allowed": false, "diagnosis_required": true},
+    "long_or_edited_material": {"preview_copy_export_equal": true, "truncation_visible": true, "max_text_bytes": 98304},
+    "moved_report_after_preparation": {"case_save_and_run_from_owned_inputs": true},
+    "inconsistent_source_evidence": {"prepare_allowed": false},
+    "save_failure": {"preparation_retryable": true, "published_case": false},
+    "delivery_and_replay": {"preserve_origin_confirmations_and_hashes": true}
+  }
+}

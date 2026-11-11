@@ -1,0 +1,7 @@
+include README.en.md CHANGELOG.md SECURITY.md CONTRIBUTING.md INSTALL.md
+recursive-include docs *.md *.png
+recursive-include packaging *.py *.spec *.md *.txt
+recursive-include packaging/licenses *
+recursive-include .github *.yml *.md
+prune docs/superpowers
+global-exclude .DS_Store *.pyc

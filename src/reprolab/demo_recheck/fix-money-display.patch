@@ -1,0 +1,6 @@
+diff --git a/cart.py b/cart.py
+--- a/cart.py
++++ b/cart.py
+@@ -5 +5 @@
+-    return f"{value:.1f}"
++    return f"{value:.2f}"

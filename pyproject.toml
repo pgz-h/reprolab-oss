@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reprolab-local"
+version = "0.19.0a21"
+description = "Evidence-based repair acceptance and project regression comparison for Python/pytest."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE", "packaging/licenses/deepseek-harness/LICENSE", "packaging/licenses/heroicons/LICENSE"]
+dependencies = ["pytest>=8,<10", "packaging>=23", "tomlkit>=0.15.2,<1", "pywin32; sys_platform == 'win32'"]
+
+[project.optional-dependencies]
+desktop = ["PySide6-Essentials>=6.9,<7"]
+
+[project.scripts]
+reprolab = "reprolab.cli:main"
+reprolab-desktop = "reprolab.desktop:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+reprolab = ["_vitest_worker.mjs", "demo_recheck/*", "ui_assets/*.svg", "demo_case/*.json", "demo_case/*.py", "demo_case/before/*.py", "demo_case/after/*.py", "history_cases/humanize250/*", "history_cases/humanize250/before/*", "history_cases/humanize250/after/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"

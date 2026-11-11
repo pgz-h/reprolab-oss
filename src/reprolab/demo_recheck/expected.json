@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "kind": "authored_recheck_expectations",
+  "runtime_verified": false,
+  "source_selected_count": 9,
+  "source_counts": {
+    "regression_passed": 5,
+    "improved": 1,
+    "regression_detected": 1,
+    "baseline_failure": 1,
+    "inconclusive": 1
+  },
+  "scenarios": {
+    "fix_source_all": {
+      "money_result": "regression_passed",
+      "money_test_file": "same",
+      "same_check_resolved": 1
+    },
+    "fix_source_attention": {
+      "selected_count": 3,
+      "not_rechecked_count": 6,
+      "same_check_resolved": 1
+    },
+    "weaken_same_test_all": {
+      "money_result": "regression_passed",
+      "test_changed_count": 9,
+      "same_check_resolved": 0
+    },
+    "rename_test": {
+      "pending_original_id": "tests/test_cart.py::test_money_display",
+      "matching_count": 8,
+      "requires_confirmation": true
+    },
+    "explicit_empty": {
+      "selected_count": 0,
+      "run_allowed": false
+    },
+    "missing_source": {
+      "action": "relocate_and_verify_exact_identity"
+    },
+    "inconsistent_evidence": {
+      "comparison_allowed": false
+    }
+  }
+}

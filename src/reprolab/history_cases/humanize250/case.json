@@ -1,0 +1,16 @@
+{
+  "title": "真实历史案例：1 字节为什么显示成 1.0 Byte？",
+  "description": "humanize 4.12.2 在接收字符串“1”时输出“1.0 Byte”，而预期是“1 Byte”。官方 PR #250 在 2025 年修复了这一回归。这里使用未改动的 4.12.2 与 4.12.3 文件大小格式化模块，让同一份测试分别检查两版的实际输出。",
+  "before": "before",
+  "after": "after",
+  "test": "regression.py",
+  "expected_failure": {"type": "AssertionError", "message_contains": "one byte must be formatted as 1 Byte"},
+  "demo": false,
+  "provenance": {
+    "project": "humanize",
+    "issue_url": "https://github.com/python-humanize/humanize/pull/250",
+    "before_ref": "4.12.2 / 15230fbfdcae5ca46fa831f656378b2275b88f53",
+    "after_ref": "4.12.3 / 2968d44280a68f775db73ddeb2f2fc6c05edac84",
+    "scope": "未改动的 filesize.py 单模块历史复现。不是完整项目集成、新漏洞发现或上游采用证明。"
+  }
+}
