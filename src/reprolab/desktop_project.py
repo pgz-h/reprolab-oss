@@ -3371,9 +3371,10 @@ class ProjectWorkbench(QWidget):
             return {'imported': imported, 'report': report}
         def shown(result):
             report = result['report']
-            if report.get('runner') == 'vitest':
+            if report.get('runner') in ('vitest', 'go'):
                 self._open_local(Path(report['report_dir']) / 'report.html')
-                self.status_label.setText('已校验并导入 Vitest 报告。可从命令行使用 project replay 重放。')
+                runner = {'vitest': 'Vitest', 'go': 'Go'}[report['runner']]
+                self.status_label.setText(f'已校验并导入 {runner} 报告。可从命令行使用 project replay 重放。')
                 return
             self._apply_report(report)
             self.tabs.setCurrentIndex(2)

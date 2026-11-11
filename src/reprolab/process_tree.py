@@ -4,12 +4,15 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import time
+import uuid
 
 
 class WindowsJob:
     def __init__(self):
         import win32job
-        self.handle = win32job.CreateJobObject(None, None)
+        # pywin32 requires a Unicode name even though Win32 accepts NULL.
+        self.handle = win32job.CreateJobObject(None, f"Local\\ReproLab-{uuid.uuid4().hex}")
         try:
             info = win32job.QueryInformationJobObject(self.handle, win32job.JobObjectExtendedLimitInformation)
             info['BasicLimitInformation']['LimitFlags'] |= win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -84,3 +87,24 @@ def terminate_tree(process):
         elif process.poll() is None:
             process.kill()
     return process.wait()
+
+
+def run_logged_command(command, cwd, env, log, deadline, control):
+    control.check()
+    if time.monotonic() >= deadline:
+        return 'timed_out', None
+    child = spawn(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                  stdout=log, stderr=subprocess.STDOUT)
+    try:
+        while child.poll() is None:
+            control.check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return 'timed_out', None
+            try:
+                child.wait(timeout=min(.1, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+        return 'completed', child.returncode
+    finally:
+        terminate_tree(child)

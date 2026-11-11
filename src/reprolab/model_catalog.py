@@ -4,9 +4,9 @@ import json
 import math
 import socket
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, build_opener
+from urllib.request import Request
 
-from .ai import _api_settings, _NoRedirect
+from .ai import _api_settings, _model_opener
 
 MAX_MODELS = 1000
 MAX_LISTING_BYTES = 4 * 1024 * 1024
@@ -41,7 +41,7 @@ def discover_models(data, *, timeout=20):
         headers['anthropic-version'] = '2023-06-01'
     request = Request(endpoint, method='GET', headers=headers)
     try:
-        with build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
+        with _model_opener(request).open(request, timeout=timeout) as response:
             raw = response.read(MAX_LISTING_BYTES + 1)
     except HTTPError as exc:
         status = exc.code

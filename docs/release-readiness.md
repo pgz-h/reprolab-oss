@@ -1,5 +1,9 @@
 # 验证与发布状态
 
+## 开发分支
+
+`90bf648` 在 Windows x64 GitHub Actions 上通过原生检查和实际 exe 验收。该次检查覆盖 pytest 对比与重放、Qt 离屏界面和本地模拟模型，生成未签名便携候选包。Go 在此运行中的覆盖范围限于构建进候选。 [Windows Actions](https://github.com/pgz-h/reprolab-oss/actions/runs/43006106781#artifacts)
+
 ## 0.19.0a21 Alpha 候选
 
 首发候选包含 Python／pytest 桌面和 CLI 流程，新增 `project review` 一次冻结、发现和比较。Vitest 4 对比和重放以 CLI 预览提供，桌面支持导入并打开证据报告。

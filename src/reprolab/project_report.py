@@ -239,7 +239,8 @@ def _runtime_card(report, label, heading):
         ("worker 记录", complete), ("测试记录数", len(_mapping(run.get("tests")))),
         ("Python", run.get("python_version") or runtime.get("python_version")),
         ("pytest", run.get("pytest_version") or runtime.get("pytest_version")),
-        ("Vitest", run.get("vitest_version")), ("最后执行阶段", run.get("phase")),
+        ("Vitest", run.get("vitest_version")), ("Go", runtime.get("go_version")),
+        ("最后执行阶段", run.get("phase")),
     ])
     if run.get('status') == 'dependencies_failed':
         errors = ['npm ci 未完成，请查看日志中的依赖、缓存或 registry 错误。', *errors]
@@ -362,6 +363,15 @@ def _environment(report):
     from .pytest_profile import describe_pytest_profile
     runtime = _mapping(report.get("runtime"))
     environment = _mapping(report.get("environment"))
+    if report.get("runner") == "go":
+        facts = _facts([
+            ("Go", runtime.get("go_version")), ("包目录", report.get("go_package")),
+            ("系统", environment.get("platform")), ("架构", environment.get("machine")),
+            ("每版总超时", _seconds(report.get("timeout"))),
+            ("依赖", "使用本机模块缓存"),
+        ])
+        return ('<section class="card section"><h2>Go 环境与执行范围</h2>'
+                + facts + f'<p>{_e(report.get("notice"))}</p></section>')
     if report.get("runner") == "vitest":
         facts = _facts([
             ("Node.js", runtime.get("node_version")), ("npm", runtime.get("npm_version")),
@@ -444,8 +454,9 @@ def write_project_report(report: dict) -> str:
     if not isinstance(report, dict) or not report.get("report_dir"):
         raise ValueError("项目报告必须包含 report_dir。")
     entries = _entries(report)
-    is_vitest = report.get("runner") == "vitest"
-    diagnostics = {"groups": []} if is_vitest else group_project_failures(report)
+    runner = report.get("runner")
+    is_vitest = runner == "vitest"
+    diagnostics = {"groups": []} if runner in ("vitest", "go") else group_project_failures(report)
     memberships = {}
     for group in diagnostics['groups']:
         for identity in group['test_ids']:
@@ -481,6 +492,8 @@ def write_project_report(report: dict) -> str:
             scope += ' 上方结论考虑已匹配的用例，下方卡片按文件计数。'
         else:
             scope += ' 结论以文件为单位。'
+    elif runner == 'go':
+        scope = f'本次选择 <strong>{selected_count}</strong> 个顶层 Go 测试 · 包目录 {_e(report["go_package"])}。'
     else:
         scope = f'本次选择 <strong>{selected_count}</strong> 个测试 · {_e(discovery)} · 表中展示 <strong>{len(entries)}</strong> 项。结论仅覆盖这些所选测试。'
     stats = "".join(f'<div class="stat {key}"><b>{counts[key]}</b><span>{label}</span></div>'
@@ -496,11 +509,12 @@ def write_project_report(report: dict) -> str:
         collection_error = ('<details open class="collection-errors"><summary>会话收集问题</summary><pre>'
                             + _e(_json(collection.get("collection_errors") or collection.get("log_excerpt") or collection))
                             + "</pre></details>")
-    selection_unit = '测试文件' if is_vitest else '测试 node ID'
-    blocked_note = ('依赖准备失败、收集异常、跳过和执行不完整保留为受阻。' if is_vitest
+    selection_unit = {'vitest': '测试文件', 'go': 'Go 测试函数'}.get(runner, '测试 node ID')
+    blocked_note = ('依赖准备失败、收集异常、跳过和执行不完整保留为受阻。' if runner in ('vitest', 'go')
                     else '跳过、xfail、fixture 问题、缺失记录和超时保留为受阻。')
-    code_notice = ('Vitest 配置和测试会执行本机代码。' if is_vitest else '测试和 conftest 可以运行任意本机代码。')
-    acceptance_note = ('' if is_vitest else '<p class="scope">项目回归通过不等于目标问题已完整修复；'
+    code_notice = {'vitest': 'Vitest 配置和测试会执行本机代码。',
+                   'go': 'Go 测试和包初始化会执行本机代码。'}.get(runner, '测试和 conftest 可以运行任意本机代码。')
+    acceptance_note = ('' if runner in ('vitest', 'go') else '<p class="scope">项目回归通过不等于目标问题已完整修复；'
                        '目标修复的预声明验收继续由单项验收与 AI 验收计划承担。</p>')
     script_hash = base64.b64encode(hashlib.sha256(_SCRIPT.encode("utf-8")).digest()).decode("ascii")
     csp = ("default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-" + script_hash
@@ -519,7 +533,7 @@ def write_project_report(report: dict) -> str:
 <p class="muted">新增失败：旧版通过、新版失败。原有失败：两版均失败。改善：旧版失败、新版通过。{blocked_note}</p>
 <div class="toolbar"><label class="search" for="test-search">搜索 node ID、异常或阶段记录<input id="test-search" type="search" placeholder="例如 test_export[utf8] 或 AssertionError" autocomplete="off"></label>
 <label for="status-filter">结果筛选<select id="status-filter"><option value="">全部结果 · {len(entries)}</option>{options}</select></label><label for="diagnostic-filter">现象筛选<select id="diagnostic-filter"><option value="">全部现象</option>{group_options}</select></label><button type="button" id="clear-filters">清除筛选</button><span class="visible-count" id="visible-count" aria-live="polite">显示 {len(entries)} / {len(entries)} 项</span></div>
-<noscript><p class="muted">当前浏览器未启用脚本，全部记录仍可阅读；搜索与筛选需要启用本地脚本。</p></noscript>{_matrix(entries, memberships, target_label="测试文件" if is_vitest else "测试 node ID")}</section>
+<noscript><p class="muted">当前浏览器未启用脚本，全部记录仍可阅读；搜索与筛选需要启用本地脚本。</p></noscript>{_matrix(entries, memberships, target_label=selection_unit)}</section>
 <div class="runtime-grid">{_runtime_card(report, "before", "基线版本的实际运行")}{_runtime_card(report, "after", "对比版本的实际运行")}</div>
 {_source(report)}{_changes(report)}{_environment(report)}
 <section class="card section"><p class="eyebrow">EVIDENCE & SCOPE</p><h2>证据与能力范围</h2>

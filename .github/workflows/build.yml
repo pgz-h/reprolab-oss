@@ -41,12 +41,26 @@ jobs:
           tests/test_project_conditions.py tests/test_recheck_shortcut.py
           tests/test_environment_groups.py tests/test_project_diagnostics.py
           tests/test_project_progress.py tests/test_project_config.py tests/test_execution_settings.py
+          tests/test_vitest_project.py
           tests/test_processing_history.py tests/test_release_preparation.py tests/test_desktop_store.py
           tests/test_runtime_environment.py
           tests/test_collection_recovery.py tests/test_recheck_progress.py
           tests/test_environment_recovery.py tests/test_repair_drafts.py
           tests/test_snapshot_children.py tests/test_conditional_xfail.py
           tests/test_ai_api.py tests/test_model_catalog.py tests/test_model_reasoning.py tests/test_model_definitions.py tests/test_platform_support.py
+      - uses: actions/setup-go@v7
+        if: matrix.python == '3.14'
+        with:
+          go-version: '1.27.x'
+          cache: false
+      - name: Verify Go comparison and evidence replay
+        if: matrix.python == '3.14'
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          go version
+          python -m pytest -q -p no:cacheprovider tests/test_go_project.py
       - name: Install build tools
         run: python -m pip install 'build>=1.2' 'setuptools>=77'
       - name: Build wheel and source distribution

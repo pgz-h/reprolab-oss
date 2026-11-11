@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tomllib
 
+from verify_desktop_payload import verify_desktop_payload
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -34,6 +36,7 @@ def main():
                     str(source / "packaging/desktop.spec")], cwd=source, env=env, check=True)
     app = output / "ReproLab.app"
     subprocess.run(["ditto", str(work / "dist/ReproLab.app"), str(app)], check=True)
+    verify_desktop_payload(app / "Contents/MacOS/ReproLab")
     bundle_info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
     if bundle_info.get("LSBackgroundOnly") or bundle_info.get("LSUIElement"):
         raise RuntimeError("Desktop bundle must allow a regular foreground application and keyboard focus.")

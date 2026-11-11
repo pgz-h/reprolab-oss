@@ -1,4 +1,4 @@
-"""Native acceptance for the actual frozen Windows exe, using local fixtures."""
+"""Verify the Windows release CLI and exercise Qt from the build environment."""
 import argparse
 import json
 import os
@@ -67,24 +67,25 @@ def main():
     assert cli('project', 'check', replay['report_dir'])['status']=='consistent'
     checks.append('project preparation, execution, evidence import/export and replay')
 
-    for flag, filename, key in (
+    for name, filename, key in (
         ('desktop', 'smoke-result.json', 'ok'),
-        ('onboarding', 'onboarding-result.json', 'status'),
-        ('config', 'config-result.json', 'status'),
-        ('suite', 'suite-result.json', 'ok'),
+        ('desktop_onboarding', 'onboarding-result.json', 'status'),
+        ('desktop_config', 'config-result.json', 'status'),
+        ('desktop_suite', 'suite-result.json', 'ok'),
     ):
-        destination = output/flag
-        result = subprocess.run([str(exe), '--'+flag+'-smoke', str(destination)], cwd=output,
+        destination = output/name
+        script = source / 'packaging' / (name + '_smoke.py')
+        result = subprocess.run([sys.executable, '-I', '-X', 'utf8', str(script), str(destination)], cwd=output,
             env=env, capture_output=True, encoding='utf-8', timeout=240)
-        (output/(flag+'-stdout.log')).write_text(result.stdout+'\n'+result.stderr, encoding='utf-8')
+        (output/(name+'-stdout.log')).write_text(result.stdout+'\n'+result.stderr, encoding='utf-8')
         if result.returncode:
-            raise RuntimeError(f'Frozen {flag} flow failed; inspect its saved result and logs.')
+            raise RuntimeError(f'{name} Qt check failed; inspect its saved result and logs.')
         record = json.loads((destination/filename).read_text(encoding='utf-8'))
         if record.get(key) not in (True, 'passed'):
-            raise RuntimeError(f'Frozen {flag} flow did not record success.')
-        checks.append(flag+': frozen Qt workflow')
+            raise RuntimeError(f'{name} Qt check did not record success.')
+        checks.append(name + ': Qt workflow from installed Python package')
     record = {'version': expected, 'status': 'passed', 'platform': platform.platform(),
-        'checks': checks, 'limits': 'Windows runner, Qt offscreen, trusted local fixtures and mock model services; unsigned; no independent user trial or live vendor account.'}
+        'checks': checks, 'limits': 'Windows runner, frozen CLI, Qt offscreen from installed Python package, trusted local fixtures and mock model services; unsigned; no independent user trial or live vendor account.'}
     (output/'windows-validation.json').write_text(json.dumps(record, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
     print(json.dumps(record, ensure_ascii=False, indent=2))
 

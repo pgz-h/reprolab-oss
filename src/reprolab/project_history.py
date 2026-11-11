@@ -304,8 +304,8 @@ def compare_project_reports(before_directory, after_directory, *, expected_befor
 
 
 def _compare_checked_reports(before, after, *, test_ids=None):
-    if 'vitest' in (before.get('runner'), after.get('runner')):
-        raise ValueError('Vitest 预览按文件保存两版对比，暂不支持跨报告比较。')
+    if any(report.get('runner') in ('vitest', 'go') for report in (before, after)):
+        raise ValueError('Go 和 Vitest 预览支持两版比较，暂不支持跨报告比较。')
     left = {entry['test_id']: entry for entry in before['entries']}
     right = {entry['test_id']: entry for entry in after['entries']}
     entries = []

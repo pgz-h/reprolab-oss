@@ -27,6 +27,9 @@ for python_license in (Path(sysconfig.get_path("stdlib")) / "LICENSE.txt", Path(
 # External venv workers still execute the regular isolated worker script.
 datas += [(str(root / 'src/reprolab' / name), 'reprolab') for name in ('_worker.py', '_project_worker.py', '_vitest_worker.mjs')]
 hiddenimports = collect_submodules("pytest") + collect_submodules("_pytest")
+if sys.platform == "win32":
+    # pywin32 imports this when converting timestamps returned by Win32 APIs.
+    hiddenimports.append("win32timezone")
 a = Analysis(
     [str(root / "packaging/desktop_entry.py")],
     pathex=[str(root / "src"), str(root / "packaging")],

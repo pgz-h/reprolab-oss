@@ -15,8 +15,8 @@ def refresh_project(directory, output_root, *, selected_ids=None, python_executa
     if control:
         control.check()
     source = read_project(directory)
-    if source.get('runner') == 'vitest':
-        raise ValueError('请使用 project vitest 重新检查 Vitest 项目，或使用 project replay 重放保存的报告。')
+    if source.get('runner') in ('vitest', 'go'):
+        raise ValueError(f"请使用 project {source['runner']} 重新检查，或使用 project replay 重放报告。")
     if expected_source is not None and _identity(source) != _identity(expected_source):
         raise ValueError('来源报告的固定会话发生变化，请重新打开报告。')
     selected = (requested_selection(source) if selected_ids is None

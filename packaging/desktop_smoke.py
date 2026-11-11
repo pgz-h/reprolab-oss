@@ -1,6 +1,6 @@
-"""Explicit release QA. Uses the shipped Qt widgets and real bundled workers.
+"""Source-side desktop QA using the product Qt widgets and worker processes.
 
-Run: ReproLab.app/Contents/MacOS/ReproLab --desktop-smoke /absolute/qa-directory
+Run: PYTHONPATH=src python packaging/desktop_smoke.py /absolute/qa-directory
 Optional: --python /project/venv/bin/python, --restart-only, --open-report.
 No existing model configuration is opened or used.
 """
@@ -108,3 +108,7 @@ def main():
     (root / filename).write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(output, ensure_ascii=False))
     return 0 if output["ok"] else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

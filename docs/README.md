@@ -10,6 +10,7 @@
 - [失败修复](failure-repair.md)：修复说明、草稿恢复和严格验收。
 - [连续复查](report-recheck.md)：沿用基线、处理进展和未复查范围。
 - [CLI 与 CI](cli-contract.md)：脚本调用、输出和退出码。
+- [Go 项目对比](go.md)、[Vitest 项目对比](vitest.md)：非 Python 项目的 CLI 预览。
 
 ## AI 辅助（可选）
 
@@ -46,4 +47,4 @@
 
 环境、凭据、本机设置、工作项目、完整日志及安装产物留在源码仓库之外。公开源码审阅副本由现有发布脚本按白名单生成，不包含开发 Git 历史或本机 AGENTS.md；它是交付材料，唯一开发目录继续保留。
 
-新公开仓库地址尚未确定，文档使用相对链接。确定地址并实际发布后再添加仓库和下载入口，不放虚构徽章、下载量或未发生的发布记录。
+公开源码和预发行包见 [ReproLab 公开仓库](https://github.com/pgz-h/reprolab-oss)及其 [Releases](https://github.com/pgz-h/reprolab-oss/releases)。

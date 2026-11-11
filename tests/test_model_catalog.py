@@ -171,7 +171,14 @@ def test_form_fetch_select_test_save_and_reopen_use_typed_key_and_model_id(app, 
         saved = json.loads(path.read_text())
         assert saved['model'] == 'gateway/second'
         assert saved['display_name'] == '教学网关' and saved['provider_id'].startswith('custom-')
-        assert len(saved['models']) == 2 and path.stat().st_mode & 0o777 == 0o600
+        assert len(saved['models']) == 2
+        if os.name == 'nt':
+            import win32security
+            descriptor = win32security.GetNamedSecurityInfo(
+                str(path), win32security.SE_FILE_OBJECT, win32security.DACL_SECURITY_INFORMATION)
+            assert descriptor.GetSecurityDescriptorControl()[0] & win32security.SE_DACL_PROTECTED
+        else:
+            assert path.stat().st_mode & 0o777 == 0o600
         assert requests[-1]['data']['model'] == 'gateway/second'
         assert all(item['authorization'] == 'Bearer ' + SECRET for item in requests)
         # Saving a directory must remain consumable through the actual model client.

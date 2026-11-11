@@ -18,7 +18,7 @@ python3 -m venv .venv
 
 以上命令在已取得的源码根目录执行。案例采用上游原始单模块和 ReproLab 编写的行为检查；它不是完整 humanize 项目适配，也不是上游采用证明。见[案例与来源](docs/history-case.md)。
 
-开发版另提供 JavaScript／TypeScript 的 [Vitest 命令行预览](docs/vitest.md)，可按文件比较两版并导出证据。
+开发版提供 JavaScript／TypeScript 的 [Vitest 命令行预览](docs/vitest.md)和 [Go 命令行预览](docs/go.md)，均可比较两版并导出可校验、可重放的证据。
 
 ## 适合什么任务
 
@@ -102,7 +102,7 @@ AI 为可选功能，用于准备回归测试草稿、生成可审阅的验收�
 
 环境错误、收集或 fixture 失败、超时、跳过、xfail 和不完整记录不能计入通过。日志、源码与模型材料可能含项目数据，分享前应检查。证据哈希校验内容一致性，不证明作者身份。
 
-macOS arm64 用于本地开发与验证。Windows x64 已纳入构建与验收流程，原生结果待验证。见[Windows 指南](docs/windows.md)和[安全边界](SECURITY.md)。
+macOS arm64 用于本地开发与验证。Windows x64 开发候选已在 GitHub Actions 完成原生检查和实际 exe 验收。见[Windows 指南](docs/windows.md)和[安全边界](SECURITY.md)。
 
 ## 文档与贡献入口
 

@@ -348,8 +348,8 @@ def collect_project(directory, *, python_executable=None, timeout=120, control=N
     control.check()
     with _lock(directory):
         state = read_project(directory)
-        if state.get('runner') == 'vitest':
-            raise ValueError('此报告按 Vitest 测试文件保存，请使用 project vitest 或 project replay。')
+        if state.get('runner') in ('vitest', 'go'):
+            raise ValueError(f"请使用 project {state['runner']} 或 project replay。")
         requested = requested_selection(state)
         folder = Path(state['directory'])
         snapshot = folder / 'inputs/after'
@@ -558,8 +558,8 @@ def run_project(directory, output_root, *, selected_ids=None, python_executable=
     control = control or RunControl()
     control.check()
     state = read_project(directory)
-    if state.get('runner') == 'vitest':
-        raise ValueError('请使用 project vitest 或 project replay 执行 Vitest 项目。')
+    if state.get('runner') in ('vitest', 'go'):
+        raise ValueError(f"请使用 project {state['runner']} 或 project replay。")
     # Empty selection is rejected before discovery could load project code.
     if selected_ids == [] or (selected_ids is None and requested_selection(state) == []):
         raise ValueError('当前范围已主动清空；正式运行须明确选择 1–2000 项，不会自动全选。')
@@ -738,6 +738,11 @@ def check_project_report(directory, *, control=None):
             check_vitest_evidence(folder, report, state, execution, selected)
             return {'status': 'consistent', 'report_dir': str(folder), 'issues': [],
                     'notice': '项目证据一致性与测试结果分别判断；校验值不是身份认证。'}
+        if report.get('runner') == 'go':
+            from .go_project import check_go_evidence
+            check_go_evidence(folder, report, state, execution, selected)
+            return {'status': 'consistent', 'report_dir': str(folder), 'issues': [],
+                    'notice': '项目证据一致性与测试结果分别判断；校验值不是身份认证。'}
         scope = (report.get('collection') or {}).get('collection_path', '')
         if scope != state.get('collection_path', ''):
             raise ValueError('报告发现范围与固定会话不一致。')
@@ -803,7 +808,7 @@ def project_replay_settings(report, *, python_executable=None, timeout=None):
 
 
 def replay_project_report(directory, output_root, *, python_executable=None, timeout=None, confirmed=False,
-                          control=None, node=None, npm=None, offline=None, npm_cache=None):
+                          control=None, node=None, npm=None, offline=None, npm_cache=None, go=None):
     checked = check_project_report(directory)
     if checked['status'] != 'consistent':
         raise ValueError('项目报告证据不一致：' + '; '.join(checked['issues']))
@@ -813,11 +818,17 @@ def replay_project_report(directory, output_root, *, python_executable=None, tim
         raise ValueError('重放输出须保存在来源报告之外。')
     if report.get('runner') == 'vitest':
         from .vitest_project import replay_vitest_project
-        if python_executable is not None:
+        if python_executable is not None or go is not None:
             raise ValueError('Vitest 重放使用 --node 和 --npm 选择运行环境。')
         return replay_vitest_project(folder, report, output_root, node=node, npm=npm, timeout=timeout,
                                      offline=offline, npm_cache=npm_cache, confirmed=confirmed, control=control)
-    if any(value is not None for value in (node, npm, offline, npm_cache)):
+    if report.get('runner') == 'go':
+        from .go_project import replay_go_project
+        if any(value is not None for value in (python_executable, node, npm, offline, npm_cache)):
+            raise ValueError('Go 重放使用 --go 选择运行环境。')
+        return replay_go_project(folder, report, output_root, go=go, timeout=timeout,
+                                 confirmed=confirmed, control=control)
+    if any(value is not None for value in (node, npm, offline, npm_cache, go)):
         raise ValueError('此报告使用 pytest，请通过 --python 选择运行环境。')
     replay_profile = read_pytest_profile(folder / 'evidence/project/inputs/after')
     variables = variable_record(replay_profile)
