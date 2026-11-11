@@ -75,7 +75,7 @@ def main():
     ):
         destination = output/name
         script = source / 'packaging' / (name + '_smoke.py')
-        result = subprocess.run([sys.executable, '-I', str(script), str(destination)], cwd=output,
+        result = subprocess.run([sys.executable, '-I', '-X', 'utf8', str(script), str(destination)], cwd=output,
             env=env, capture_output=True, encoding='utf-8', timeout=240)
         (output/(name+'-stdout.log')).write_text(result.stdout+'\n'+result.stderr, encoding='utf-8')
         if result.returncode:
