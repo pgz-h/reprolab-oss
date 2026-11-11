@@ -92,6 +92,18 @@ def _parser():
     vitest.add_argument('--timeout', type=_timeout, default=120, help='每版安装依赖和测试的总时限，默认 120 秒')
     _npm_options(vitest)
 
+    go = commands.add_parser('go', help='比较单个 Go 包中所选测试的两版结果')
+    go.add_argument('repository', type=Path, help='本地 Git 仓库目录')
+    go.add_argument('--before', required=True, help='基线 Git 提交或引用')
+    candidate = go.add_mutually_exclusive_group(required=True)
+    candidate.add_argument('--after', help='对比 Git 提交或引用')
+    candidate.add_argument('--working-tree', action='store_true', help='以当前工作区作为对比版本')
+    go.add_argument('--package', default='.', help='仓库内包目录，默认根目录')
+    go.add_argument('--test', action='append', required=True, help='顶层 Go 测试函数名称，可重复')
+    go.add_argument('--go', help='Go 可执行文件路径，默认使用 PATH')
+    go.add_argument('--output', type=Path, required=True, help='报告保存根目录')
+    go.add_argument('--timeout', type=_timeout, default=120, help='每版编译和测试总时限，默认 120 秒')
+
     show = commands.add_parser("show", help="读取已保存项目会话，不执行项目代码")
     show.add_argument("directory", type=Path, help="项目会话目录")
 
@@ -199,6 +211,7 @@ def _parser():
     replay.add_argument("--confirm-run", action="store_true", help="明确同意加载可信证据代码并执行重放")
     _runtime_options(replay, inherit_timeout=True)
     _npm_options(replay, replay=True)
+    replay.add_argument('--go', help='Go 报告重放使用的 Go 可执行文件')
     return parser
 
 
@@ -231,6 +244,13 @@ def _dispatch(args):
         result = run_vitest_project(args.repository, args.before, WORKTREE if args.working_tree else args.after,
             args.file, args.output, node=args.node, npm=args.npm, timeout=args.timeout,
             offline=args.offline, npm_cache=args.npm_cache, control=control)
+        return result, _run_exit_code(result)
+    if args.command == 'go':
+        from .go_project import run_go_project
+        from .workspace import WORKTREE
+        result = run_go_project(args.repository, args.before, WORKTREE if args.working_tree else args.after,
+                                args.output, package=args.package, selected=args.test, go=args.go,
+                                timeout=args.timeout, control=control)
         return result, _run_exit_code(result)
     if args.command == "prepare":
         return _prepare(args, args.output), 0
@@ -347,7 +367,7 @@ def _dispatch(args):
     result = project_sessions.replay_project_report(
         args.report, args.output, python_executable=args.python, timeout=args.timeout,
         confirmed=args.confirm_run, control=control, node=args.node, npm=args.npm,
-        offline=args.offline, npm_cache=args.npm_cache,
+        offline=args.offline, npm_cache=args.npm_cache, go=args.go,
     )
     return result, _run_exit_code(result) if args.confirm_run else 0
 

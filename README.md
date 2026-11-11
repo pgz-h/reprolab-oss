@@ -18,7 +18,7 @@ python3 -m venv .venv
 
 以上命令在已取得的源码根目录执行。案例采用上游原始单模块和 ReproLab 编写的行为检查；它不是完整 humanize 项目适配，也不是上游采用证明。见[案例与来源](docs/history-case.md)。
 
-开发版另提供 JavaScript／TypeScript 的 [Vitest 命令行预览](docs/vitest.md)，可按文件比较两版并导出证据。
+开发版提供 JavaScript／TypeScript 的 [Vitest 命令行预览](docs/vitest.md)和 [Go 命令行预览](docs/go.md)，均可比较两版并导出可校验、可重放的证据。
 
 ## 适合什么任务
 

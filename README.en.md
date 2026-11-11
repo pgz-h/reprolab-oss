@@ -22,7 +22,7 @@ ReproLab is useful when repeated fixes, patch review or handoffs require more th
 
 ## Status
 
-The development branch includes a [Vitest CLI preview](docs/vitest.md) for comparing selected JavaScript and TypeScript test files across two revisions.
+The development branch includes CLI previews for [Vitest](docs/vitest.md) in JavaScript and TypeScript projects and [Go tests](docs/go.md) in a Go module. Both can compare Git revisions and export replayable evidence.
 
 The **0.19.0a21 Alpha candidate** focuses on Python and pytest. It includes the desktop workbench, a single-command CLI review and evidence bundles with review history. Vitest 4 is available as a CLI preview. See the [changes](CHANGELOG.md), [platform status](docs/platforms.md) and [validation notes](docs/release-readiness.md).
 

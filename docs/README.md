@@ -10,6 +10,7 @@
 - [失败修复](failure-repair.md)：修复说明、草稿恢复和严格验收。
 - [连续复查](report-recheck.md)：沿用基线、处理进展和未复查范围。
 - [CLI 与 CI](cli-contract.md)：脚本调用、输出和退出码。
+- [Go 项目对比](go.md)、[Vitest 项目对比](vitest.md)：非 Python 项目的 CLI 预览。
 
 ## AI 辅助（可选）
 

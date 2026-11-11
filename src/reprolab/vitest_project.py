@@ -16,7 +16,7 @@ from . import __version__
 from .changes import describe_changes
 from .git_source import export_revision, resolve_commit
 from .persistence import save_json
-from .process_tree import spawn, terminate_tree
+from .process_tree import run_logged_command
 from .recipes import repository_root
 from .repair_suite import _new_id
 from .runner import RunCancelled, RunControl, source_fingerprint, source_mode_fingerprint
@@ -100,27 +100,6 @@ def _runtime_environment(tools):
     return env
 
 
-def _process(command, cwd, env, log, deadline, control):
-    control.check()
-    if time.monotonic() >= deadline:
-        return 'timed_out', None
-    child = spawn(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                  stdout=log, stderr=subprocess.STDOUT)
-    try:
-        while child.poll() is None:
-            control.check()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return 'timed_out', None
-            try:
-                child.wait(timeout=min(.1, remaining))
-            except subprocess.TimeoutExpired:
-                continue
-        return 'completed', child.returncode
-    finally:
-        terminate_tree(child)
-
-
 def _version_run(report_dir, label, evidence, selected, tools, expected_version, timeout, offline, npm_cache, control):
     start = time.monotonic()
     log_path = report_dir / (label + '.log')
@@ -145,7 +124,7 @@ def _version_run(report_dir, label, evidence, selected, tools, expected_version,
         deadline = start + timeout
         log.write(b'=== npm ci ===\n')
         log.flush()
-        status, code = _process(install, copied, env, log, deadline, control)
+        status, code = run_logged_command(install, copied, env, log, deadline, control)
         if status == 'completed' and code != 0:
             status = 'dependencies_failed'
         if status == 'completed':
@@ -156,7 +135,7 @@ def _version_run(report_dir, label, evidence, selected, tools, expected_version,
             worker = Path(__file__).with_name('_vitest_worker.mjs')
             options = work / 'selection.json'
             save_json(options, selected)
-            status, code = _process([tools['node'], str(worker), str(result_path), str(options)],
+            status, code = run_logged_command([tools['node'], str(worker), str(result_path), str(options)],
                                     copied, env, log, deadline, control)
             if status == 'completed':
                 try:
