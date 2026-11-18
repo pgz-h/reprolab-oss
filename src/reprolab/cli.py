@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import sys
 
-from . import __version__
+from . import __version__, source_examples_available
 from .doctor import diagnose
 from .preflight import check_case
 from .retry import plan_retry, run_retry
@@ -106,6 +106,8 @@ def main(argv=None):
     sub.add_parser('project', help='项目工作台：批量测试回归、结果矩阵、证据导出与重放')
     for name, help_text in (("demo", "运行教学示例"), ("history", "运行真实历史案例"),
                             ("verify", "运行已保存的案例")):
+        if name in ("demo", "history") and not source_examples_available():
+            continue
         command = sub.add_parser(name, help=help_text)
         if name == "verify":
             command.add_argument("case", type=Path)

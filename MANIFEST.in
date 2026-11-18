@@ -1,7 +1,11 @@
 include README.en.md CHANGELOG.md SECURITY.md CONTRIBUTING.md INSTALL.md
-recursive-include docs *.md *.png
-recursive-include packaging *.py *.spec *.md *.txt
+prune tests
+prune docs
+prune .github
+prune packaging
 recursive-include packaging/licenses *
-recursive-include .github *.yml *.md
-prune docs/superpowers
+prune src/reprolab/demo_case
+prune src/reprolab/demo_recheck
+prune src/reprolab/history_cases
+exclude src/reprolab/project_demo.py
 global-exclude .DS_Store *.pyc

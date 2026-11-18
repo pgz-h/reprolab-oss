@@ -13,7 +13,7 @@ distributions = ("pywin32",) if sys.platform == "win32" else ()
 datas = sum((copy_metadata(name) for name in ("pytest", "pluggy", "iniconfig", "packaging", "pygments", "tomlkit", "PySide6-Essentials", "shiboken6")), [])
 datas += sum((copy_metadata(name) for name in distributions), [])
 datas += [(str(root / "src/reprolab" / name), "reprolab/" + name)
-          for name in ("demo_case", "demo_recheck", "history_cases", "ui_assets")]
+          for name in ("ui_assets",)]
 datas += [(str(root / "LICENSE"), "licenses/reprolab"), (str(root / "packaging/licenses"), "licenses/qt-pyside")]
 for distribution in ("PySide6-Essentials", "shiboken6", "pytest", "pluggy", "iniconfig", "packaging", "pygments", "tomlkit", "pyinstaller", *distributions):
     dist = importlib.metadata.distribution(distribution)
@@ -34,7 +34,7 @@ a = Analysis(
     [str(root / "packaging/desktop_entry.py")],
     pathex=[str(root / "src"), str(root / "packaging")],
     binaries=[], datas=datas, hiddenimports=hiddenimports,
-    excludes=["PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.QtQml",
+    excludes=["reprolab.project_demo", "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.QtQml",
               "PySide6.QtQuick", "tkinter"],
     noarchive=False,
 )

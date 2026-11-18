@@ -15,7 +15,7 @@ import zipfile
 
 
 ROOT_FILES = ('README.md', 'README.en.md', 'LICENSE', 'CHANGELOG.md', 'INSTALL.md',
-              'CONTRIBUTING.md', 'SECURITY.md', 'pyproject.toml', 'MANIFEST.in',
+              'CONTRIBUTING.md', 'SECURITY.md', 'setup.py', 'pyproject.toml', 'MANIFEST.in',
               '.gitignore', '.gitattributes')
 FOLDERS = ('src', 'tests', 'docs', 'packaging', '.github')
 EXCLUDED = {'.git', '__pycache__', '.pytest_cache', '.venv', 'node_modules', 'build', 'dist', 'outputs', '.DS_Store'}
@@ -62,8 +62,10 @@ def current_changes(source, version):
 
 def verify_python_artifacts(source, wheel_path, sdist_path, files, version):
     """Compare build payloads, rather than trusting filenames with the right version."""
-    package = {p.relative_to(source / 'src').as_posix(): p.read_bytes()
-               for p in files if p.is_relative_to(source / 'src/reprolab')}
+    source_only = {'demo_case', 'demo_recheck', 'history_cases', 'project_demo.py'}
+    runtime = [p for p in files if p.is_relative_to(source / 'src/reprolab')
+               and p.relative_to(source / 'src/reprolab').parts[0] not in source_only]
+    package = {p.relative_to(source / 'src').as_posix(): p.read_bytes() for p in runtime}
     with zipfile.ZipFile(wheel_path) as wheel:
         names = wheel.namelist()
         metadata = [name for name in names if name.endswith('.dist-info/METADATA')]
@@ -83,7 +85,8 @@ def verify_python_artifacts(source, wheel_path, sdist_path, files, version):
             raise ValueError('Python 源码包结构不唯一。')
         root = roots.pop()
         required = {p.relative_to(source).as_posix(): p for p in files
-                    if p.relative_to(source).as_posix() not in ('.gitignore', '.gitattributes')}
+                    if p in runtime or p.is_relative_to(source / 'packaging/licenses')
+                    or (p.parent == source and p.name not in ('.gitignore', '.gitattributes'))}
         actual = {m.name[len(root) + 1:]: m for m in members if m.name.startswith(root + '/src/') and not m.isdir()}
         if set(actual) != {name for name in required if name.startswith('src/')}:
             # setuptools metadata is generated separately, outside the source package.

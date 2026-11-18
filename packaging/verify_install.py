@@ -33,14 +33,9 @@ def main():
             raise RuntimeError(f'CLI failed: {arguments[0]} / exit {result.returncode}\n{result.stderr}\n{result.stdout}')
         return json.loads(result.stdout)
 
-    for name in ('demo', 'history'):
-        report = cli(name, '--output', output / name, '--json')
-        if report['status'] != 'verified':
-            raise RuntimeError(name + ' did not verify the declared fix.')
-        checked = cli('report', 'check', report['report_dir'], '--json')
-        if checked['status'] != 'consistent':
-            raise RuntimeError(name + ' evidence is inconsistent.')
-        checks.append(name + ': verified and evidence consistent')
+    if any((installed.parent / name).exists() for name in ('demo_case', 'demo_recheck', 'history_cases', 'project_demo.py')):
+        raise RuntimeError('Installed wheel contains source-only examples.')
+    checks.append('installed runtime excludes teaching payloads')
 
     repo = output / 'project'
     repo.mkdir()

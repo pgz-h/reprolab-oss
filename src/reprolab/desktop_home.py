@@ -1,4 +1,5 @@
 """A focused starting point for checking a change."""
+from . import source_examples_available
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QGraphicsDropShadowEffect, QGridLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget
@@ -88,6 +89,8 @@ class StartPage(QScrollArea):
         self.reports_button = QPushButton('打开已有报告')
         self.reports_button.setObjectName('quiet')
         self.reports_button.clicked.connect(lambda: reports())
+        self.project_demo_button.setVisible(source_examples_available())
+        self.demo_button.setVisible(source_examples_available())
         extras.addWidget(self.project_demo_button)
         extras.addWidget(self.reports_button)
         body.addLayout(extras)

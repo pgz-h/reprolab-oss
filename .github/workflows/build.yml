@@ -56,7 +56,7 @@ jobs:
         run: |
           result="$RUNNER_TEMP/reprolab-demo-result.json"
           comparison=0
-          reprolab project demo --review-handoff --output "$RUNNER_TEMP/reprolab-ci-demo" > "$result" || comparison=$?
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python -m reprolab project demo --review-handoff --output "$RUNNER_TEMP/reprolab-ci-demo" > "$result" || comparison=$?
           test "$comparison" -eq 1
           handoff="$(python -c 'import json, sys; print(json.load(sys.stdin)["handoff_dir"])' < "$result")"
           reprolab project check-summary "$handoff/project.zip" "$handoff/review-summary.md" \

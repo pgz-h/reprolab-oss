@@ -37,12 +37,6 @@ def main():
     if expected not in version:
         raise RuntimeError('Frozen executable version differs from source.')
     checks.append('frozen version')
-    for name in ('demo', 'history'):
-        report = cli(name, '--output', output/(name+' 中文 报告'), '--json')
-        assert report['status'] == 'verified'
-        assert cli('report', 'check', report['report_dir'], '--json')['status'] == 'consistent'
-        checks.append(name+': frozen workers, Unicode paths and evidence')
-
     repo = output/'project with spaces'
     repo.mkdir()
     (repo/'answer.py').write_text('def answer(): return 0\n', encoding='utf-8')
@@ -68,7 +62,6 @@ def main():
     checks.append('project preparation, execution, evidence import/export and replay')
 
     for name, filename, key in (
-        ('desktop', 'smoke-result.json', 'ok'),
         ('desktop_onboarding', 'onboarding-result.json', 'status'),
         ('desktop_config', 'config-result.json', 'status'),
         ('desktop_suite', 'suite-result.json', 'ok'),

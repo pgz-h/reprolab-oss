@@ -8,39 +8,16 @@ ReproLab 冻结改动前后的源码，在两版上运行同一份选定测试�
 
 [English](README.en.md) · [文档导航](docs/README.md) · [第一次使用](docs/first-run.md) · [安装](INSTALL.md) · [项目工作台](docs/project-workbench.md) · [CLI 与 CI](docs/cli-contract.md) · [更新记录](CHANGELOG.md)
 
-## 先看一次真实修复
+## 检查自己的项目
 
-内置 humanize 历史案例用同一测试核对 `naturalsize("1")`：旧版返回 `1.0 Byte`，修复版返回 `1 Byte`。运行后得到两版执行记录、修复差异和离线 HTML 报告，无需模型账号或下载被测项目。
-
-```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install .
-.venv/bin/reprolab history --output /tmp/reprolab-history
-```
-
-以上命令在已取得的源码根目录执行。案例采用上游原始单模块和 ReproLab 编写的行为检查；它不是完整 humanize 项目适配，也不是上游采用证明。见[案例与来源](docs/history-case.md)。
-
-在真实的 [async-lru PR #799](https://github.com/aio-libs/async-lru/pull/799) 上，ReproLab 运行了三个上游测试，基线均失败，候选均通过。[案例与重放指南](docs/replay-handoff-case.md)记录了固定提交、测试范围和接收方复跑步骤。
-
-桌面工作台支持[重放交接](docs/project-workbench.md#核对导出导入与明确重放)。接收方可以保存重放证据和回执，发送方可从原始证据与回传目录离线复核。Markdown 回执可附到 PR 或 CI。
-
-本版在「项目检查」提供 Python／pytest 工作台，以及 JavaScript／TypeScript 的 [Vitest 4 对比](docs/vitest.md)和 [Go 单包对比](docs/go.md)。Go 可从候选快照发现包内测试。后两项也可从 CLI 发起，保存可校验、可重放的证据。
-
-## 在终端体验一次 PR 审查
-
-安装本版 CLI 后，运行内置购物车教学项目。第一条命令实际测试两版，确认折扣修复，同时检测到故意留下的金额显示回归，预期返回 `1`。它会生成证据 ZIP、验收计划和 PR 摘要。最后一条命令模拟接收者，直接从这些文件复核摘要。
+用户安装包只提供工作台和 CLI。选择可信 Git 仓库、基线提交和一项已有测试，即可运行对比。将下面的路径和测试 ID 换成项目中的实际值，输出目录放在仓库之外。
 
 ```sh
-demo_dir="$(mktemp -d)"
-reprolab project demo --review-handoff --output "$demo_dir" > "$demo_dir/result.json" || test "$?" -eq 1
-handoff="$(python -c 'import json, sys; print(json.load(sys.stdin)["handoff_dir"])' < "$demo_dir/result.json")"
-reprolab project check-summary "$handoff/project.zip" "$handoff/review-summary.md" \
-  --acceptance-plan "$handoff/acceptance-plan.json"
+reprolab project review /path/to/repo --before HEAD --working-tree \
+  --test tests/test_feature.py::test_feature --output /path/to/reports
 ```
 
-看到 `status: consistent`，表示摘要与证据相符。`gate.status: failed` 仍记录这次审查发现的回归。供审查的 Markdown 位于交接目录中的 `review-summary.md`。 [离线核对 PR 摘要](docs/cli-contract.md#离线核对收到的-pr-摘要)
-
-开发版可在同一次运行中按计划确认必验测试由失败转为通过，并输出供 PR 审查的 Markdown。验收通过、失败和受阻会分别传回 CI；接收方仍可从交接 ZIP 离线复核证据。 [GitHub Actions 接入示例](docs/cli-contract.md#将验收摘要写入-github-actions)
+教学案例与贡献者测试仅随完整公开源码提供。[CLI 与 CI](docs/cli-contract.md) · [首次使用](docs/first-run.md)
 
 ## 适合什么任务
 
@@ -61,7 +38,6 @@ reprolab project check-summary "$handoff/project.zip" "$handoff/review-summary.m
 | 还没写好检查 | AI 验收计划：准备材料、审阅生成内容，再实际执行 |
 | 查看、交付或重放检查结果 | 报告与证据：查看、校验、导出、导入和明确重放 |
 
-第一次打开可选择“运行内置示例”；想了解完整项目流程，可选择“创建项目示例”。购物车示例只准备独立项目和冻结会话，由你决定发现和执行测试。两者均为人为构造的教学材料。
 
 ## 项目检查
 
@@ -91,7 +67,6 @@ reprolab project check-summary "$handoff/project.zip" "$handoff/review-summary.m
 python3 -m venv .venv
 .venv/bin/python -m pip install .
 . .venv/bin/activate
-reprolab demo
 ```
 
 检查可信项目的当前改动时，替换仓库、解释器和测试 ID，并把输出保存到仓库外。

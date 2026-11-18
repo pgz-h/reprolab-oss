@@ -1,18 +1,20 @@
 # 安装 ReproLab
 
+教学案例只随完整源码提供。安装包用于检查你自己的项目或接收已有证据。源码侧示例命令请在仓库根目录使用 `PYTHONPATH=src python -m reprolab`。
+
 [0.19.0a23 下载页](https://github.com/pgz-h/reprolab-oss/releases/tag/v0.19.0a23) 提供 Python 包和 macOS arm64 ZIP。Windows x64 便携附件待构建。
 
 ReproLab 仍处于 Alpha 阶段。源码安装需要 Python 3.11 或以上。macOS arm64 使用下方安装流程，Windows x64 的源码试用和构建步骤见[Windows 指南](docs/windows.md)。两端当前验证范围见[平台说明](docs/platforms.md)。
 
 ## 从已取得的源码安装
 
-在包含 `pyproject.toml` 的源码根目录打开终端。安装到独立环境后，可以直接体验内置示例。
+在包含 `pyproject.toml` 的源码根目录打开终端。安装到独立环境后，可以直接检查自己的仓库。
 
 ```sh
 python3 -m venv ~/.venvs/reprolab
 ~/.venvs/reprolab/bin/python -m pip install .
 ~/.venvs/reprolab/bin/reprolab --version
-~/.venvs/reprolab/bin/reprolab demo --output ~/reprolab-reports
+~/.venvs/reprolab/bin/reprolab project review --help
 ```
 
 安装桌面依赖并启动界面可使用下面的命令。
@@ -22,11 +24,11 @@ python3 -m venv ~/.venvs/reprolab
 ~/.venvs/reprolab/bin/reprolab-desktop
 ```
 
-pip 安装可能需要网络。已有测试和内置示例可以直接使用，AI 是可选功能。源码必须来自你有访问权限并且信任的项目来源。
+pip 安装可能需要网络。已有测试可以直接使用，AI 是可选功能。源码必须来自你有访问权限并且信任的项目来源。
 
 ## 使用 macOS 应用 ZIP
 
-已取得相应版本的 `ReproLab-<版本>-macOS-arm64.zip` 时，解压，将 `ReproLab.app` 放到合适目录，再打开应用。应用自带 Python 和 pytest。打开后可从“开始使用”运行内置示例。
+已取得相应版本的 `ReproLab-<版本>-macOS-arm64.zip` 时，解压，将 `ReproLab.app` 放到合适目录，再打开应用。应用自带 Python 和 pytest。打开后可从“项目检查”选择自己的仓库。
 
 公开下载以仓库 Releases 实际列出的附件为准。只有源码压缩包或本地构建记录时，请使用上面的源码安装方法。GitHub 自动生成的源码 ZIP 需要另行安装或构建。
 
@@ -46,7 +48,7 @@ python3 -m venv ~/.venvs/reprolab
 
 ## 接入自己的项目
 
-在项目工作台选择可信的本地 Git 仓库，并选择已经具备该项目依赖的 Python。应用自带环境适合内置示例，项目自己的虚拟环境更适合实际项目。
+在项目工作台选择可信的本地 Git 仓库，并选择已经具备该项目依赖的 Python。请为项目选择已安装其测试依赖的 Python 环境。
 
 CLI 可以先检查解释器和已安装依赖的元数据。
 

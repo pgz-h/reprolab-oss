@@ -19,11 +19,15 @@ desktop = ["PySide6-Essentials>=6.9,<7"]
 reprolab = "reprolab.cli:main"
 reprolab-desktop = "reprolab.desktop:main"
 
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.packages.find]
 where = ["src"]
+namespaces = false
 
 [tool.setuptools.package-data]
-reprolab = ["_vitest_worker.mjs", "demo_recheck/*", "ui_assets/*.svg", "demo_case/*.json", "demo_case/*.py", "demo_case/before/*.py", "demo_case/after/*.py", "history_cases/humanize250/*", "history_cases/humanize250/before/*", "history_cases/humanize250/after/*"]
+reprolab = ["_vitest_worker.mjs", "ui_assets/*.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

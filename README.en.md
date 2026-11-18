@@ -8,47 +8,16 @@ ReproLab freezes the source before and after a change, runs the same selected te
 
 [中文](README.md) · [Documentation index](docs/README.md) · [Installation](INSTALL.md) · [Project Workbench](docs/project-workbench.md) · [Changelog](CHANGELOG.md)
 
-## Try a real historical fix
+## Check your project
 
-From a source checkout, run the bundled humanize case. The same test observes `naturalsize("1")` returning `1.0 Byte` before the fix and `1 Byte` after it. No model account or project download is needed.
-
-```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install .
-.venv/bin/reprolab history --output /tmp/reprolab-history
-```
-
-This uses original upstream single-module snapshots and a ReproLab-authored behavior test. It is not full-package integration or evidence of upstream adoption. See the [case and provenance](docs/history-case.md).
-
-ReproLab is useful when repeated fixes, patch review or handoffs require more than a one-off pytest run. Existing tox, Nox and CI workflows can continue to prepare environments and run routine tests.
-
-## Try a pull request review from the CLI
-
-After installing the CLI, run the bundled shopping-cart example. The first command tests both versions, verifies the discount fix, and exits with `1` because of a deliberate price-format regression. It saves an evidence ZIP, an acceptance plan, and a PR summary. The final command checks those files from the recipient’s side.
+Choose a trusted Git checkout, a base commit and an existing test. Substitute your actual paths and test ID below. Keep the output outside the checkout.
 
 ```sh
-demo_dir="$(mktemp -d)"
-reprolab project demo --review-handoff --output "$demo_dir" > "$demo_dir/result.json" || test "$?" -eq 1
-handoff="$(python -c 'import json, sys; print(json.load(sys.stdin)["handoff_dir"])' < "$demo_dir/result.json")"
-reprolab project check-summary "$handoff/project.zip" "$handoff/review-summary.md" \
-  --acceptance-plan "$handoff/acceptance-plan.json"
+reprolab project review /path/to/repo --before HEAD --working-tree \
+  --test tests/test_feature.py::test_feature --output /path/to/reports
 ```
 
-`status: consistent` means the Markdown matches the evidence. `gate.status: failed` records the regression found during review. The PR-ready Markdown is saved as `review-summary.md` in the handoff directory. [Offline summary verification](docs/cli-contract.md#离线核对收到的-pr-摘要)
-
-The development version can verify a repair plan and save a Markdown review summary in the same run. CI receives a distinct exit code for passed, failed, and blocked results. A recipient can check the evidence from a handoff ZIP offline. [GitHub Actions example](docs/cli-contract.md#将验收摘要写入-github-actions)
-
-## Status
-
-On [async-lru PR #799](https://github.com/aio-libs/async-lru/pull/799), all three selected upstream tests failed on the baseline and passed on the candidate. The [replay case guide](docs/replay-handoff-case.md) records the pinned commits, test scope, and recipient replay steps.
-
-The desktop workbench supports [replay handoff](docs/project-workbench.md#核对导出导入与明确重放). Recipients can save the replay evidence and receipt together. Senders can verify the returned folder offline using their original evidence, then attach the Markdown receipt to a PR or CI summary.
-
-This release offers the Python and pytest workbench, [Vitest 4 comparison](docs/vitest.md) for JavaScript and TypeScript projects, and [single-package Go comparison](docs/go.md) in the desktop Project Check area. Go can discover tests from the candidate snapshot. The Vitest and Go workflows also run from the CLI and produce verifiable, replayable evidence.
-
-Use the linked guides for local development features and GitHub Releases for the scope of each public prerelease. See the [changes](CHANGELOG.md), [platform status](docs/platforms.md) and [validation notes](docs/release-readiness.md).
-
-The macOS arm64 desktop build uses an ad-hoc signature. The 0.19.0a22 Windows x64 portable build passed its native and frozen executable checks in GitHub Actions. Later development changes require their own validation. Downloadable builds are listed in Releases.
+Teaching fixtures and contributor tests are available in the full source checkout. [CLI and CI](docs/cli-contract.md) · [Getting started](docs/first-run.md)
 
 ## Choose a workflow
 
@@ -59,7 +28,6 @@ The macOS arm64 desktop build uses an ad-hoc signature. The 0.19.0a22 Windows x6
 | Prepare tests with optional AI assistance | Reviewable AI acceptance plans |
 | Inspect, share or replay execution records | Reports and evidence |
 
-The start page offers a small authored fix example and a shopping-cart project example. Creating the project example only prepares code and a frozen session; collection and execution require a separate action.
 
 ## Project Workbench
 
@@ -87,7 +55,6 @@ CLI users need Python >=3.11. Run these commands from the source checkout.
 python3 -m venv .venv
 .venv/bin/python -m pip install .
 . .venv/bin/activate
-reprolab demo
 ```
 
 To check pending changes in a trusted project, replace the repository, interpreter and test ID. Keep the output outside the target repository.

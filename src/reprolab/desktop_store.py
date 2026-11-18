@@ -204,9 +204,10 @@ class DesktopStore:
         if folder.is_dir():
             entries = list_cases(folder)["cases"]
         else:
-            warnings.append("尚未添加项目案例；内置示例已就绪，可从“开始使用”体验。")
+            warnings.append("尚未添加项目案例。")
         builtins = Path(__file__).parent
         paths = [builtins / "demo_case/case.json", builtins / "history_cases/humanize250/case.json"]
+        paths = [p for p in paths if p.is_file()]
         paths.extend(Path(p) for p in self.settings["extra_cases"])
         known = {item["file"] for item in entries}
         for path in paths:

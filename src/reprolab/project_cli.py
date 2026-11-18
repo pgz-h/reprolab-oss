@@ -120,9 +120,11 @@ def _parser():
         epilog="review、collect、run、recheck 和明确确认的 replay 会加载并运行可信项目代码；独立进程不是安全沙箱。",
     )
     commands = parser.add_subparsers(dest="command", required=True, parser_class=_Parser)
-    demo = commands.add_parser('demo', help='实际运行内置购物车项目并生成报告，预期检测到一个新增失败')
-    demo.add_argument('--output', type=Path, required=True, help='教学项目、会话与报告的保存根目录')
-    demo.add_argument('--review-handoff', action='store_true', help='另存证据 ZIP、验收计划和供接收方核对的摘要')
+    from . import source_examples_available
+    if source_examples_available():
+        demo = commands.add_parser('demo', help='实际运行内置购物车项目并生成报告，预期检测到一个新增失败')
+        demo.add_argument('--output', type=Path, required=True, help='教学项目、会话与报告的保存根目录')
+        demo.add_argument('--review-handoff', action='store_true', help='另存证据 ZIP、验收计划和供接收方核对的摘要')
     prepare = commands.add_parser("prepare", help="冻结两个版本或当前工作区，创建项目会话")
     review = commands.add_parser("review", help="一次冻结、发现并运行 pytest 项目对比")
     for command in (prepare, review):
