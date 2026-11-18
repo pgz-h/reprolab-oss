@@ -1,6 +1,24 @@
 """Plain-language next steps derived only from recorded outcomes and phases."""
 
 
+VITEST_OFFLINE_CACHE_MISSING = 'npm 离线缓存缺少依赖（ENOTCACHED），未运行测试。'
+
+
+def vitest_offline_cache_misses(report):
+    """Identify sides with an explicit npm cache miss during offline install."""
+    if report.get('runner') != 'vitest' or report.get('offline') is not True:
+        return ()
+    codes = (['npm', 'error', 'code', 'ENOTCACHED'], ['npm', 'ERR!', 'code', 'ENOTCACHED'])
+    missing = []
+    for side in ('before', 'after'):
+        run = report.get(side) or {}
+        log = run.get('log_excerpt')
+        if (run.get('phase') == 'dependencies' and run.get('status') == 'dependencies_failed'
+                and isinstance(log, str) and any(line.split() in codes for line in log.splitlines())):
+            missing.append(side)
+    return tuple(missing)
+
+
 def entry_action(entry, report):
     """Choose one useful next action; preserve secondary repair and evidence tools."""
     if not entry:

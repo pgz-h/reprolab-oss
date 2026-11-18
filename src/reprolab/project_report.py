@@ -8,12 +8,20 @@ import base64
 from collections import Counter
 import hashlib
 from html import escape
+from itertools import zip_longest
 import json
 import math
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
-from .project_diagnostics import group_project_failures
+from .project_archive import archive_preflight_text
+from .project_input_control import input_changes
+from .project_comparison import (
+    DIVERGENT_OUTCOME_LABELS, comparison_blocked, comparison_scope, comparison_scope_message,
+    comparison_verdict, pytest_order_difference,
+)
+from .pytest_profile import describe_pytest_rules
+from .project_diagnostics import VITEST_OFFLINE_CACHE_MISSING, group_project_failures, vitest_offline_cache_misses
 from .project_progress import OBSERVATION_LABELS
 
 
@@ -153,7 +161,7 @@ def _entries(report):
     return entries
 
 
-def _case_comparison(entry):
+def _case_comparison(entry, labels):
     cases = entry.get('case_entries') or []
     if not cases:
         return ''
@@ -168,10 +176,10 @@ def _case_comparison(entry):
             if observed.get('expected_failure'):
                 label += '（预期失败）'
             sides.append(label)
-        rows.append(f'<li><code>{_e(case["test_id"])}</code> · {_e(_ENTRY_LABELS[case["status"]])}'
+        rows.append(f'<li><code>{_e(case["test_id"])}</code> · {_e(labels[case["status"]])}'
                     f' · {_e(" → ".join(sides))}</li>')
     counts = Counter(case['status'] for case in cases)
-    summary = ' · '.join(f'{_ENTRY_LABELS[key]} {count}' for key, count in counts.items() if key != 'regression_passed')
+    summary = ' · '.join(f'{labels[key]} {count}' for key, count in counts.items() if key != 'regression_passed')
     title = f'查看 {len(rows)} 个用例' + (' · ' + summary if summary else '')
     return f'<details><summary>{_e(title)}</summary><ul>{"".join(rows)}</ul></details>'
 
@@ -183,21 +191,21 @@ def _entry_statuses(entry):
     return {status, *(case['status'] for case in entry.get('case_entries') or ())}
 
 
-def _matrix(entries, memberships=None, *, target_label="测试 node ID"):
+def _matrix(entries, memberships=None, *, target_label="测试 node ID", labels=_ENTRY_LABELS):
     rows = []
     for entry in entries:
         status = entry.get("status", "inconclusive")
         status = status if status in _ENTRY_LABELS else "inconclusive"
         statuses = _entry_statuses(entry)
-        search = " ".join((entry["test_id"], *(_ENTRY_LABELS.get(key, key) for key in sorted(statuses)),
+        search = " ".join((entry["test_id"], *(labels.get(key, key) for key in sorted(statuses)),
                            _json(entry.get("before")), _json(entry.get("after"))))
         missing = '<span class="missing">逐项结论未记录，暂列受阻</span>' if entry.get("missing_entry") else ""
         rows.append(
             f'<tr class="test-row" data-status="{status}" data-statuses="{_e(" ".join(sorted(statuses)))}" '
             f'data-groups="{_e(" ".join((memberships or {}).get(entry["test_id"], [])))}" data-search="{_e(search)}">'
             f'<th scope="row"><code class="node-id">{_e(entry["test_id"])}</code>{missing}</th>'
-            f'<td><span class="classification {status}">{_e(_ENTRY_LABELS[status])}</span>'
-            + (f'<p>{_e(entry["reason"])}</p>' if entry.get("reason") else '') + _case_comparison(entry) + '</td>'
+            f'<td><span class="classification {status}">{_e(labels[status])}</span>'
+            + (f'<p>{_e(entry["reason"])}</p>' if entry.get("reason") else '') + _case_comparison(entry, labels) + '</td>'
             f'<td>{_outcome(entry.get("before"))}</td><td>{_outcome(entry.get("after"))}</td></tr>'
         )
     empty = '<p class="empty">没有可展示的所选测试记录。</p>' if not entries else ""
@@ -225,7 +233,110 @@ def _diagnostic_overview(diagnostics):
             + '</section>')
 
 
-def _runtime_card(report, label, heading):
+def _archive_preflight(report):
+    preflight = report.get('archive_preflight')
+    heading = archive_preflight_text(preflight)
+    if not heading:
+        return ''
+    labels = {'before': '基线', 'after': '候选'}
+    reasons = {'archive_path': 'ZIP 格式不支持', 'windows_name': 'Windows 文件名不兼容',
+               'case_or_unicode_collision': '大小写或 Unicode 规范化后路径冲突'}
+    items = []
+    for issue in preflight['issues']:
+        detail = reasons[issue['reason']]
+        if conflict := issue.get('conflicts_with'):
+            detail += ' · 与 ' + conflict + ' 冲突'
+        items.append(f'<li>{labels[issue["side"]]} · <code>{_e(issue["path"])}</code> · {_e(detail)}</li>')
+    omitted = f'<p>另有 {preflight["omitted"]} 项省略。</p>' if preflight['omitted'] else ''
+    return '<details open><summary>' + _e(heading) + '</summary><ul>' + ''.join(items) + '</ul>' + omitted + '</details>'
+
+
+def _pytest_observations(report, scope):
+    if report.get('runner', 'pytest') != 'pytest':
+        return ''
+    sections = []
+    if audit := report.get('discovery_audit'):
+        items = []
+        labels = {'source_file_absent': '基线文件缺失', 'not_discovered': '候选未发现', 'possible_rename': '可能改名'}
+        for item in audit['baseline_only'][:40]:
+            names = '、'.join(item['possible_matches'])
+            detail = labels[item['reason']] + (' · ' + names if names else '')
+            items.append(f'<li><code>{_e(item["test_id"])}</code> · {_e(detail)}</li>')
+        status = '发现完整' if audit['status'] == 'complete' else '发现不完整，无法判定缺失项'
+        sections.append(f'<h3>双版本测试发现</h3><p>{status} · 基线 {audit["before_count"]} 项 · 候选 {audit["after_count"]} 项'
+                        f' · 基线独有 {len(audit["baseline_only"])} 项</p>'
+                        + ('<ul>' + ''.join(items) + '</ul>' if items else ''))
+    if changed := input_changes(report):
+        rows = ''.join(f'<li><code>{_e(item["test_id"])}</code> · {_e("、".join(item["names"]))}</li>'
+                       for item in changed[:40])
+        sections.append(f'<h3>业务输入发生变化</h3><p>{len(changed)} 项测试记录了不同的业务输入。</p><ul>{rows}</ul>')
+    if source := report.get('test_source_control'):
+        sections.append('<p>两版使用基线测试文件 · 来源报告 <code>'
+                        + _e(source['source_report_sha256']) + '</code></p>')
+    if metadata := report.get('input_control'):
+        sections.append(f'<p>固定基线业务输入 · {len(metadata["targets"])} 项 · 来源报告 <code>'
+                        + _e(metadata['source_report_sha256']) + '</code></p>')
+        if digest := metadata.get('plan_sha256'):
+            sections.append('<p>保护计划 SHA-256 · <code>' + _e(digest) + '</code></p>')
+    if fixture := report.get('fixture_control'):
+        names = '、'.join(item['path'] for item in fixture['files'])
+        sections.append('<p>候选使用基线夹具文件 · ' + _e(names) + ' · 来源报告 <code>'
+                        + _e(fixture['source_report_sha256']) + '</code></p>')
+    if changes := report.get('fixture_changes'):
+        sections.append('<p>相关 conftest.py 发生变化 · '
+                        + _e('、'.join(item['path'] for item in changes[:40])) + '</p>')
+    if version_order := report.get('version_order'):
+        from .project_version_order import STATE_NOTICE
+
+        positions = ' → '.join('基线 A' if side == 'before' else '候选 B'
+                               for side in version_order['started_versions']) or '无'
+        group = 'A→B' if version_order['group'] == 'ab' else 'B→A'
+        sections.append(f'<p>版本先后对照 · 计划 {group} · 已启动 {positions}。来源报告指纹 <code>'
+                        + _e(version_order['source_report_sha256']) + '</code>。</p><p>' + _e(STATE_NOTICE) + '</p>')
+    if order := report.get('order_control'):
+        label = '基线实际顺序' if order['mode'] == 'baseline' else '原请求顺序'
+        sections.append(f'<p>本次为顺序对照，两版采用{label}。来源报告指纹 <code>'
+                        + _e(order['source_report_sha256']) + '</code>。</p>')
+    if imports := (scope or {}).get('pytest_import_issues'):
+        labels = {'installed-package': '环境安装包', 'external': '外部路径', 'built-in': '内置模块',
+                  'frozen': '冻结模块', 'unknown': '来源未知'}
+        rows = []
+        for item in imports[:40]:
+            cells = []
+            for side in ('before', 'after'):
+                origin = '、'.join('快照 · ' + value.removeprefix('snapshot:') if value.startswith('snapshot:')
+                                  else labels.get(value, value) for value in item[side])
+                cells.append('<td>' + _e(origin or '未观察到') + '</td>')
+            rows.append('<tr><th scope="row"><code>' + _e(item['module']) + '</code></th>' + ''.join(cells) + '</tr>')
+        sections.append('<h3>需核对的 Python 导入来源</h3><div class="table-scroll"><table class="matrix">'
+                        '<thead><tr><th scope="col">模块</th><th scope="col">基线</th><th scope="col">候选</th></tr></thead>'
+                        '<tbody>' + ''.join(rows) + '</tbody></table></div>')
+        if len(imports) > len(rows):
+            sections.append('<p>仅显示前 40 项。完整信息可从报告 JSON 核对。</p>')
+    before, after = (report.get(side, {}).get('execution_order') for side in ('before', 'after'))
+    if before is not None and after is not None:
+        requested = report.get('selected_tests', [])
+        length = max(len(requested), len(before), len(after))
+        sequences = list(zip_longest(requested, before, after, fillvalue='—'))
+        positions = list(range(length))
+        difference = pytest_order_difference(report)
+        if difference:
+            positions.sort(key=lambda index: sequences[index][1] == sequences[index][2])
+        rows = ''.join(f'<tr><th scope="row">{index + 1}</th>' +
+                       ''.join(f'<td><code>{_e(name)}</code></td>' for name in sequences[index]) + '</tr>'
+                       for index in sorted(positions[:24]))
+        notice = (f'<p>两版实际启动顺序不同，{difference["positions_changed"]} 个共同测试的位置发生变化。</p>'
+                  if difference else '')
+        if length > 24:
+            notice += '<p>本表展示最多 24 个位置。完整顺序保存在各版阶段事件 JSON 中。</p>'
+        sections.append('<details' + (' open' if difference else '') + '><summary>测试执行顺序</summary>'
+                        + notice + '<div class="table-scroll"><table class="matrix"><thead><tr>'
+                        '<th scope="col">位置</th><th scope="col">请求顺序</th><th scope="col">基线实际</th>'
+                        '<th scope="col">候选实际</th></tr></thead><tbody>' + rows + '</tbody></table></div></details>')
+    return ('<section class="card section"><h2>pytest 执行核对</h2>' + ''.join(sections) + '</section>') if sections else ''
+
+
+def _runtime_card(report, label, heading, cache_misses):
     run = _mapping(report.get(label))
     runtime = _mapping(report.get("runtime"))
     errors = _items(run.get("collection_errors"))
@@ -239,10 +350,13 @@ def _runtime_card(report, label, heading):
         ("worker 记录", complete), ("测试记录数", len(_mapping(run.get("tests")))),
         ("Python", run.get("python_version") or runtime.get("python_version")),
         ("pytest", run.get("pytest_version") or runtime.get("pytest_version")),
+        ("pytest 项目规则", describe_pytest_rules(run.get("pytest_rules")) or None),
         ("Vitest", run.get("vitest_version")), ("Go", runtime.get("go_version")),
         ("最后执行阶段", run.get("phase")),
     ])
-    if run.get('status') == 'dependencies_failed':
+    if label in cache_misses:
+        errors = [VITEST_OFFLINE_CACHE_MISSING, *errors]
+    elif run.get('status') == 'dependencies_failed':
         errors = ['npm ci 未完成，请查看日志中的依赖、缓存或 registry 错误。', *errors]
     error_html = ('<div class="collection-errors"><h4>收集 / 执行错误</h4><pre>'
                   + _e(_json(errors)) + "</pre></div>") if errors else ""
@@ -303,12 +417,15 @@ def _source(report):
                '来源会话和旧报告保留；本报告的结果只覆盖本次实际选择。</p>')
     review_source = _mapping(report.get('review_source'))
     if review_source:
+        runner = {'go': 'Go', 'vitest': 'Vitest'}.get(report.get('runner'))
+        review_note = (f'在桌面 {runner} 项目对比页打开本报告，来源可核对时会显示候选间复查结果。'
+                       if runner else '在桌面项目结果页使用“与来源报告比较”。报告移动后可重新定位，须通过身份与证据核对。')
         refresh += '<h3>复查所绑定的来源报告</h3>' + _facts([
             ('来源会话 ID', review_source.get('project_id')), ('来源运行 ID', review_source.get('run_id')),
             ('来源报告目录', review_source.get('report_dir')), ('来源报告指纹', review_source.get('report_sha256')),
             ('带入范围', {'all': '来源报告全部选择', 'attention': '来源报告失败／受阻项',
                         'selected': '来源报告明确子集', 'workspace': '当前工作区的勾选／继承选择'}.get(review_source.get('selection_mode'), '范围方式未记录')),
-        ]) + '<p class="muted">在桌面项目结果页使用“与来源报告比较”。报告移动后可重新定位，须通过身份与证据核对。</p>'
+        ]) + f'<p class="muted">{review_note}</p>'
     return (f'<section class="card section"><div class="section-head"><div><p class="eyebrow">FROZEN INPUTS</p>'
             f'<h2>来源与固定输入</h2></div><span class="tag">{mode}</span></div>{facts}'
             f'<p class="muted">{note}</p>{refresh}<details><summary>内容、权限与所选测试指纹</summary>{"".join(hashes)}</details>'
@@ -375,6 +492,9 @@ def _environment(report):
     if report.get("runner") == "vitest":
         facts = _facts([
             ("Node.js", runtime.get("node_version")), ("npm", runtime.get("npm_version")),
+            ("npm 项目目录", report.get("vitest_project_dir", ".")),
+            ("npm workspace 安装根目录", _mapping(report.get("vitest_install")).get("root")
+             if _mapping(report.get("vitest_install")).get("workspaces") else None),
             ("系统", environment.get("platform")), ("架构", environment.get("machine")),
             ("每版总超时", _seconds(report.get("timeout"))),
             ("依赖安装", "仅使用 npm 缓存" if report.get("offline") else "npm ci"),
@@ -456,6 +576,7 @@ def write_project_report(report: dict) -> str:
     entries = _entries(report)
     runner = report.get("runner")
     is_vitest = runner == "vitest"
+    cache_misses = vitest_offline_cache_misses(report)
     diagnostics = {"groups": []} if runner in ("vitest", "go") else group_project_failures(report)
     memberships = {}
     for group in diagnostics['groups']:
@@ -465,8 +586,28 @@ def write_project_report(report: dict) -> str:
                             + '</option>' for group in diagnostics['groups'])
     counts = Counter(entry.get("status") if entry.get("status") in _ENTRY_LABELS else "inconclusive"
                      for entry in entries)
-    status = report.get("status", "attention")
+    finding = comparison_scope(report)
+    labels = _ENTRY_LABELS
+    if finding and finding['divergent_outcomes']:
+        labels = {**labels, **DIVERGENT_OUTCOME_LABELS}
+    status = comparison_verdict(report, finding)
     heading, style, explanation = _GLOBAL.get(status, _GLOBAL["attention"])
+    if comparison_blocked(report, finding):
+        heading = {'same_snapshot_divergence': '同快照结果分歧', 'excluded_changes_only': '本次改动未纳入快照',
+                   'pytest_import_origin': '实际导入来源需核对',
+                   'pytest_test_source_control': '基线测试文件对照',
+                   'pytest_parameter_changed': '参数化输入需核对',
+                   'pytest_input_changed': '业务输入需核对',
+                   'pytest_input_control': '基线业务输入对照',
+                   'pytest_fixture_changed': '夹具输入需核对',
+                   'pytest_fixture_control': '基线夹具对照结果',
+                   'pytest_discovery_scope': '测试保护范围需核对',
+                   'failure_shape_changed': '故障表现变化',
+                   'pytest_version_order': '版本先后对照结果',
+                   'pytest_order_control': '固定顺序对照结果'}[finding['reason']]
+        explanation = _e(comparison_scope_message(finding))
+    elif finding:
+        explanation += ' ' + _e(comparison_scope_message(finding))
     title = report.get("title") or "项目回归报告"
     selected = _items(report.get("selected_tests"))
     selected_count = len(selected) if "selected_tests" in report else len(entries)
@@ -484,7 +625,7 @@ def write_project_report(report: dict) -> str:
         scope = f'本次选择 <strong>{selected_count}</strong> 个测试文件。'
         if 'case_counts' in report:
             case_counts = _mapping(report['case_counts'])
-            case_stats = ' · '.join(f'{label} {case_counts.get(key, 0)}' for key, label in _ENTRY_LABELS.items())
+            case_stats = ' · '.join(f'{label} {case_counts.get(key, 0)}' for key, label in labels.items())
             retries = sum(any(case[side].get('retry_passed') for side in ('before', 'after'))
                           for entry in entries for case in entry.get('case_entries') or ())
             case_summary = (f'<p>匹配用例 · {_e(case_stats)}</p>'
@@ -497,10 +638,10 @@ def write_project_report(report: dict) -> str:
     else:
         scope = f'本次选择 <strong>{selected_count}</strong> 个测试 · {_e(discovery)} · 表中展示 <strong>{len(entries)}</strong> 项。结论仅覆盖这些所选测试。'
     stats = "".join(f'<div class="stat {key}"><b>{counts[key]}</b><span>{label}</span></div>'
-                    for key, label in _ENTRY_LABELS.items())
+                    for key, label in labels.items())
     filter_counts = Counter(status for entry in entries for status in _entry_statuses(entry))
     options = "".join(f'<option value="{key}">{label} · {filter_counts[key]}</option>'
-                      for key, label in _ENTRY_LABELS.items())
+                      for key, label in labels.items())
     notice = f'<p class="notice">{_e(report["notice"])}</p>' if report.get("notice") else ""
     issue = (f'<details><summary>本次问题与检查说明</summary><pre>{_e(report["issue"])}</pre></details>'
              if report.get("issue") else "")
@@ -526,18 +667,18 @@ def write_project_report(report: dict) -> str:
 <main><p class="eyebrow">ONE PROJECT · TWO SNAPSHOTS · SELECTED TESTS</p><h1>{_e(title)}</h1>
 <p class="subtitle">项目 {_e(_value(report.get("project_id")))} · 运行 {_e(_value(report.get("run_id")))} · {_e(_value(report.get("created_at")))}</p>
 <section class="hero {style}" aria-label="本次项目回归结论"><h2>{heading}</h2><p>{explanation}</p>
-<p class="scope">{scope}</p>{acceptance_note}{notice}{issue}{collection_error}</section>
+<p class="scope">{scope}</p>{acceptance_note}{_archive_preflight(report)}{notice}{issue}{collection_error}</section>
 <div class="stats" aria-label="逐项结果数量">{stats}</div>
 {case_summary}{_diagnostic_overview(diagnostics)}
 <section class="card section" id="tests"><div class="section-head"><div><p class="eyebrow">TEST MATRIX</p><h2>逐项比较前后结果</h2></div><span class="tag">同一份目标测试</span></div>
-<p class="muted">新增失败：旧版通过、新版失败。原有失败：两版均失败。改善：旧版失败、新版通过。{blocked_note}</p>
+<p class="muted">原有失败表示两版均失败。逐项保留每版真实观察。{blocked_note}</p>
 <div class="toolbar"><label class="search" for="test-search">搜索 node ID、异常或阶段记录<input id="test-search" type="search" placeholder="例如 test_export[utf8] 或 AssertionError" autocomplete="off"></label>
 <label for="status-filter">结果筛选<select id="status-filter"><option value="">全部结果 · {len(entries)}</option>{options}</select></label><label for="diagnostic-filter">现象筛选<select id="diagnostic-filter"><option value="">全部现象</option>{group_options}</select></label><button type="button" id="clear-filters">清除筛选</button><span class="visible-count" id="visible-count" aria-live="polite">显示 {len(entries)} / {len(entries)} 项</span></div>
-<noscript><p class="muted">当前浏览器未启用脚本，全部记录仍可阅读；搜索与筛选需要启用本地脚本。</p></noscript>{_matrix(entries, memberships, target_label=selection_unit)}</section>
-<div class="runtime-grid">{_runtime_card(report, "before", "基线版本的实际运行")}{_runtime_card(report, "after", "对比版本的实际运行")}</div>
-{_source(report)}{_changes(report)}{_environment(report)}
+<noscript><p class="muted">当前浏览器未启用脚本，全部记录仍可阅读；搜索与筛选需要启用本地脚本。</p></noscript>{_matrix(entries, memberships, target_label=selection_unit, labels=labels)}</section>
+<div class="runtime-grid">{_runtime_card(report, "before", "基线版本的实际运行", cache_misses)}{_runtime_card(report, "after", "对比版本的实际运行", cache_misses)}</div>
+{_pytest_observations(report, finding)}{_source(report)}{_changes(report)}{_environment(report)}
 <section class="card section"><p class="eyebrow">EVIDENCE & SCOPE</p><h2>证据与能力范围</h2>
-{_facts([("运行编号", report.get("run_id")), ("会话编号", report.get("project_id")), ("记录时间", report.get("created_at")), ("原始状态", status)])}
+{_facts([("运行编号", report.get("run_id")), ("会话编号", report.get("project_id")), ("记录时间", report.get("created_at")), ("原始状态", report.get("status"))])}
 <div class="links">{_link("report.json", "结构化报告 JSON")}{_link("before.log", "BEFORE 完整日志")}{_link("after.log", "AFTER 完整日志")}{_link("before.events.json", "BEFORE 事件")}{_link("after.events.json", "AFTER 事件")}{_link("evidence/", "全部固定输入证据")}</div>
 <ul class="scope-list"><li>仅运行明确选中的{selection_unit}；未选中的项目功能不在本报告结论中。</li><li>只有两版实际通过，或旧版失败而新版通过，且记录完整、没有收集或执行错误，才构成全局回归通过。</li><li>源码快照、普通文件权限、目标测试与日志事件可核对；一致性检查不代表作者身份认证。</li><li>仅用于可信项目。独立运行进程与固定副本不是安全沙箱。{code_notice}</li><li>HTML 在本地使用，无外部字体、脚本、网络请求或数据上传。证据链接均相对于报告目录，导出时请保留目录结构。</li></ul>
 <details><summary>引擎记录的统计</summary><pre>{_e(_json(report.get("counts", {})))}</pre></details></section>

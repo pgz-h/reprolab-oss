@@ -1,8 +1,16 @@
 # 验证与发布状态
 
-## 开发分支
+## 0.19.0a23 Alpha
+
+本版附件、验证摘要与 SHA-256 清单见[公开发行页](https://github.com/pgz-h/reprolab-oss/releases/tag/v0.19.0a23)。本版准备 Python wheel、源码包、公开源码快照和 macOS arm64 应用 ZIP；Windows x64 便携附件待构建。GitHub 运行记录仅覆盖对应提交及所列作业。
+
+## 历史开发分支
 
 `90bf648` 在 Windows x64 GitHub Actions 上通过原生检查和实际 exe 验收。该次检查覆盖 pytest 对比与重放、Qt 离屏界面和本地模拟模型，生成未签名便携候选包。Go 在此运行中的覆盖范围限于构建进候选。 [Windows Actions](https://github.com/pgz-h/reprolab-oss/actions/runs/43006106781#artifacts)
+
+## 0.19.0a22 Alpha 候选
+
+0.19.0a22 发行目录包含未签名 Windows x64 便携 ZIP、macOS arm64 ZIP、源码和 Python 分发包。该发行目录的 `validation-summary.json` 记录 Windows 原生与 exe 验收、macOS 包验收、Python 3.11／3.14 矩阵和 Go 集成检查。后续工作树的检查须以其自身的验证记录为准。
 
 ## 0.19.0a21 Alpha 候选
 

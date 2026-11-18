@@ -10,6 +10,7 @@ import tempfile
 
 from .runner import EXCLUDED, MAX_BYTES, MAX_ENTRIES, run_case
 from .case import parse_test_target
+from .project_snapshot_scope import in_source_scope
 
 
 def _git(repo, *args, data=None):
@@ -36,7 +37,28 @@ def resolve_commit(repo, ref):
     return sha
 
 
-def export_revision(repo, sha, destination):
+def excluded_source_path(path):
+    return any(part in EXCLUDED or part.startswith('.env') for part in path.parts)
+
+
+def excluded_tracked_changes(repo, before, after=None, *, saved_baseline=False, snapshot_scope=None):
+    """Count changes omitted by the snapshot policy without saving paths or contents."""
+    if before == after:
+        return 0
+    if saved_baseline:
+        try:
+            resolve_commit(repo, before)
+        except ValueError:
+            # Rechecks can use the saved baseline after history has been rewritten.
+            return None
+    revisions = [before] if after is None else [before, after]
+    changed = _git(repo, 'diff', '--name-only', '--no-renames', '--no-ext-diff', '--no-textconv',
+                   '-z', *revisions, '--')
+    paths = (PurePosixPath(os.fsdecode(name)) for name in changed.split(b'\0') if name)
+    return sum(excluded_source_path(path) or not in_source_scope(path, snapshot_scope) for path in paths)
+
+
+def export_revision(repo, sha, destination, *, snapshot_scope=None):
     # Raw blobs avoid git archive export-ignore silently removing tested code.
     entries, size_total = [], 0
     for record in _git(repo, "ls-tree", "-r", "-l", "-z", "--full-tree", sha).split(b"\0"):
@@ -51,7 +73,7 @@ def export_revision(repo, sha, destination):
         path = PurePosixPath(name)
         if path.is_absolute() or any(p in (".", "..") for p in path.parts):
             raise ValueError(f"不支持的 Git 文件路径：{name}")
-        if any(p in EXCLUDED or p.startswith(".env") for p in path.parts):
+        if excluded_source_path(path) or not in_source_scope(path, snapshot_scope):
             continue
         if mode == b"120000":
             raise ValueError(f"当前不支持 Git 源码中的符号链接：{name}")
@@ -69,6 +91,20 @@ def export_revision(repo, sha, destination):
         return
     request = b"".join(oid + b"\n" for _, oid, _, _ in entries)
     stream = io.BytesIO(_git(repo, "cat-file", "--batch", data=request))
+    physical_directories = {}
+
+    def mkdir_checked(relative):
+        if relative == PurePosixPath('.'):
+            return
+        path = destination.joinpath(*relative.parts)
+        path.mkdir(parents=True, exist_ok=True)
+        info = path.stat()
+        if info.st_ino:
+            actual = (info.st_dev, info.st_ino)
+            previous = physical_directories.setdefault(actual, relative)
+            if previous != relative:
+                raise ValueError(f'目标文件系统将不同源码目录视为同一路径：{previous} / {relative}')
+
     for name, oid, size, mode in entries:
         if stream.readline().split() != [oid, b"blob", str(size).encode()]:
             raise ValueError("Git 对象读取结果与版本清单不一致。")
@@ -77,9 +113,15 @@ def export_revision(repo, sha, destination):
             raise ValueError("Git 文件内容不完整。")
         if content.startswith(b"version https://git-lfs.github.com/spec/v1\n"):
             raise ValueError(f"当前不自动下载 Git LFS 内容：{name}")
-        target = destination.joinpath(*PurePosixPath(name).parts)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
+        relative = PurePosixPath(name)
+        target = destination.joinpath(*relative.parts)
+        for parent in reversed(relative.parents):
+            mkdir_checked(parent)
+        try:
+            with target.open('xb') as stream_file:
+                stream_file.write(content)
+        except FileExistsError:
+            raise ValueError(f'目标文件系统出现源码文件名冲突：{name}') from None
         target.chmod(0o755 if mode == b"100755" else 0o644)
 
 

@@ -57,6 +57,15 @@ def collection_diagnosis(record):
                               r"([A-Za-z_][A-Za-z0-9_.]{0,119})['\"]\s*$", error)
             if match and match[1] not in modules:
                 modules.append(match[1])
+    if code in ('collection_failed', 'worker_error'):
+        plugin_error = re.search(
+            r'''(?m)^(?:ERROR|ImportError): Error importing plugin ["']([A-Za-z_][A-Za-z0-9_.-]{0,199})["']: '''
+            r'''No module named ["']([A-Za-z_][A-Za-z0-9_.]{0,119})["'][ \t]*$''',
+            record.get('log_excerpt') or '')
+        if plugin_error:
+            plugin, missing = plugin_error.groups()
+            return {'code': code, 'missing_modules': [missing],
+                    'summary': f'无法加载 pytest 插件 {plugin}，缺少模块 {missing}。请检查所选 Python 环境。'}
     if modules:
         names = '、'.join(modules[:3]) + ('等' if len(modules) > 3 else '')
         detail = '导入失败：找不到 ' + names + '。请检查 Python 环境与项目导入配置。'

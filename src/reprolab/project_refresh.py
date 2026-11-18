@@ -1,12 +1,58 @@
 """Refresh immutable inputs while retaining their baseline and selection intent."""
+from contextlib import contextmanager
 from pathlib import Path
+import tempfile
 
 from .case import parse_test_target
+from .git_source import excluded_tracked_changes
 from .project_collection import CollectionPathUnavailable
 from .project_selections import reconcile_selection, requested_selection, validate_selection
 from .project_sessions import _collection, _identity, _prepare_project, read_project
 from .recipes import repository_root
 from .workspace import WORKTREE
+
+
+@contextmanager
+def _stage_worktree_recheck(source, output, repository, *, control):
+    from .project_history import report_reference
+    from .repair_suite import _new_id
+    from .runner import snapshot, source_fingerprint, source_mode_fingerprint
+    from .workspace import copy_workspace
+
+    try:
+        root = repository_root(Path(repository or source['repository']).expanduser())
+    except ValueError as exc:
+        raise ValueError('请改选可读取的本机 Git 仓库。' + str(exc)) from exc
+    folder = Path(source['report_dir'])
+    output = Path(output).expanduser().resolve()
+    if output.is_relative_to(folder) or output.is_relative_to(root):
+        raise ValueError('请将复查报告保存在来源报告和被测仓库之外。')
+    control.check()
+    output.mkdir(parents=True, exist_ok=True)
+    runner = source['runner']
+    final = output / _new_id(runner + '-run')
+    with tempfile.TemporaryDirectory(prefix=f'.{runner}-recheck-', dir=output) as temp:
+        stage = Path(temp) / final.name
+        snapshots = stage / 'evidence/project/inputs'
+        snapshots.mkdir(parents=True)
+        before = folder / 'evidence/project/inputs/before'
+        entries, digest = source_fingerprint(before)
+        baseline_mode = source['source_mode_sha256']['before']
+        if (digest != source['source_sha256']['before']
+                or snapshot(before, snapshots / 'before', entries, control=control) != digest
+                or source_mode_fingerprint(snapshots / 'before') != baseline_mode):
+            raise ValueError('来源报告的固定基线或文件权限发生变化，请重新打开。')
+        copied = copy_workspace(root, snapshots / 'after', control=control)
+        control.check()
+        title = {'go': 'Go', 'vitest': 'Vitest'}[runner]
+        metadata = {'project_id': _new_id('project'), 'title': f'{root.name} · {title} 项目回归',
+                    'repository': str(root), 'before_commit': source['before_commit'], 'after_commit': WORKTREE,
+                    'excluded_tracked_changes': excluded_tracked_changes(root, source['before_commit'], saved_baseline=True),
+                    'source_sha256': {'before': digest, 'after': copied['sha256']},
+                    'source_mode_sha256': {'before': baseline_mode, 'after': source_mode_fingerprint(snapshots / 'after')},
+                    'review_source': {**report_reference(source), 'selection_mode': 'all',
+                                      'selected_tests': source['selected_tests']}}
+        yield stage, final, metadata
 
 
 def refresh_project(directory, output_root, *, selected_ids=None, python_executable=None, control=None,
@@ -64,9 +110,15 @@ def refresh_from_displayed_report(directory, output_root, reference, *, selected
         python_executable=python_executable, control=control, review_source=origin, expected_source=report)
 
 
-def review_project_selection(directory, *, selected_ids=None):
+def review_project_selection(directory, *, selected_ids=None, acceptance_plan=None):
     """Read saved discovery evidence only; never start an interpreter or pytest."""
     state = read_project(directory)
+    if acceptance_plan is not None:
+        from .acceptance_plan import review_pytest_plan
+
+        if selected_ids is not None:
+            raise ValueError('验收计划与显式测试清单不能同时核对。')
+        return review_pytest_plan(acceptance_plan, state, _collection(state, state['runtime']))
     selected = (requested_selection(state) if selected_ids is None
                 else validate_selection(selected_ids, allow_empty=True))
     collection = _collection(state, state['runtime'])

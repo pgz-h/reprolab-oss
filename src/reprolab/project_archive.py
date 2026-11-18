@@ -1,9 +1,11 @@
 """Pack verified project runs and their exact ancestry without changing report files."""
 import json
+import os
 from pathlib import Path, PurePosixPath
 import shutil
 import stat
 import tempfile
+import unicodedata
 import zipfile
 
 from .runner import RunControl
@@ -14,7 +16,7 @@ _MANIFEST = 'reprolab-history.json'
 
 
 def _checked_chain(directory, *, include_sources, control, locations=None, bundled_only=False,
-                   expected_report=None):
+                   expected_report=None, series=False):
     from . import project_history as history
     from .processing_history import MAX_ROUNDS, MAX_REPORT_BYTES
 
@@ -23,8 +25,8 @@ def _checked_chain(directory, *, include_sources, control, locations=None, bundl
     reference = expected_report
     while True:
         control.check()
-        if len(seen) >= MAX_ROUNDS:
-            raise ValueError(f'复查来源超过 {MAX_ROUNDS} 轮；可以改为仅导出本次报告。')
+        if len(seen) >= (2000 if series else MAX_ROUNDS):
+            raise ValueError(f'复查来源超过 {2000 if series else MAX_ROUNDS} 轮。')
         report = history._checked_report(directory, control=control)
         if reference is not None:
             history._match_reference(report, reference)
@@ -34,7 +36,7 @@ def _checked_chain(directory, *, include_sources, control, locations=None, bundl
         seen.add(identity)
         folder = Path(report['report_dir'])
         total += (folder / 'report.json').stat().st_size
-        if include_sources and total > MAX_REPORT_BYTES:
+        if include_sources and not series and total > MAX_REPORT_BYTES:
             raise ValueError('复查链的报告 JSON 合计超过 64 MiB；可以改为仅导出本次报告。')
         yield report
         reference = report.get('review_source')
@@ -57,18 +59,80 @@ def _archive_path(name):
     if (not name or len(name) > 4000 or path.is_absolute() or '\\' in name or ':' in name
             or any(part in ('', '.', '..') for part in parts)
             or any(ord(character) < 32 for character in name)):
-        raise ValueError('项目 ZIP 的条目路径无效。')
+        raise ValueError(f'项目 ZIP 不支持此条目路径：{name!r}')
     return path
 
 
+def source_zip_preflight(snapshots, *, runner='pytest', control=None):
+    """Check frozen source paths against the standalone report format and common Windows limits."""
+    prefix = {'pytest': 'project-run', 'go': 'go-run', 'vitest': 'vitest-run'}[runner]
+    root = prefix + '-20000101T000000Z-00000000'
+    blocking, portability = [], []
+    blocked = review = 0
+
+    def add(side, path, reason, *, conflict=None):
+        nonlocal blocked, review
+        if reason == 'archive_path':
+            blocked += 1
+            items = blocking
+        else:
+            review += 1
+            items = portability
+        if len(items) < 24:
+            item = {'side': side, 'path': path, 'reason': reason}
+            if conflict is not None:
+                item['conflicts_with'] = conflict
+            items.append(item)
+
+    for side in ('before', 'after'):
+        tree = Path(snapshots) / side
+        names = {}
+        for path in sorted(tree.rglob('*')):
+            if control:
+                control.check()
+            relative = path.relative_to(tree).as_posix()
+            member = f'{root}/evidence/project/inputs/{side}/{relative}'
+            try:
+                _archive_path(member)
+            except ValueError:
+                add(side, relative, 'archive_path')
+            component = path.name
+            device = component.partition('.')[0].rstrip().upper()
+            if (any(character in component for character in '<>"|?*')
+                    or component.endswith(('.', ' '))
+                    or device in ('CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$')
+                    or device[:3] in ('COM', 'LPT') and len(device) == 4 and device[3] in '123456789¹²³'):
+                add(side, relative, 'windows_name')
+            canonical = unicodedata.normalize('NFC', relative).casefold()
+            previous = names.setdefault(canonical, relative)
+            if previous != relative:
+                add(side, relative, 'case_or_unicode_collision', conflict=previous)
+    issues = (blocking + portability)[:24]
+    return {'status': 'blocked' if blocked else 'review' if review else 'ready',
+            'blocked_count': blocked, 'portability_count': review, 'issues': issues,
+            'omitted': blocked + review - len(issues)}
+
+
+def archive_preflight_text(preflight):
+    if not preflight or preflight['status'] == 'ready':
+        return ''
+    parts = []
+    if count := preflight['blocked_count']:
+        parts.append(f'{count} 个快照路径阻碍证据 ZIP 导出')
+    if count := preflight['portability_count']:
+        parts.append(f'{count} 个跨平台路径问题需核对')
+    return ' · '.join(parts)
+
+
 def pack_project_report(directory, destination, *, include_sources=False, locations=None,
-                        expected_report=None, control=None):
+                        expected_report=None, control=None, _max_bytes=None):
     from . import project_history as history
 
     control = control or RunControl()
+    byte_limit = _MAX_BYTES if _max_bytes is None else _max_bytes
     target = Path(destination).expanduser().absolute()
     if target.exists() or target.is_symlink():
-        raise ValueError('请选择报告目录外的新 ZIP 文件。')
+        raise ValueError('目标路径已存在，请选择新的 ZIP 文件名或位置。')
     files = []
     references = []
     total = 0
@@ -95,42 +159,41 @@ def pack_project_report(directory, destination, *, include_sources=False, locati
             _archive_path(name)
             files.append((path, name))
             total += 0 if name.endswith('/') else path.stat().st_size
-            if len(files) > _MAX_ENTRIES or total > _MAX_BYTES:
-                raise ValueError('项目证据超过 ZIP 交付限制（20000 条目 / 250 MiB）。')
+            if len(files) > _MAX_ENTRIES or total > byte_limit:
+                raise ValueError(f'项目证据超过 ZIP 交付限制（{_MAX_ENTRIES} 条目 / {byte_limit} 字节）。')
     manifest = None
     if len(references) > 1:
         manifest = json.dumps({'schema_version': 1, 'reports': [ref['report_sha256'] for ref in references]})
-        if len(files) + 1 > _MAX_ENTRIES or total + len(manifest) > _MAX_BYTES:
-            raise ValueError('项目证据超过 ZIP 交付限制（20000 条目 / 250 MiB）。')
+        if len(files) + 1 > _MAX_ENTRIES or total + len(manifest) > byte_limit:
+            raise ValueError(f'项目证据超过 ZIP 交付限制（{_MAX_ENTRIES} 条目 / {byte_limit} 字节）。')
     target.parent.mkdir(parents=True, exist_ok=True)
-    owned = False
-    try:
-        with zipfile.ZipFile(target, 'x', compression=zipfile.ZIP_DEFLATED) as archive:
-            owned = True
+    with tempfile.TemporaryDirectory(prefix='.project-pack-', dir=target.parent) as directory:
+        staged = Path(directory) / 'evidence.zip'
+        with zipfile.ZipFile(staged, 'x', compression=zipfile.ZIP_DEFLATED) as archive:
             for path, name in files:
                 control.check()
                 archive.write(path, name)
             if manifest is not None:
                 archive.writestr(f'{root}/{_MANIFEST}', manifest)
-        if target.stat().st_size > _MAX_BYTES:
-            raise ValueError('项目证据 ZIP 超过 250 MiB。')
+        if staged.stat().st_size > byte_limit:
+            raise ValueError(f'项目证据 ZIP 超过 {byte_limit} 字节。')
         for reference in references:
             report = history._checked_report(reference['report_dir'], control=control)
             history._match_reference(report, reference)
         control.commit()
-    except BaseException:
-        if owned:
-            target.unlink(missing_ok=True)
-        raise
+        try:
+            os.link(staged, target)
+        except FileExistsError:
+            raise ValueError('目标路径已存在，请选择新的 ZIP 文件名或位置。') from None
     return {'status': 'packed', 'output': str(target), 'files': sum(not name.endswith('/') for _, name in files),
             'report_count': len(references),
             'notice': '解压后可使用 project check 核对并以 project replay 明确重放。'}
 
 
-def _extract(bundle, stage, control):
+def _extract(bundle, stage, control, byte_limit):
     with zipfile.ZipFile(bundle) as archive:
         entries = archive.infolist()
-        if len(entries) > _MAX_ENTRIES or sum(item.file_size for item in entries) > _MAX_BYTES:
+        if len(entries) > _MAX_ENTRIES or sum(item.file_size for item in entries) > byte_limit:
             raise ValueError('项目 ZIP 超过条目或解压总大小限制。')
         seen, roots = set(), set()
         for item in entries:
@@ -157,21 +220,22 @@ def _extract(bundle, stage, control):
         return stage / next(iter(roots))
 
 
-def unpack_project_report(bundle, destination, *, control=None):
+def unpack_project_report(bundle, destination, *, control=None, _max_bytes=None):
     """Verify the archive in staging and publish only after checking all bundled runs."""
     from .project_history import BUNDLED_SOURCES
 
     control = control or RunControl()
+    byte_limit = _MAX_BYTES if _max_bytes is None else _max_bytes
     bundle = Path(bundle).expanduser().resolve()
     target = Path(destination).expanduser().absolute()
     if target.exists() or target.is_symlink():
         raise ValueError('请选择一个不存在的项目证据导入目录。')
-    if not bundle.is_file() or bundle.stat().st_size > _MAX_BYTES:
-        raise ValueError('项目 ZIP 不存在或超过 250 MiB。')
+    if not bundle.is_file() or bundle.stat().st_size > byte_limit:
+        raise ValueError(f'项目 ZIP 不存在或超过 {byte_limit} 字节。')
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.project-import-', dir=target.parent) as temp:
         try:
-            imported = _extract(bundle, Path(temp), control)
+            imported = _extract(bundle, Path(temp), control, byte_limit)
         except (zipfile.BadZipFile, NotImplementedError) as exc:
             raise ValueError('无法读取项目证据 ZIP。') from exc
         sources = imported / BUNDLED_SOURCES

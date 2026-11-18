@@ -8,15 +8,16 @@ import shutil
 import tempfile
 
 from .case import load_case, parse_test_target
-from .git_source import _git, export_revision, resolve_commit
+from .git_source import _git, excluded_source_path, export_revision, resolve_commit
 from .recipes import repository_root
-from .runner import EXCLUDED, MAX_BYTES, MAX_ENTRIES, fingerprint_manifest, snapshot, source_fingerprint, source_mode_fingerprint
+from .runner import MAX_BYTES, MAX_ENTRIES, fingerprint_manifest, snapshot, source_fingerprint, source_mode_fingerprint
 from .runtime import choose_runtime
+from .project_snapshot_scope import in_source_scope
 
 WORKTREE = '@working-tree'
 
 
-def workspace_manifest(repository, *, control=None):
+def workspace_manifest(repository, *, control=None, snapshot_scope=None):
     """Git-visible regular files, including untracked and excluding ignored files."""
     root = Path(repository)
     gitlinks = {record.split(b"\t", 1)[1] for record in _git(root, "ls-files", "--stage", "-z").split(b"\0")
@@ -32,7 +33,7 @@ def workspace_manifest(repository, *, control=None):
         relative = PurePosixPath(name)
         if relative.is_absolute() or '..' in relative.parts:
             raise ValueError('工作区包含不支持的路径。')
-        if any(part in EXCLUDED or part.startswith('.env') for part in relative.parts):
+        if excluded_source_path(relative) or not in_source_scope(relative, snapshot_scope):
             continue
         path = root.joinpath(*relative.parts)
         for part in (path, *path.parents):
@@ -57,12 +58,12 @@ def workspace_manifest(repository, *, control=None):
     return ordered, fingerprint_manifest(manifest)
 
 
-def copy_workspace(repository, destination, *, control=None):
+def copy_workspace(repository, destination, *, control=None, snapshot_scope=None):
     root = repository_root(repository)
-    entries, original = workspace_manifest(root, control=control)
+    entries, original = workspace_manifest(root, control=control, snapshot_scope=snapshot_scope)
     modes = source_mode_fingerprint(root, entries)
     copied = snapshot(root, Path(destination), entries, control=control)
-    current_entries, current = workspace_manifest(root, control=control)
+    current_entries, current = workspace_manifest(root, control=control, snapshot_scope=snapshot_scope)
     if (copied != original or current != original
             or source_mode_fingerprint(Path(destination)) != modes
             or source_mode_fingerprint(root, current_entries) != modes):

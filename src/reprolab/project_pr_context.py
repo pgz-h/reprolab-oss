@@ -1,0 +1,64 @@
+"""Resolve an explicit GitHub PR event to verified local Git commits."""
+import hashlib
+import json
+from pathlib import Path
+import re
+
+from .git_source import _git, resolve_commit
+from .recipes import repository_root
+
+
+def _sha(value):
+    return isinstance(value, str) and bool(re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', value))
+
+
+def github_pr_context(repository, location, mode, *, merge_commit=None):
+    if mode not in ('head', 'merge'):
+        raise ValueError('GitHub PR 事件须明确选择 head 或 merge。')
+    path = Path(location).expanduser()
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
+        raise ValueError('请选择实际保存、大小不超过 2 MiB 的 GitHub PR 事件。')
+    raw = path.read_bytes()
+    event = json.loads(raw)
+    pull = event.get('pull_request') if isinstance(event, dict) else None
+    if not isinstance(pull, dict):
+        raise ValueError('事件不包含 pull_request。')
+    try:
+        base, head = pull['base']['sha'], pull['head']['sha']
+    except (KeyError, TypeError):
+        raise ValueError('PR 事件缺少目标或候选的完整 SHA。') from None
+    if not (_sha(base) and _sha(head)):
+        raise ValueError('PR 事件缺少有效完整 SHA。')
+    root = repository_root(repository)
+    if resolve_commit(root, base) != base or resolve_commit(root, head) != head:
+        raise ValueError('本地 Git 中缺少事件对应的实际提交。')
+    if mode == 'head':
+        if merge_commit is not None:
+            raise ValueError('head 模式无需提供合并结果。')
+        bases = _git(root, 'merge-base', '--all', base, head).decode().split()
+        if len(bases) != 1 or not _sha(bases[0]):
+            raise ValueError('无法为 PR 唯一确定共同基线。')
+        before, after = bases[0], head
+    else:
+        after = merge_commit or pull.get('merge_commit_sha')
+        if not _sha(after) or resolve_commit(root, after) != after:
+            raise ValueError('merge 模式须能在本地读取明确的合并结果 SHA。')
+        parents = _git(root, 'rev-list', '--parents', '-n', '1', after).decode().split()
+        if parents != [after, base, head]:
+            raise ValueError('指定合并结果的父提交与 PR 目标及 head 不一致。')
+        before = base
+    return {'mode': mode, 'event_sha256': hashlib.sha256(raw).hexdigest(), 'base': base, 'head': head,
+            'before': before, 'after': after}
+
+
+def validate_pr_context(value, before, after):
+    if value is None:
+        return
+    if (not isinstance(value, dict) or value.keys() != {'mode', 'event_sha256', 'base', 'head', 'before', 'after'}
+            or value['mode'] not in ('head', 'merge')
+            or not all(_sha(value[key]) for key in ('base', 'head', 'before', 'after'))
+            or not isinstance(value['event_sha256'], str) or not re.fullmatch(r'[0-9a-f]{64}', value['event_sha256'])
+            or value['before'] != before or value['after'] != after
+            or value['mode'] == 'head' and value['after'] != value['head']
+            or value['mode'] == 'merge' and value['before'] != value['base']):
+        raise ValueError('保存的 PR 上下文与本次固定提交不一致。')

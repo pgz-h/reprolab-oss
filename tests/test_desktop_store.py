@@ -162,3 +162,25 @@ def test_incomplete_repository_input_does_not_break_preference_lookup(tmp_path):
     store = DesktopStore(tmp_path)
     assert store.project_defaults('/tmp/invalid\0path') is None
     assert store.project_defaults('') is None
+def test_catalog_keeps_project_imports_available_after_restart(tmp_path):
+    DesktopStore = store_module().DesktopStore
+    state = tmp_path / 'state'
+    store = DesktopStore(state)
+    reports = tmp_path / 'reports'
+    imports = reports / 'imported'
+    store.settings.update(cases=str(tmp_path / 'cases'), drafts=str(tmp_path / 'drafts'),
+                          reports=str(reports), imports=str(imports))
+    store.save()
+    imported = imports / 'project-import-example'
+    imported.mkdir(parents=True)
+    (imported / 'report.json').write_text(
+        '{"kind":"project_regression","title":"cart","status":"regression_passed",'
+        '"created_at":"2026-11-13T00:00:00Z"}', encoding='utf-8')
+
+    reloaded = DesktopStore(state)
+    assert [entry['directory'] for entry in reloaded.catalog()['reports']] == [str(imported)]
+    reloaded.settings['reports'] = str(tmp_path / 'other-reports')
+    entry, = reloaded.catalog()['reports']
+    assert entry['directory'] == str(imported)
+    assert entry['title'] == '导入的项目证据 · cart'
+    assert entry['kind'] == 'project_regression'

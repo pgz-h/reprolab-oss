@@ -41,13 +41,27 @@ jobs:
           tests/test_project_conditions.py tests/test_recheck_shortcut.py
           tests/test_environment_groups.py tests/test_project_diagnostics.py
           tests/test_project_progress.py tests/test_project_config.py tests/test_execution_settings.py
-          tests/test_vitest_project.py
+          tests/test_vitest_project.py tests/test_project_review_summary.py tests/test_pytest_replay_environment.py
+          tests/test_acceptance_plan.py tests/test_project_version_order.py tests/test_project_review_audit.py tests/test_project_audit_continuation.py
+          tests/test_replay_verification.py tests/test_replay_stability.py tests/test_vitest_recheck.py
           tests/test_processing_history.py tests/test_release_preparation.py tests/test_desktop_store.py
           tests/test_runtime_environment.py
           tests/test_collection_recovery.py tests/test_recheck_progress.py
           tests/test_environment_recovery.py tests/test_repair_drafts.py
           tests/test_snapshot_children.py tests/test_conditional_xfail.py
           tests/test_ai_api.py tests/test_model_catalog.py tests/test_model_reasoning.py tests/test_model_definitions.py tests/test_platform_support.py
+      - name: Publish a comparison from the bundled demo
+        if: matrix.python == '3.14'
+        shell: bash
+        run: |
+          result="$RUNNER_TEMP/reprolab-demo-result.json"
+          comparison=0
+          reprolab project demo --review-handoff --output "$RUNNER_TEMP/reprolab-ci-demo" > "$result" || comparison=$?
+          test "$comparison" -eq 1
+          handoff="$(python -c 'import json, sys; print(json.load(sys.stdin)["handoff_dir"])' < "$result")"
+          reprolab project check-summary "$handoff/project.zip" "$handoff/review-summary.md" \
+            --acceptance-plan "$handoff/acceptance-plan.json"
+          cat "$handoff/review-summary.md" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/setup-go@v7
         if: matrix.python == '3.14'
         with:
@@ -71,6 +85,21 @@ jobs:
           python -m venv "$RUNNER_TEMP/reprolab-wheel-env"
           "$RUNNER_TEMP/reprolab-wheel-env/bin/python" -m pip install dist/*.whl '${{ matrix.pytest }}'
           "$RUNNER_TEMP/reprolab-wheel-env/bin/python" -I packaging/verify_install.py --output "$RUNNER_TEMP/reprolab-install-check"
+          cat "$RUNNER_TEMP/reprolab-install-check/review-summary.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Stage the installed-wheel handoff fixture
+        if: matrix.python == '3.14'
+        shell: bash
+        run: |
+          handoff="$RUNNER_TEMP/reprolab-ci-handoff"
+          mkdir "$handoff"
+          cp dist/*.whl "$RUNNER_TEMP/reprolab-install-check/project.zip" "$handoff/"
+      - uses: actions/upload-artifact@v7
+        if: matrix.python == '3.14'
+        with:
+          name: reprolab-handoff-inputs
+          path: ${{ runner.temp }}/reprolab-ci-handoff/
+          if-no-files-found: error
+          retention-days: 14
       - uses: actions/upload-artifact@v7
         with:
           name: python-${{ matrix.python }}-distribution
@@ -79,4 +108,69 @@ jobs:
             dist/*.tar.gz
             ${{ runner.temp }}/reprolab-install-check/installation-check.json
           if-no-files-found: error
+          retention-days: 14
+
+  replay-received-evidence:
+    needs: python-distribution
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - uses: actions/download-artifact@v8
+        with:
+          name: reprolab-handoff-inputs
+          path: ${{ runner.temp }}/reprolab-ci-handoff
+      - name: Verify the received ZIP without the source checkout
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP/reprolab-ci-handoff"
+          python -m venv .venv
+          .venv/bin/python -m pip install ./*.whl 'pytest>=9,<10'
+          .venv/bin/reprolab project replay project.zip --check-environment > preflight.json
+          replay_exit=0
+          .venv/bin/reprolab project replay project.zip --confirm-run --receipt-dir receipt \
+            --output replays > replay-result.json || replay_exit=$?
+          receipt_exit=0
+          .venv/bin/reprolab project check-receipt project.zip receipt > receipt-check.json || receipt_exit=$?
+          test "$receipt_exit" -eq "$replay_exit"
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+
+          checked = json.loads(Path("receipt-check.json").read_text(encoding="utf-8"))
+          replay = json.loads(Path("replay-result.json").read_text(encoding="utf-8"))
+          proof = checked["replay_verification"]
+          if checked["status"] != "consistent" or proof != replay["replay_verification"]:
+              raise SystemExit("The receipt and offline verification differ.")
+          print(Path("receipt/replay-receipt.md").read_text(encoding="utf-8"), end="")
+          if proof["counts"] != {"matched": 2, "different": 0, "incomplete": 0}:
+              raise SystemExit("The received fixture did not reproduce both recorded outcomes.")
+          if proof["conditions"]["platform"] is not False:
+              raise SystemExit("The receiver did not record the expected platform difference.")
+          PY
+          test "$receipt_exit" -eq 0
+          # Verify the handoff against the sender, then measure stability on the receiver.
+          .venv/bin/reprolab project summary project.zip \
+            --require-improvement test_answer.py::test_answer --require-receipt receipt > acceptance.md
+          receiver_report="$(python -c 'import json; print(json.load(open("replay-result.json"))["report_dir"])')"
+          .venv/bin/reprolab project stability "$receiver_report" --confirm-run --rounds 2 \
+            --output stability > stability-result.json
+          stability_check="$(python -c 'import json; print(json.load(open("stability-result.json"))["summary_file"])')"
+          .venv/bin/reprolab project summary "$receiver_report" --require-improvement test_answer.py::test_answer \
+            --require-stability "$stability_check" --min-stability-rounds 2 >> acceptance.md
+          cat acceptance.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: reprolab-handoff-receiver-results
+          path: |
+            ${{ runner.temp }}/reprolab-ci-handoff/preflight.json
+            ${{ runner.temp }}/reprolab-ci-handoff/replay-result.json
+            ${{ runner.temp }}/reprolab-ci-handoff/receipt-check.json
+            ${{ runner.temp }}/reprolab-ci-handoff/acceptance.md
+            ${{ runner.temp }}/reprolab-ci-handoff/receipt/
+            ${{ runner.temp }}/reprolab-ci-handoff/stability/
+          if-no-files-found: ignore
           retention-days: 14

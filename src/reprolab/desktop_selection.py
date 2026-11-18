@@ -9,9 +9,11 @@ from .project_selections import reconcile_selection
 
 
 class SelectionReviewDialog(QDialog):
-    def __init__(self, selected, available, *, title='核对测试选择', parent=None, collection_complete=True, discovery_status='collected'):
+    def __init__(self, selected, available, *, title='核对测试选择', parent=None,
+                 collection_complete=True, discovery_status='collected', plan_review=None):
         super().__init__(parent)
-        self.review = reconcile_selection(selected, available, collection_complete=collection_complete)
+        self.review = (plan_review if plan_review is not None
+                       else reconcile_selection(selected, available, collection_complete=collection_complete))
         self.setWindowTitle(title)
         self.resize(820, 520)
         self.setMinimumSize(560, 360)
@@ -29,6 +31,8 @@ class SelectionReviewDialog(QDialog):
                          '本次未找到的目标可能改名或受环境影响，不自动替换。' if result['missing_tests'] else
                          '原范围未指定。' if selected is None else '原范围为空，采用后仍保持空选择。' if not selected else
                          '完整 ID 已匹配。') + ' 采用后仍需实际运行；其他测试不会自动加入。')
+        if plan_review is not None:
+            notice.setText(plan_review['notice'])
         notice.setWordWrap(True)
         layout.addWidget(notice)
         self.search = QLineEdit()
@@ -63,7 +67,13 @@ class SelectionReviewDialog(QDialog):
         buttons.addWidget(cancel)
         apply = QPushButton(f'仅采用可用 {result["matched_count"]} 项' if result['requested_tests'] else '采用空选择')
         apply.setAutoDefault(False)
-        apply.setEnabled(can_apply and selected is not None and (bool(result['matched_tests']) or not result['requested_tests']))
+        if plan_review is not None:
+            apply.setText(f'采用计划的 {result["requested_count"]} 项')
+            apply.setObjectName('applyAcceptancePlanSelection')
+            apply.setEnabled(plan_review['ready'])
+        else:
+            apply.setEnabled(can_apply and selected is not None
+                             and (bool(result['matched_tests']) or not result['requested_tests']))
         apply.clicked.connect(self.accept)
         buttons.addWidget(apply)
         layout.addLayout(buttons)

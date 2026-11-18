@@ -158,7 +158,8 @@ def preview_configuration(repository, plugins, import_mode=None, *, environment=
     previous = _profile(_document(original))
     profile = _validate_profile({'plugins': list(plugins), 'import_mode': import_mode,
         'environment': previous.get('environment', {}) if environment is None else environment,
-        'pass_env': previous.get('pass_env', []) if pass_env is None else pass_env})
+        'pass_env': previous.get('pass_env', []) if pass_env is None else pass_env,
+        'snapshot_modules': previous.get('snapshot_modules', [])})
     return ConfigPreview(str(root), original, _updated(original, profile), identity,
                          identity[-1] if identity else 0o644, tuple(profile['plugins']), import_mode,
                          environment=tuple(profile.get('environment', {}).items()), pass_env=tuple(profile.get('pass_env', [])))

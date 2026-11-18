@@ -17,7 +17,7 @@ Linux 的 Ubuntu、Debian、Fedora 等是发行版；`.deb`、`.rpm`、AppImage 
 | 目标 | 当前材料 | 验证状态 |
 | --- | --- | --- |
 | macOS arm64 | 应用构建入口与共用源码 | 验证范围见本版记录 |
-| Windows x64 | 适配源码、Windows 构建与实际 exe 验收脚本、GitHub Actions | 开发分支通过 Windows x64 Actions 原生检查与实际 exe 验收，提供未签名的 Actions 候选包 |
+| Windows x64 | 适配源码、Windows 构建与实际 exe 验收脚本、GitHub Actions | 0.19.0a22 的未签名便携包有 Windows 原生和实际 exe 验收记录；后续开发变更单独验收 |
 | Windows ARM64、macOS Intel | 尚无专用交付 | 未验证 |
 | Linux x86_64／ARM64 | 通用源码；目录约定已覆盖 Linux | 未构建 AppImage／deb／rpm，未验证桌面运行 |
 

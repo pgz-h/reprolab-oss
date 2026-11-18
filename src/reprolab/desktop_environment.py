@@ -614,7 +614,8 @@ class ProjectEnvironmentDialog(QDialog):
         mode = self.plugin_mode.currentData()
         try:
             original = read_pytest_profile(self.repository or self.project)
-            text = render_pytest_profile(names, mode, environment=original.get('environment'), pass_env=original.get('pass_env'))
+            text = render_pytest_profile(names, mode, environment=original.get('environment'),
+                                         pass_env=original.get('pass_env'), snapshot_modules=original.get('snapshot_modules'))
         except ValueError as exc:
             self.plugin_preview.setPlainText(str(exc))
             self.copy_plugins_button.setEnabled(False)

@@ -136,3 +136,42 @@ def test_report_review_uses_displayed_run_and_shows_scope_counts(window, tmp_pat
     assert calls[0][0][0] == str(report)
     assert calls[0][1]['scope'] == 'attention'
     assert calls[0][1]['expected_reference']['run_id'] == 'chosen'
+
+
+def test_plan_selection_applies_all_targets_or_keeps_the_existing_scope(window, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QDialog, QFileDialog, QPushButton
+    from reprolab.acceptance_plan import AcceptancePlan, baseline_pin, save_acceptance_plan
+
+    bench = window.project_workbench
+    wait_project(bench)
+    data = state(tmp_path, selected=[AVAILABLE], available=[OLD, AVAILABLE])
+    bench._apply_state(data)
+    assert bench.selected_test_ids() == [AVAILABLE]
+    actions = bench.selection_more_button.menu().actions()
+    trigger = next(item for item in actions if item.text() == '按验收计划选择…')
+    missing = 'tests/test_cart.py::test_missing'
+    bad = tmp_path / 'missing.json'
+    good = tmp_path / 'valid.json'
+    pin = baseline_pin(data)
+    save_acceptance_plan(AcceptancePlan('pytest', 'strict', (OLD, missing), baseline=pin), bad)
+    save_acceptance_plan(AcceptancePlan('pytest', 'strict', (OLD,), baseline=pin), good)
+    choices = iter([bad, good])
+    monkeypatch.setattr(QFileDialog, 'getOpenFileName', lambda *_args: (str(next(choices)), ''))
+
+    def inspect(dialog):
+        apply = dialog.findChild(QPushButton, 'applyAcceptancePlanSelection')
+        if dialog.review['missing_tests']:
+            assert dialog.review['missing_tests'] == [missing]
+            assert not apply.isEnabled()
+            dialog.reject()
+        else:
+            assert dialog.review['matched_tests'] == [OLD] and apply.isEnabled()
+            apply.click()
+        return dialog.result()
+
+    monkeypatch.setattr(QDialog, 'exec', inspect)
+    trigger.trigger()
+    assert bench.selected_test_ids() == [AVAILABLE]
+    trigger.trigger()
+    assert bench.selected_test_ids() == [OLD]
+    assert bench.task is None and bench.report is None

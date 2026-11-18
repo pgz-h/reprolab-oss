@@ -1,8 +1,10 @@
 # ReproLab
 
-**Check a Python fix or project change with real tests, and keep replayable evidence.**
+**0.19.0a23 Alpha** · [Download the Python packages and macOS Apple silicon app](https://github.com/pgz-h/reprolab-oss/releases/tag/v0.19.0a23). The Windows x64 portable package is pending.
 
-ReproLab freezes before/after source snapshots, runs the same selected pytest tests against both, and records regressions, existing failures, improvements and blocked outcomes. It provides a macOS desktop app and CLI. AI may help prepare checks; verdicts come from execution and apply only to the selected scenarios.
+**Check a fix or project change with real tests, and keep replayable evidence.**
+
+ReproLab freezes the source before and after a change, runs the same selected tests on both versions, and saves verifiable reports, logs, and snapshots for replay. Project comparison shows regressions, existing failures, improvements, and blocked results. Strict fix verification checks for the declared failure on the old version and a pass on the new version. AI can help prepare or interpret checks. Verdicts come from execution and apply to the selected tests.
 
 [中文](README.md) · [Documentation index](docs/README.md) · [Installation](INSTALL.md) · [Project Workbench](docs/project-workbench.md) · [Changelog](CHANGELOG.md)
 
@@ -20,13 +22,33 @@ This uses original upstream single-module snapshots and a ReproLab-authored beha
 
 ReproLab is useful when repeated fixes, patch review or handoffs require more than a one-off pytest run. Existing tox, Nox and CI workflows can continue to prepare environments and run routine tests.
 
+## Try a pull request review from the CLI
+
+After installing the CLI, run the bundled shopping-cart example. The first command tests both versions, verifies the discount fix, and exits with `1` because of a deliberate price-format regression. It saves an evidence ZIP, an acceptance plan, and a PR summary. The final command checks those files from the recipient’s side.
+
+```sh
+demo_dir="$(mktemp -d)"
+reprolab project demo --review-handoff --output "$demo_dir" > "$demo_dir/result.json" || test "$?" -eq 1
+handoff="$(python -c 'import json, sys; print(json.load(sys.stdin)["handoff_dir"])' < "$demo_dir/result.json")"
+reprolab project check-summary "$handoff/project.zip" "$handoff/review-summary.md" \
+  --acceptance-plan "$handoff/acceptance-plan.json"
+```
+
+`status: consistent` means the Markdown matches the evidence. `gate.status: failed` records the regression found during review. The PR-ready Markdown is saved as `review-summary.md` in the handoff directory. [Offline summary verification](docs/cli-contract.md#离线核对收到的-pr-摘要)
+
+The development version can verify a repair plan and save a Markdown review summary in the same run. CI receives a distinct exit code for passed, failed, and blocked results. A recipient can check the evidence from a handoff ZIP offline. [GitHub Actions example](docs/cli-contract.md#将验收摘要写入-github-actions)
+
 ## Status
 
-The development branch includes CLI previews for [Vitest](docs/vitest.md) in JavaScript and TypeScript projects and [Go tests](docs/go.md) in a Go module. Both can compare Git revisions and export replayable evidence.
+On [async-lru PR #799](https://github.com/aio-libs/async-lru/pull/799), all three selected upstream tests failed on the baseline and passed on the candidate. The [replay case guide](docs/replay-handoff-case.md) records the pinned commits, test scope, and recipient replay steps.
 
-The **0.19.0a21 Alpha candidate** focuses on Python and pytest. It includes the desktop workbench, a single-command CLI review and evidence bundles with review history. Vitest 4 is available as a CLI preview. See the [changes](CHANGELOG.md), [platform status](docs/platforms.md) and [validation notes](docs/release-readiness.md).
+The desktop workbench supports [replay handoff](docs/project-workbench.md#核对导出导入与明确重放). Recipients can save the replay evidence and receipt together. Senders can verify the returned folder offline using their original evidence, then attach the Markdown receipt to a PR or CI summary.
 
-The macOS arm64 desktop build uses an ad-hoc signature. A Windows x64 development candidate passed native checks and frozen executable acceptance in GitHub Actions. The unsigned candidate is available as an Actions artifact. Downloadable builds are listed in Releases.
+This release offers the Python and pytest workbench, [Vitest 4 comparison](docs/vitest.md) for JavaScript and TypeScript projects, and [single-package Go comparison](docs/go.md) in the desktop Project Check area. Go can discover tests from the candidate snapshot. The Vitest and Go workflows also run from the CLI and produce verifiable, replayable evidence.
+
+Use the linked guides for local development features and GitHub Releases for the scope of each public prerelease. See the [changes](CHANGELOG.md), [platform status](docs/platforms.md) and [validation notes](docs/release-readiness.md).
+
+The macOS arm64 desktop build uses an ad-hoc signature. The 0.19.0a22 Windows x64 portable build passed its native and frozen executable checks in GitHub Actions. Later development changes require their own validation. Downloadable builds are listed in Releases.
 
 ## Choose a workflow
 

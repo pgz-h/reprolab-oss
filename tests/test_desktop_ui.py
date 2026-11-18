@@ -91,7 +91,8 @@ def test_restart_remembers_selected_case_and_python(window, tmp_path):
     other.close()
 
 
-def test_import_shows_metadata_and_requires_separate_replay(window, tmp_path):
+def test_import_shows_metadata_and_requires_separate_replay(window, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog
     from reprolab.evidence_bundle import pack_report
     QTest.mouseClick(window.run_button, Qt.MouseButton.LeftButton)
     wait_idle(window)
@@ -99,8 +100,11 @@ def test_import_shows_metadata_and_requires_separate_replay(window, tmp_path):
     bundle = tmp_path / "proof.zip"
     pack_report(original["report_dir"], bundle)
     before = len(list(Path(window.store.settings["reports"]).glob("*/report.json")))
-    window.import_bundle_path(bundle)
+    window.tabs.setCurrentWidget(window.home_page)
+    monkeypatch.setattr(QFileDialog, 'getOpenFileName', lambda *_args: (str(bundle), ''))
+    window.home_page.import_evidence_button.click()
     wait_idle(window)
+    assert window.tabs.currentWidget() is window.reports_page
     assert window.imported_case is not None
     assert window.replay_button.isEnabled()
     assert "未执行" in window.import_info.text()

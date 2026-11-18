@@ -7,8 +7,8 @@ import tempfile
 from .platform_support import private_permissions
 
 
-def atomic_write(path, content):
-    """Write/fsync a sibling temporary file; replace the destination in one step."""
+def atomic_write(path, content, *, replace=True):
+    """Write and sync a sibling temporary file before publishing it in one step."""
     path = Path(path)
     fd, name = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
     temporary = Path(name)
@@ -18,7 +18,10 @@ def atomic_write(path, content):
             stream.write(content if isinstance(content, bytes) else content.encode('utf-8'))
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        if replace:
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 

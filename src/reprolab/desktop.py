@@ -232,12 +232,13 @@ class MainWindow(QMainWindow):
         self.home_page = StartPage(
             project=self.open_project_workbench, case=self.new_case, ai=self.new_ai_suite,
             reports=lambda: self.tabs.setCurrentWidget(self.reports_page), demo=self.run_demo,
-            project_demo=self.create_project_demo, resume=self.resume_project)
+            project_demo=self.create_project_demo, resume=self.resume_project, import_evidence=self.choose_bundle)
         self.tabs.insertTab(0, self.home_page, '开始使用')
         self.tabs.setCurrentWidget(self.home_page)
         self.project_workbench.busyChanged.connect(self._project_busy_changed)
         self.project_workbench.projectOpened.connect(self._project_opened)
         self.project_workbench.casePrepared.connect(self._open_project_repair_case)
+        self.project_workbench.evidenceImported.connect(self.refresh)
         self._project_opened(self.store.settings.get('last_project', ''),
                              self.store.settings.get('last_project_title', ''))
         self.navigation_buttons = {}
@@ -416,6 +417,8 @@ class MainWindow(QMainWindow):
         self.report_info = label()
         layout.addWidget(self.report_info)
         self.browse_report_button = button("打开报告", self.open_selected_report)
+        self.open_project_evidence_button = button("在工作台打开", self.open_selected_project_evidence)
+        self.open_project_evidence_button.hide()
         self.check_button = button("检查证据", self.check_selected_report)
         self.check_button.setToolTip("校验保存材料的一致性，不重新执行测试，也不证明作者身份。")
         self.pack_button = button("导出证据 ZIP…", self.pack_selected)
@@ -423,7 +426,7 @@ class MainWindow(QMainWindow):
         self.explain_report_button = button("AI 解读结果…", self.explain_selected_report)
         self.retry_failed_button = button("重跑未通过项…", lambda: self.open_retry("not_verified"))
         self.resume_batch_button = button("继续未完成项…", lambda: self.open_retry("unfinished"))
-        layout.addWidget(row(self.browse_report_button, self.check_button, self.pack_button,
+        layout.addWidget(row(self.browse_report_button, self.open_project_evidence_button, self.check_button, self.pack_button,
                              self.explain_report_button, self.retry_failed_button, self.resume_batch_button, self.unpack_button))
         self.import_info = label()
         self.replay_button = button("审阅后重放", self.replay_imported, True)
@@ -722,6 +725,9 @@ class MainWindow(QMainWindow):
         self.verify_draft_button.setEnabled(idle and bool(draft and draft.get("case")))
         report = self.selected_report()
         self.browse_report_button.setEnabled(bool(report))
+        project = bool(report and report.get('kind') == 'project_regression')
+        self.open_project_evidence_button.setVisible(project)
+        self.open_project_evidence_button.setEnabled(project and idle and not self.project_workbench.busy)
         self.explain_report_button.setEnabled(idle and bool(report) and report.get('kind') != 'project_regression'
                                              and report.get("status") not in ("invalid", "running"))
         single = bool(report and report.get("kind") not in ("batch", "suite") and report.get("status") != "invalid")
@@ -804,6 +810,7 @@ class MainWindow(QMainWindow):
 
     def _project_busy_changed(self, busy):
         self.home_page.set_busy(busy or self.task is not None)
+        self.update_actions()
 
     def open_project_workbench(self):
         self.tabs.setCurrentWidget(self.project_workbench)
@@ -1235,6 +1242,13 @@ class MainWindow(QMainWindow):
         if entry:
             self.safe_open(Path(entry["directory"]) / ("summary.html" if entry.get("kind") in ("batch", "suite") else "report.html"))
 
+    def open_selected_project_evidence(self):
+        entry = self.selected_report()
+        if self.task or self.project_workbench.busy or not entry or entry.get('kind') != 'project_regression':
+            return
+        self.tabs.setCurrentWidget(self.project_workbench)
+        self.project_workbench.open_project_report(Path(entry['directory']) / 'report.json')
+
     def check_selected_report(self):
         entry = self.selected_report()
         if entry and entry.get("kind") not in ("batch", "suite"):
@@ -1265,12 +1279,14 @@ class MainWindow(QMainWindow):
                         lambda result: self.status_label.setText("证据包已保存：" + path), "正在核对并打包证据…")
 
     def choose_bundle(self):
+        if self.task or self.project_workbench.busy:
+            return
         path, _ = QFileDialog.getOpenFileName(self, "选择证据包；导入不会执行代码", str(Path.home()), "ZIP (*.zip)")
         if path:
             self.import_bundle_path(path)
 
     def import_bundle_path(self, path):
-        if self.task:
+        if self.task or self.project_workbench.busy:
             return
         try:
             with zipfile.ZipFile(path) as archive:
@@ -1281,8 +1297,10 @@ class MainWindow(QMainWindow):
                     self.project_workbench.import_bundle(path)
                     return
         except (OSError, zipfile.BadZipFile) as exc:
+            self.tabs.setCurrentWidget(self.reports_page)
             self.status_label.setText('无法读取证据 ZIP：' + str(exc))
             return
+        self.tabs.setCurrentWidget(self.reports_page)
         destination = Path(self.store.settings["imports"]) / ("import-" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6])
         def completed(result):
             self.imported_case = result["case"]

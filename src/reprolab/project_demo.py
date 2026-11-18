@@ -64,3 +64,32 @@ def create_project_demo(projects_root, *, control=None):
     return prepare_project(final, baseline, WORKTREE, projects_root,
                            python_executable=sys.executable, title='购物车示例 · 项目回归入门',
                            issue='确认折扣修复，并检查常规金额、显示格式及税率相关行为。')
+
+
+def save_demo_review_handoff(report, output, *, control):
+    """Build the teaching handoff from the report and verify it through the archive."""
+    from .acceptance_plan import AcceptancePlan, baseline_pin, save_acceptance_plan
+    from .project_archive import pack_project_report
+    from .project_history import read_report_snapshot, report_reference
+    from .project_review_summary import render_review_markdown, review_summary
+
+    source = read_report_snapshot(report['report_dir'])
+    plan = AcceptancePlan('pytest', 'no-new-failures',
+                          ('tests/test_cart.py::test_discount_cannot_make_total_negative',),
+                          baseline=baseline_pin(source))
+    target = Path(output).expanduser().resolve() / source['run_id']
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.demo-review-', dir=target.parent) as temporary:
+        stage = Path(temporary) / 'handoff'
+        stage.mkdir(mode=0o700)
+        evidence = stage / 'project.zip'
+        reference = report_reference(source)
+        pack_project_report(source['report_dir'], evidence, expected_report=reference, control=control.child())
+        save_acceptance_plan(plan, stage / 'acceptance-plan.json')
+        summary = review_summary(evidence, plan=plan, expected_report=reference, control=control)
+        (stage / 'review-summary.md').write_text(render_review_markdown(summary), encoding='utf-8')
+        if target.exists() or target.is_symlink():
+            raise ValueError('该示例交接目录已存在。')
+        control.commit()
+        stage.rename(target)
+    return target, summary

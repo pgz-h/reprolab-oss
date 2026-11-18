@@ -28,8 +28,8 @@ def read_pytest_profile(source):
 
 
 def _validate_profile(table):
-    if not isinstance(table, dict) or set(table) - {'plugins', 'import_mode', 'environment', 'pass_env'}:
-        raise ValueError('[tool.reprolab.pytest] 仅支持 plugins、import_mode、environment 和 pass_env。')
+    if not isinstance(table, dict) or set(table) - {'plugins', 'import_mode', 'environment', 'pass_env', 'snapshot_modules'}:
+        raise ValueError('[tool.reprolab.pytest] 支持 plugins、import_mode、environment、pass_env 和 snapshot_modules。')
     plugins = table.get('plugins', [])
     if (not isinstance(plugins, list) or len(plugins) > 32
             or any(not isinstance(name, str) or len(name) > 200
@@ -39,18 +39,27 @@ def _validate_profile(table):
     if mode is not None and mode not in ('prepend', 'append', 'importlib'):
         raise ValueError('import_mode 须为 prepend、append 或 importlib。')
     values, names = validate_variables(table.get('environment'), table.get('pass_env'))
+    modules = table.get('snapshot_modules', [])
+    if (not isinstance(modules, list) or len(modules) > 64
+            or any(not isinstance(name, str) or len(name) > 200
+                   or not all(part.isidentifier() for part in name.split('.')) for name in modules)):
+        raise ValueError('snapshot_modules 须填写最多 64 个完整 Python 模块名，例如 my_app 或 my_app.storage。')
     return {'plugins': list(dict.fromkeys(plugins)), 'import_mode': mode,
+            **({'snapshot_modules': list(dict.fromkeys(modules))} if modules else {}),
             **({'environment': values} if values else {}), **({'pass_env': names} if names else {})}
 
 
-def render_pytest_profile(plugins, import_mode=None, *, environment=None, pass_env=None):
+def render_pytest_profile(plugins, import_mode=None, *, environment=None, pass_env=None, snapshot_modules=None):
     profile = _validate_profile({'plugins': plugins, 'import_mode': import_mode,
-                                 'environment': environment or {}, 'pass_env': pass_env or []})
+                                 'environment': environment or {}, 'pass_env': pass_env or [],
+                                 'snapshot_modules': snapshot_modules or []})
     lines = ['[tool.reprolab.pytest]', 'plugins = ' + json.dumps(profile['plugins'], ensure_ascii=False)]
     if profile['import_mode']:
         lines.append('import_mode = ' + json.dumps(profile['import_mode']))
     if profile.get('pass_env'):
         lines.append('pass_env = ' + json.dumps(profile['pass_env']))
+    if profile.get('snapshot_modules'):
+        lines.append('snapshot_modules = ' + json.dumps(profile['snapshot_modules'], ensure_ascii=False))
     if profile.get('environment'):
         lines.extend(['', '[tool.reprolab.pytest.environment]'])
         lines.extend(name + ' = ' + json.dumps(value, ensure_ascii=False) for name, value in profile['environment'].items())
@@ -69,4 +78,13 @@ def describe_pytest_profile(profile):
         return '没有记录 pytest 运行配置；请结合当次日志核对插件和导入方式。'
     plugins = '、'.join(profile.get('plugins') or []) or '未额外启用'
     mode = profile.get('import_mode') or 'pytest 默认'
-    return f'测试插件：{plugins}；导入方式：{mode}。两版使用同一配置，项目默认附加参数不自动执行。'
+    return f'测试插件：{plugins}；导入方式：{mode}。两版使用同一插件和导入配置。项目对比保留各版警告筛选，忽略其他 addopts 参数。'
+
+
+def describe_pytest_rules(rules):
+    if not rules or not (rules['warning_filters'] or rules['other_addopts_ignored']):
+        return ''
+    parts = [str(rules['config_path']), f'采用 {rules["warning_filters"]} 条 addopts 警告筛选']
+    if rules['other_addopts_ignored']:
+        parts.append('其余 addopts 未采用')
+    return ' · '.join(parts)

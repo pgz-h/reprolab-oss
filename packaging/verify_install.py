@@ -45,29 +45,85 @@ def main():
     repo = output / 'project'
     repo.mkdir()
     (repo / 'answer.py').write_text('def answer():\n    return 0\n')
-    (repo / 'test_answer.py').write_text('from answer import answer\ndef test_answer():\n    assert answer() == 42\n')
+    (repo / 'test_answer.py').write_text(
+        'from answer import answer\n\n'
+        'def test_answer():\n    assert answer() == 42\n\n'
+        'def test_answer_is_int():\n    assert isinstance(answer(), int)\n',
+        encoding='utf-8',
+    )
     def git(*arguments):
         subprocess.run(['git', '-C', str(repo), '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false',
                         '-c', 'user.name=ReproLab installation check', '-c', 'user.email=test@example.invalid',
                         *arguments], check=True, capture_output=True)
-    git('init', '-q'); git('add', '.'); git('commit', '-qm', 'baseline')
+    git('init', '-q')
+    git('add', '.')
+    git('commit', '-qm', 'baseline')
+    baseline = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
     (repo / 'answer.py').write_text('def answer():\n    return 42\n')
-    report = cli('project', 'review', repo, '--before', 'HEAD', '--working-tree',
-                 '--python', sys.executable, '--test', 'test_answer.py::test_answer',
+    git('add', 'answer.py')
+    git('commit', '-qm', 'candidate')
+
+    fix = 'test_answer.py::test_answer'
+    selected = [fix, 'test_answer.py::test_answer_is_int']
+    selection = output / 'regression-tests.txt'
+    selection.write_text('\n'.join(selected) + '\n', encoding='utf-8')
+    plan = output / 'acceptance-plan.json'
+    plan.write_text(json.dumps({
+        'kind': 'project_acceptance_plan', 'schema_version': 1, 'runner': 'pytest',
+        'policy': 'no-new-failures', 'required_tests': [fix],
+        'require_receipt': False, 'min_stability_rounds': None,
+    }), encoding='utf-8')
+    markdown = output / 'review-summary.md'
+    report = cli('project', 'review', repo, '--before', baseline, '--after', 'HEAD',
+                 '--python', sys.executable, '--selection-file', selection,
+                 '--acceptance-plan', plan, '--verify-plan', '--summary-file', markdown,
                  '--output', output / 'review', '--progress')
-    if report['status'] != 'regression_passed' or report['entries'][0]['status'] != 'improved':
-        raise RuntimeError('Installed project worker did not preserve before/after results.')
+    acceptance = report['acceptance']
+    if (report['selected_tests'] != selected
+            or report['counts'] != {'improved': 1, 'regression_passed': 1}
+            or acceptance['gate']['status'] != 'passed'
+            or acceptance['required_improvements'] != [{'test_id': fix, 'status': 'passed', 'outcome': 'improved'}]
+            or report['summary_file'] != str(markdown)
+            or acceptance['report_sha256'] not in markdown.read_text(encoding='utf-8')):
+        raise RuntimeError('Installed project review did not verify the selected scope and save its CI summary.')
     if cli('project', 'check', report['report_dir'])['status'] != 'consistent':
         raise RuntimeError('Project evidence is inconsistent.')
     bundle = output / 'project.zip'
     cli('project', 'pack', report['report_dir'], '--output', bundle)
+    checked = cli('project', 'check-summary', bundle, markdown, '--acceptance-plan', plan)
+    if checked['status'] != 'consistent' or checked['gate'] != acceptance['gate']:
+        raise RuntimeError('The installed CLI could not check the PR summary against the handoff ZIP.')
     imported = cli('project', 'unpack', bundle, output / 'imported')
-    replay = cli('project', 'replay', imported['report_dir'], '--output', output / 'replayed', '--confirm-run')
+    if cli('project', 'check', imported['report_dir'])['status'] != 'consistent':
+        raise RuntimeError('Imported project evidence is inconsistent.')
+    repo.rename(output / 'sender-project-moved')
+    preflight = cli('project', 'replay', bundle, '--check-environment')
+    if preflight['status'] != 'ready' or preflight['source_archive'] != str(bundle):
+        raise RuntimeError('The installed CLI could not preflight the evidence ZIP.')
+    receipt_dir = output / 'receipt'
+    replay = cli('project', 'replay', bundle, '--output', output / 'replayed',
+                 '--confirm-run', '--receipt-dir', receipt_dir)
     if replay['status'] != 'regression_passed' or replay['run_id'] == report['run_id']:
         raise RuntimeError('Replay did not create a new passing record.')
     if cli('project', 'check', replay['report_dir'])['status'] != 'consistent':
         raise RuntimeError('Replayed evidence is inconsistent.')
-    checks.append('project: review, check, pack, unpack and replay')
+    verification = replay['replay_verification']
+    checked_receipt = cli('project', 'check-receipt', bundle, receipt_dir)
+    if (verification['status'] != 'verified'
+            or verification['counts'] != {'matched': 2, 'different': 0, 'incomplete': 0}
+            or checked_receipt['status'] != 'consistent'
+            or checked_receipt['replay_verification'] != verification):
+        raise RuntimeError('Replay verification and offline verification differ.')
+    receipt = (receipt_dir / 'replay-receipt.md').read_text(encoding='utf-8')
+    if ('Selected outcomes reproduced' not in receipt or 'test_answer.py' in receipt
+            or any(verification[key]['report_sha256'] not in receipt for key in ('source', 'replay'))):
+        raise RuntimeError('The installed CLI did not produce a shareable receipt for the checked reports.')
+    accepted = cli('project', 'summary', bundle, '--format', 'json',
+                   '--require-improvement', fix, '--require-receipt', receipt_dir)
+    if (accepted['gate']['status'] != 'passed' or accepted['required_improvements'][0]['outcome'] != 'improved'
+            or accepted['receipt']['replay_report_sha256'] != verification['replay']['report_sha256']):
+        raise RuntimeError('The installed CLI did not verify the required improvement and replay receipt.')
+    checks.append('project: PR acceptance and CI summary, ZIP handoff, replay receipt and sender check')
     result = {'version': expected, 'installed_module': str(installed), 'python': sys.version.split()[0],
               'status': 'passed', 'checks': checks,
               'scope': 'Installed CLI and local controlled fixtures; no GUI or live model service.'}

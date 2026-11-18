@@ -111,6 +111,26 @@ def test_candidate_environments_are_listed_without_starting_or_switching_them(wi
     assert not marker.exists()
     assert bench.environment_hint.isVisible()
     assert '不会自动切换' in bench.environment_hint.text()
+    assert bench.use_project_environment_button.isVisible()
+    assert str(candidate) in bench.use_project_environment_button.toolTip()
+    bench.use_project_environment_button.click()
+    assert bench.python_edit.text() == str(candidate)
+    assert bench.state is None and bench.task is None and not marker.exists()
+
+    other = repo / 'venv/bin/python'
+    other.parent.mkdir(parents=True)
+    other.write_text('#!/bin/sh\n')
+    bench.python_edit.clear()
+    bench.read_commits()
+    wait_project(bench)
+    assert bench.python_combo.findText(str(other)) >= 0
+    assert not bench.use_project_environment_button.isVisible()
+    assert bench.python_edit.text() == '' and not marker.exists()
+
+    bench.repository_edit.setText(str(tmp_path))
+    assert not bench.use_project_environment_button.isVisible()
+    assert bench.python_combo.findText(str(candidate)) == -1
+    assert bench.python_combo.findText(str(other)) == -1
 
 
 def test_small_window_keeps_project_inputs_and_actions_readable(window):

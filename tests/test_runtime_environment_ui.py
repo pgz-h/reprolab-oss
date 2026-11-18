@@ -128,18 +128,38 @@ def test_cancelling_local_values_keeps_existing_case_activity(window, tmp_path, 
 
 
 def test_imported_project_replay_can_request_local_values_without_original_repository(window, tmp_path, monkeypatch):
-    from PySide6.QtWidgets import QDialog, QDoubleSpinBox, QLabel
+    from PySide6.QtWidgets import QDialog, QDoubleSpinBox, QLabel, QPlainTextEdit, QPushButton
     from test_runtime_environment import configured, control, SECRET
+    from test_workflow import make_environment
     from reprolab.project_sessions import run_project
     from test_desktop_usability import wait_project
     repo, state = configured(tmp_path)
     report = run_project(state['directory'], tmp_path / 'source-reports', timeout=8, confirmed=True, control=control())
     repo.rename(tmp_path / 'moved-project')
-    bench = window.project_workbench; wait_project(bench)
+    bench = window.project_workbench
+    window.tabs.setCurrentWidget(bench)
+    wait_project(bench)
     bench._apply_report(report)
+    selected_python, _ = make_environment(tmp_path, True)
+
     def confirm(dialog):
         assert dialog.windowTitle() == '重放项目报告'
+        dialog.show()
+        QApplication.processEvents()
+        assert dialog.findChild(QPushButton, 'replayCheckTools').isVisible()
         assert report['runtime']['executable'] in [label.text() for label in dialog.findChildren(QLabel)]
+        field = dialog.findChild(QLineEdit, 'replayPythonPath')
+        field.setText(str(tmp_path / 'missing-python'))
+        dialog.findChild(QPushButton, 'replayCheckTools').click()
+        wait(dialog)
+        status = dialog.findChild(QLabel, 'replayToolCheckResult')
+        assert '不存在或不可执行' in status.text()
+        field.setText(str(selected_python))
+        assert not status.text()
+        dialog.findChild(QPushButton, 'replayCheckTools').click()
+        wait(dialog)
+        assert 'pytest' in status.text()
+        assert any(label.text() == 'DATABASE_TOKEN' for label in dialog.findChildren(QLabel))
         timeout = dialog.findChild(QDoubleSpinBox)
         assert timeout.value() == 8
         timeout.setValue(15)
@@ -152,3 +172,17 @@ def test_imported_project_replay_can_request_local_values_without_original_repos
     wait_project(bench)
     assert bench.report['status'] == 'regression_passed' and bench.report['run_id'] != report['run_id']
     assert bench.report['timeout'] == 15
+    assert bench.report['runtime']['executable'] == str(selected_python)
+    assert bench.replay_verification_button.isVisible()
+    assert '逐项结果一致' in bench.status_label.text()
+    def details(dialog):
+        assert dialog.windowTitle() == '重放核对与回执'
+        assert dialog.findChild(QLabel, 'receiptResultHeadline').text() == '逐项结果一致'
+        content = dialog.findChild(QPlainTextEdit).toPlainText()
+        assert '每版时限 · 有差异' in content
+        assert '运行变量 · 待核对' in content and SECRET not in content
+        dialog.reject()
+        return dialog.result()
+
+    monkeypatch.setattr(QDialog, 'exec', details)
+    bench.replay_verification_button.click()

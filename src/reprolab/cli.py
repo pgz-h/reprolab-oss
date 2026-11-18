@@ -44,7 +44,8 @@ def _initialize(args):
     if args.case.exists() or args.case.is_symlink():
         raise ValueError(f"案例文件已经存在，未覆盖：{args.case}")
     required = ("repository", "before", "project_test", "failure_type", "failure_message")
-    missing = [key for key in required if not getattr(args, key) and not (key == "before" and args.working_tree)]
+    missing = [key for key in required if not getattr(args, key) and not (key == "before" and args.working_tree)
+               and not (key == "project_test" and args.collect)]
     interactive = args.interactive or (bool(missing) and sys.stdin.isatty())
     if missing and not interactive:
         raise ValueError("缺少参数：" + ", ".join("--" + k.replace("_", "-") for k in missing)
@@ -55,19 +56,34 @@ def _initialize(args):
     before = args.before or ("HEAD" if args.working_tree else _ask("修复前版本", "HEAD~1"))
     after = WORKTREE if args.working_tree else args.after or (_ask("修复后版本", "HEAD") if interactive else "HEAD")
     target = args.project_test
+    python = args.python or (_ask("Python 解释器", sys.executable) if interactive and args.collect else None)
+    if args.collect:
+        discovered = collect_project_tests(repository, after, target=target, python_executable=python)
+        if after != WORKTREE:
+            after = discovered['revision']
+        if discovered['status'] != 'collected' or discovered['truncated']:
+            raise ValueError('实际收集不完整，请核对环境、配置或缩小目标。' + discovered['log_excerpt'])
+        if target and target not in discovered['tests']:
+            raise ValueError('请选择实际收集得到的完整测试 ID，包括参数部分。')
+        if target is None and len(discovered['tests']) == 1:
+            target = discovered['tests'][0]
+        elif target is None and not interactive:
+            raise ValueError('实际收集到多项测试，请用 --project-test 提供完整 ID，或使用 --interactive。')
     if not target:
-        discovered = list_workspace_tests(repository) if args.working_tree else list_project_tests(repository, after)
+        if not args.collect:
+            discovered = list_workspace_tests(repository) if args.working_tree else list_project_tests(repository, after)
         offered = discovered["tests"][:20]
-        print("发现的测试（仅静态读取，尚未执行）：", file=sys.stderr)
+        label = "实际收集的测试（未运行测试主体）：" if args.collect else "发现的测试（仅静态读取，尚未执行）："
+        print(label, file=sys.stderr)
         for index, name in enumerate(offered, 1):
             print(f"  {index}. {name}", file=sys.stderr)
         print(discovered["notice"], file=sys.stderr)
         answer = _ask("选择编号或输入完整测试目标")
-        if answer and answer.isdigit() and 1 <= int(answer) <= len(offered):
-            target = offered[int(answer) - 1]
-        else:
-            target = answer
-    python = args.python or (_ask("Python 解释器", sys.executable) if interactive else None)
+        target = offered[int(answer) - 1] if answer and answer.isdigit() and 1 <= int(answer) <= len(offered) else answer
+        if args.collect and target not in discovered['tests']:
+            raise ValueError('所选目标不在实际收集清单中。')
+    if python is None and interactive and not args.collect:
+        python = _ask("Python 解释器", sys.executable)
     failure_type = args.failure_type or _ask("旧版应出现的异常类型", "AssertionError")
     failure_message = args.failure_message or _ask("旧版异常消息应包含的文本")
     title = args.title or (_ask("案例名称", "项目修复验收") if interactive else None)
@@ -146,6 +162,7 @@ def main(argv=None):
     command.add_argument("--failure-type")
     command.add_argument("--failure-message")
     command.add_argument("--title")
+    command.add_argument("--collect", action="store_true", help="先在固定副本中收集可信项目的实际测试")
     command.add_argument("--interactive", action="store_true", help="逐步输入并选择测试")
     command.add_argument("--json", action="store_true")
     command = sub.add_parser("cases", help="查看已保存的案例，不执行测试")
@@ -500,7 +517,7 @@ def main(argv=None):
                     print(target)
                 if result["status"] == "collection_failed":
                     print(result["log_excerpt"], file=sys.stderr)
-            return 0 if result["status"] == "collected" else 2
+            return 0 if result["status"] == "collected" and not result["truncated"] else 2
         if args.command == "list-tests":
             result = list_project_tests(args.repository, args.ref)
             if args.before:

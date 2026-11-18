@@ -144,7 +144,8 @@ class ProgressReader:
         return (self.valid and self.finished and not self.tail_ignored
                 and self.exit_code == raw.get('exit_code') and self.events == raw.get('events')
                 and self.started == raw.get('started_tests') and self.errors == raw.get('collection_errors')
-                and all(self.header.get(key) == raw.get(key) for key in ('python_version', 'pytest_version', 'pytest_profile', 'runtime_environment')))
+                and all(self.header.get(key) == raw.get(key) for key in (
+                    'python_version', 'pytest_version', 'pytest_profile', 'runtime_environment', 'pytest_rules')))
 
     def summary(self):
         return {'schema_version': 1, 'status': 'invalid' if self.error or self.rejection else 'recorded' if self.header else 'unavailable',
@@ -155,11 +156,15 @@ class ProgressReader:
 
 
 def progress_text(payload):
-    side = {'before': '基线版本', 'after': '候选版本', 'collection': '测试发现'}.get(payload.get('side'), '项目检查')
+    version = payload.get('side')
+    side = {'before': '基线版本', 'after': '候选版本', 'collection': '测试发现',
+            'baseline-discovery': '基线测试发现'}.get(version, '项目检查')
     phase = PHASE_LABELS.get(payload.get('current_phase'), '准备执行')
-    count = f"已完成 {payload.get('completed', 0)}/{payload.get('total', 0)} 项" if payload.get('side') != 'collection' else '正在发现测试'
-    if payload.get('side') == 'collection' and payload.get('session_finished') and payload.get('collected') is not None:
-        count = f"已发现 {payload['collected']} 项"
+    if version in ('collection', 'baseline-discovery'):
+        count = (f"已发现 {payload['collected']} 项"
+                 if payload.get('session_finished') and payload.get('collected') is not None else '正在发现测试')
+    else:
+        count = f"已完成 {payload.get('completed', 0)}/{payload.get('total', 0)} 项"
     text = f"{side} · {count} · {phase} · 已用 {payload.get('elapsed_seconds', 0):.1f} 秒"
     quiet = payload.get('quiet_seconds', 0)
     if quiet >= 5:

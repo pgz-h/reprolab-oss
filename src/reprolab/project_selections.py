@@ -1,4 +1,4 @@
-"""Portable pytest selections; these files contain no execution verdict."""
+"""Portable test selections; these files contain no execution verdict."""
 import json
 from pathlib import Path
 
@@ -49,7 +49,7 @@ def requested_selection(state):
     return validate_selection(request.get('selected_tests'), allow_empty=True)
 
 
-def read_selection(path, *, allow_empty=False):
+def read_selection_values(path):
     path = Path(path).expanduser()
     if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_SELECTION_BYTES:
         raise ValueError('选择清单须为不超过 8 MiB 的普通 UTF-8 文件。')
@@ -65,8 +65,14 @@ def read_selection(path, *, allow_empty=False):
         else:
             values = [line for line in text.splitlines() if line.strip()]
     except (ValueError, UnicodeError, RecursionError):
-        raise ValueError('无法读取选择清单；请使用 JSON 列表或每行一个完整测试 ID 的文本。') from None
-    return validate_selection(values, allow_empty=allow_empty)
+        raise ValueError('无法读取选择清单；请使用 JSON 列表或每行一个目标的文本。') from None
+    if not isinstance(values, list):
+        raise ValueError('选择清单缺少目标列表。')
+    return values
+
+
+def read_selection(path, *, allow_empty=False):
+    return validate_selection(read_selection_values(path), allow_empty=allow_empty)
 
 
 def write_selection(path, selected, *, title='', allow_empty=False):

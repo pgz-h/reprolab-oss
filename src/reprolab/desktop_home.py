@@ -22,7 +22,7 @@ def _glass_shadow(widget):
 
 
 class StartPage(QScrollArea):
-    def __init__(self, *, project, case, ai, reports, demo, project_demo, resume, parent=None):
+    def __init__(self, *, project, case, ai, reports, demo, project_demo, resume, import_evidence, parent=None):
         super().__init__(parent)
         self.setWidgetResizable(True)
         content = QWidget()
@@ -75,7 +75,8 @@ class StartPage(QScrollArea):
         choices = QGridLayout()
         choices.setSpacing(16)
         self.case_button = self._card(choices, 0, '修复验收', '声明旧版故障，用实际测试核对修复后的表现。', '准备修复案例', case)
-        self.ai_button = self._card(choices, 1, 'AI 检查计划', '让 AI 起草测试和计划，审阅后再实际运行。', '准备检查计划', ai)
+        self.import_evidence_button = self._card(choices, 1, '收到证据 ZIP', '校验并打开已有证据，审阅后再决定是否重放。', '导入证据 ZIP…', import_evidence)
+        self.ai_button = self._card(choices, 2, 'AI 检查计划', '让 AI 起草测试和计划，审阅后再实际运行。', '准备检查计划', ai)
         body.addLayout(choices)
 
         extras = QHBoxLayout()
@@ -103,7 +104,7 @@ class StartPage(QScrollArea):
         layout.addWidget(_text(title, 'cardTitle'))
         card.setToolTip(description)
         layout.addStretch(1)
-        button = QPushButton(action + '  →')
+        button = QPushButton(action if action.endswith('…') else action + '  →')
         button.setObjectName('quiet')
         button.clicked.connect(lambda: callback())
         layout.addWidget(button, 0, Qt.AlignmentFlag.AlignLeft)
@@ -114,7 +115,7 @@ class StartPage(QScrollArea):
     def set_busy(self, busy):
         self._busy = busy
         for button in (self.project_button, self.case_button, self.ai_button, self.reports_button,
-                       self.demo_button, self.project_demo_button):
+                       self.demo_button, self.project_demo_button, self.import_evidence_button):
             button.setEnabled(not busy)
         self.resume_button.setEnabled(not busy and self._resume_available)
 

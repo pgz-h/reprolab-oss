@@ -279,6 +279,27 @@ class DesktopStore:
                 if len(reports) >= 500:
                     warnings.append("最多显示 500 份报告；可更换报告目录。")
                     break
+        imports = Path(self.settings['imports']).expanduser()
+        known_reports = {Path(report['directory']).resolve() for report in reports}
+        if imports.is_dir():
+            for folder in imports.iterdir():
+                if (not folder.name.startswith('project-import-') or folder.is_symlink()
+                        or not (folder / 'report.json').is_file() or folder.resolve() in known_reports):
+                    continue
+                if len(reports) >= 500:
+                    if "最多显示 500 份报告；可更换报告目录。" not in warnings:
+                        warnings.append("最多显示 500 份报告；可更换报告目录。")
+                    break
+                try:
+                    metadata = folder / 'catalog.json'
+                    result = read_json(metadata if metadata.is_file() else folder / 'report.json')
+                    if result.get('kind') != 'project_regression':
+                        continue
+                    reports.append({'directory': str(folder), 'kind': 'project_regression',
+                                    'title': '导入的项目证据 · ' + result.get('title', folder.name),
+                                    'status': result.get('status', 'invalid'), 'at': result.get('created_at', '')})
+                except (OSError, ValueError):
+                    continue
         if incomplete_runs:
             warnings.append(f"发现 {incomplete_runs} 次未完成或取消的验收；过程材料保留在报告目录，未发布最终报告，不能视为验证通过。")
         if invalid_batches:

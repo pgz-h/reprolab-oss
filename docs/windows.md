@@ -1,6 +1,6 @@
 # Windows x64 指南
 
-Windows x64 与 macOS 共用源码。开发分支的 `90bf648` 已在 Windows x64 GitHub Actions 通过原生检查和实际 `.exe` 验收，生成未签名便携候选包。 [验收记录](https://github.com/pgz-h/reprolab-oss/actions/runs/43006106781#artifacts)
+Windows x64 与 macOS 共用源码。提交 `90bf648` 曾在 Windows x64 GitHub Actions 通过原生检查和实际 `.exe` 验收，生成未签名便携候选包。 [历史验收记录](https://github.com/pgz-h/reprolab-oss/actions/runs/43006106781#artifacts)。0.19.0a22 的原生和打包验证见 [验证状态](release-readiness.md)。
 
 ## 已整理的适配
 

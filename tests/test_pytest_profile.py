@@ -106,7 +106,8 @@ def test_missing_plugin_is_actionable_and_never_a_pass(tmp_path):
     assert result['status'] == 'collection_failed'
     assert 'reprolab_missing_plugin' in result['log_excerpt']
     assert result['pytest_profile']['plugins'] == ['reprolab_missing_plugin']
-    with pytest.raises(ValueError, match='真实测试清单'):
+    assert result['diagnosis']['missing_modules'] == ['reprolab_missing_plugin']
+    with pytest.raises(ValueError, match=r'插件 reprolab_missing_plugin.*collection\.log'):
         run_project(state['directory'], tmp_path / 'reports', confirmed=True)
 
 
@@ -133,3 +134,170 @@ def test_declared_plugin_cannot_add_unselected_execution(tmp_path):
     assert report['status'] == 'attention'
     assert report['after']['tests']['tests/test_calc.py::test_answer']['status'] == 'inconclusive'
     assert check_project_report(report['report_dir'])['status'] == 'consistent'
+
+
+def _commit_fixture(root, *args):
+    subprocess.run(['git', '-C', str(root), '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false',
+                    '-c', 'user.name=ReproLab test', '-c', 'user.email=test@example.invalid', *args],
+                   check=True, capture_output=True)
+
+
+def _freeze_fixture(repo):
+    _commit_fixture(repo, 'init', '-q')
+    _commit_fixture(repo, 'add', '.')
+    _commit_fixture(repo, 'commit', '-qm', 'baseline')
+
+
+@pytest.mark.parametrize('config', ['pytest.ini', 'pyproject.toml'])
+def test_project_warning_options_remain_active_in_comparison(tmp_path, config):
+    from reprolab.project_review_summary import render_review_markdown, review_summary
+
+    repo = tmp_path / 'project'
+    repo.mkdir()
+    rules = {'pytest.ini': '[pytest]\naddopts = -W error::UserWarning\n',
+             'pyproject.toml': '[tool.pytest.ini_options]\naddopts = ["--pythonwarnings=error::UserWarning"]\n'}
+    (repo / config).write_text(rules[config], encoding='utf-8')
+    module = repo / 'step.py'
+    module.write_text('def step(): pass\n', encoding='utf-8')
+    (repo / 'test_build.py').write_text('from step import step\ndef test_step(): step()\n', encoding='utf-8')
+    _freeze_fixture(repo)
+    module.write_text('import warnings\ndef step(): warnings.warn("warning regression", UserWarning)\n', encoding='utf-8')
+    native = subprocess.run([sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider'],
+                            cwd=repo, capture_output=True, text=True)
+    assert native.returncode == 1 and 'UserWarning: warning regression' in native.stdout
+    state = prepare_project(repo, 'HEAD', WORKTREE, tmp_path / 'sessions')
+    discovered = collect_project(state['directory'])
+    expected = {'config_path': config, 'warning_filters': 1, 'other_addopts_ignored': False}
+    assert discovered['pytest_rules'] == expected
+    report = run_project(state['directory'], tmp_path / 'reports', confirmed=True)
+    assert report['status'] == 'regression_detected'
+    assert [report[side]['pytest_rules'] for side in ('before', 'after')] == [expected, expected]
+    assert report['entries'][0]['after']['exception']['type'] == 'UserWarning'
+    summary = review_summary(report['report_dir'], policy='strict')
+    assert summary['gate']['exit_code'] == 1
+    assert '1 warning filter(s) used' in render_review_markdown(summary)
+
+
+@pytest.mark.parametrize('explicit', [False, True])
+def test_snapshot_to_installed_module_blocks_a_green_run(tmp_path, explicit):
+    from reprolab.project_comparison import comparison_scope, comparison_verdict
+    from reprolab.project_review_summary import review_summary
+
+    repo = tmp_path / 'project'
+    repo.mkdir()
+    local_module = repo / 'tomlkit.py'
+    local_module.write_text('def parse(source): return {}\n', encoding='utf-8')
+    (repo / 'test_parse.py').write_text(
+        'from tomlkit import parse\ndef test_parse(): assert parse("") == {}\n', encoding='utf-8')
+    _freeze_fixture(repo)
+    local_module.unlink()
+    if explicit:
+        from reprolab.project_config import preview_configuration
+
+        config = repo / 'pyproject.toml'
+        config.write_text(
+            '[tool.reprolab.pytest]\nsnapshot_modules = ["tomlkit", "my_app.unobserved"]\n', encoding='utf-8')
+        assert b'snapshot_modules' in preview_configuration(repo, [], 'importlib').updated
+    state = prepare_project(repo, 'HEAD', WORKTREE, tmp_path / 'sessions')
+    result = run_project(state['directory'], tmp_path / 'reports', confirmed=True)
+    assert result['counts'] == {'regression_passed': 1}
+    assert result['before']['module_origins']['tomlkit'] == ['snapshot:tomlkit.py']
+    assert result['after']['module_origins']['tomlkit'] == ['installed-package']
+    scope = comparison_scope(result)
+    assert comparison_verdict(result, scope) == 'attention'
+    expected = [('tomlkit', 'snapshot_to_external')]
+    if explicit:
+        expected.insert(0, ('my_app.unobserved', 'required_snapshot_import'))
+    assert [(item['module'], item['reason']) for item in scope['pytest_import_issues']] == expected
+    summary = review_summary(result['report_dir'], policy='strict')
+    assert summary['gate']['reason'] == 'pytest_import_origin' and summary['gate']['exit_code'] == 2
+    folder = Path(result['report_dir'])
+    assert '环境安装包' in (folder / 'report.html').read_text(encoding='utf-8')
+    checked = json.loads((folder / 'report.json').read_text(encoding='utf-8'))
+    del checked['after']['module_origins']
+    (folder / 'report.json').write_text(json.dumps(checked), encoding='utf-8')
+    assert check_project_report(folder)['status'] == 'inconsistent'
+
+
+def test_report_exposes_requested_and_started_order_when_hook_reverses_tests(tmp_path):
+    from reprolab.project_review_summary import render_review_markdown, review_summary
+
+    repo = tmp_path / 'project'
+    repo.mkdir()
+    (repo / 'test_order.py').write_text(
+        'prepared = False\n'
+        'def test_prepare():\n    global prepared\n    prepared = True\n'
+        'def test_consume():\n    assert prepared\n', encoding='utf-8')
+    _freeze_fixture(repo)
+    (repo / 'conftest.py').write_text(
+        'def pytest_collection_modifyitems(items):\n    items.reverse()\n', encoding='utf-8')
+    state = prepare_project(repo, 'HEAD', WORKTREE, tmp_path / 'sessions')
+    selected = ['test_order.py::test_prepare', 'test_order.py::test_consume']
+    result = run_project(state['directory'], tmp_path / 'reports', selected_ids=selected, confirmed=True)
+    assert result['status'] == 'regression_detected'
+    assert result['selected_tests'] == result['before']['execution_order'] == selected
+    assert result['after']['execution_order'] == list(reversed(selected))
+    summary = review_summary(result['report_dir'], policy='strict')
+    assert summary['pytest_order_difference'] == {'common_tests': 2, 'positions_changed': 2}
+    assert 'Pytest execution order differs' in render_review_markdown(summary)
+    html = (Path(result['report_dir']) / 'report.html').read_text(encoding='utf-8')
+    assert all(label in html for label in ('请求顺序', '基线实际', '候选实际', '两版实际启动顺序不同'))
+
+
+@pytest.mark.parametrize('late_reorder', [False, True])
+def test_order_control_reuses_frozen_evidence_and_checks_actual_order(tmp_path, capsys, late_reorder):
+    from reprolab.project_cli import main
+    from reprolab.project_review_summary import review_summary
+
+    repo = tmp_path / 'project'
+    repo.mkdir()
+    (repo / 'test_order.py').write_text(
+        'ready = False\n'
+        'def test_prepare():\n    global ready\n    ready = True\n'
+        'def test_consume():\n    assert ready\n', encoding='utf-8')
+    conftest = repo / 'conftest.py'
+    conftest.write_text(
+        'def pytest_collection_modifyitems(items):\n    items.sort(key=lambda item: item.name, reverse=True)\n',
+        encoding='utf-8')
+    _freeze_fixture(repo)
+    normal_reorder = 'def pytest_collection_modifyitems(items):\n    items.sort(key=lambda item: item.name)\n'
+    late_hook = ('import pytest\n@pytest.hookimpl(wrapper=True, trylast=True)\n'
+                 'def pytest_runtestloop(session):\n    session.items.sort(key=lambda item: item.name)\n'
+                 '    return (yield)\n')
+    conftest.write_text(late_hook if late_reorder else normal_reorder, encoding='utf-8')
+    state = prepare_project(repo, 'HEAD', WORKTREE, tmp_path / 'sessions')
+    selection = ['test_order.py::test_consume', 'test_order.py::test_prepare']
+    report = run_project(state['directory'], tmp_path / 'normal', selected_ids=selection, confirmed=True)
+    assert report['status'] == 'regression_detected'
+    archive = tmp_path / 'report.zip'
+    pack_project_report(report['report_dir'], archive)
+
+    output = tmp_path / 'controlled'
+    args = ['order-control', str(archive), '--output', str(output)]
+    assert main(args) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert not output.exists()
+    assert preview['selected_tests'] == selection
+    assert preview['order_control']['test_ids'] == list(reversed(selection))
+
+    assert main([*args, '--confirm-run']) == (2 if late_reorder else 0)
+    run = json.loads(capsys.readouterr().out)
+    assert run['order_control_status'] == ('blocked' if late_reorder else 'completed')
+    assert run['selected_tests'] == selection
+    assert check_project_report(run['report_dir'])['status'] == 'consistent'
+    if late_reorder:
+        assert '未能按对照顺序' in run['after']['log_excerpt']
+        return
+
+    assert run['status'] == 'regression_passed'
+    assert run['before']['execution_order'] == run['after']['execution_order'] == list(reversed(selection))
+    assert review_summary(run['report_dir'], policy='strict')['gate']['reason'] == 'pytest_order_control'
+    repeated = replay_project_report(run['report_dir'], tmp_path / 'replayed', confirmed=True, verify_result=True)
+    assert repeated['replay_verification']['status'] == 'verified'
+    assert repeated['replay_verification']['inputs']['pytest_order'] is True
+    from reprolab.replay_verification import verify_replay
+    assert verify_replay(archive, run['report_dir'])['status'] == 'inputs_changed'
+    assert main([*args, '--order', 'requested', '--confirm-run']) == 0
+    requested = json.loads(capsys.readouterr().out)
+    assert requested['before']['execution_order'] == requested['after']['execution_order'] == selection
+    assert requested['counts']['baseline_failure'] == 1

@@ -10,23 +10,31 @@ import hashlib
 import io
 from itertools import islice
 import json
+from os.path import expanduser
 from pathlib import Path, PurePosixPath
 import stat
 import sys
 import tokenize
 import uuid
 
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLayout, QLineEdit,
+    QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLayout, QLineEdit,
     QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSizePolicy, QSplitter,
-    QScrollArea, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QScrollArea, QSpinBox, QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .desktop_tasks import Task
+from .go_project import compare_go_recheck, list_go_tests, recheck_go_project, run_go_project
+from .replay_toolchain import probe_replay_tools
+from .vitest_project import (
+    compare_vitest_recheck, list_vitest_files, normalize_vitest_project_dir,
+    recheck_vitest_project, run_vitest_project,
+)
 from .runner import RunCancelled
+from .recipes import repository_root
 from .project_sessions import (
     check_project_report, collect_project, list_projects, pack_project_report,
     prepare_project, prepare_project_ai, project_replay_settings, read_project, replay_project_report,
@@ -38,14 +46,23 @@ from .desktop_store import read_json
 from .project_selections import read_selection, write_selection, reconcile_selection, requested_selection, validate_selection
 from .project_refresh import refresh_project, refresh_from_report, refresh_from_displayed_report
 from .project_history import (
-    read_report_snapshot, report_reference, resolve_report_reference, source_report_directory,
+    _checked_report, _match_reference, read_report_snapshot, report_reference, resolve_report_reference, source_report_directory,
     validate_report_reference, read_recheck_progress,
 )
 from .desktop_selection import SelectionReviewDialog
 from .project_presets import list_presets, read_preset, save_preset, delete_preset
-from .project_diagnostics import entry_action, entry_guidance, group_project_failures, format_diagnostic_group
+from .project_archive import archive_preflight_text
+from .project_comparison import (
+    DIVERGENT_OUTCOME_LABELS, comparison_scope, comparison_scope_message, comparison_verdict, pytest_order_difference,
+)
+from .pytest_profile import describe_pytest_rules
+from .project_diagnostics import (
+    VITEST_OFFLINE_CACHE_MISSING, entry_action, entry_guidance, group_project_failures,
+    format_diagnostic_group, vitest_offline_cache_misses,
+)
 from .project_progress import progress_text, PHASE_LABELS, OBSERVATION_LABELS
-from .project_collection import collection_diagnosis
+from .project_collection import collection_diagnosis, normalize_collection_path
+from .project_environment import candidate_pythons
 from .case import parse_test_target
 from .project_failure import repair_eligibility, load_repair_material
 from .desktop_failure import RepairBriefDialog, ReportRepairDialog, RepairDraftPicker
@@ -65,6 +82,13 @@ _RUN_STATUS = {
     'regression_passed': '所选项目回归通过', 'regression_detected': '发现新增失败',
     'attention': '需要处理 · 不能判为回归通过', 'cancelled': '已取消 · 保留已完成结果',
 }
+_COMPARISON_RUNNERS = {'go': 'Go', 'vitest': 'Vitest'}
+_COMPARISON_OPERATIONS = {'discover': '测试发现', 'replay': '重放', 'recheck': '复查',
+                          'export': '导出', 'summary': '复制摘要'}
+_DEFAULT_COMPARISON_TIMEOUT = 120
+_RECHECK_STATUS = {'resolved': '已解决', 'still_failed': '仍失败', 'new_failure': '新增失败',
+                   'still_passed': '继续通过', 'not_reviewed': '未能复查', 'conditions_changed': '检查条件变化'}
+_RECHECK_OUTCOMES = {**_STATUS, 'missing': '缺失', 'retry_passed': '重试后通过', 'expected_failure': '预期失败'}
 _KIND = {'added': '新增', 'removed': '删除', 'modified': '修改',
          'renamed': '重命名', 'mode': '权限变化'}
 _COLOR = {'regression_detected': '#b42332', 'baseline_failure': '#94602a',
@@ -171,6 +195,43 @@ def _duration(value):
         return '—'
 
 
+def _comparison_counts(counts, scope=None):
+    labels = {**_STATUS, **DIVERGENT_OUTCOME_LABELS} if scope and scope['divergent_outcomes'] else _STATUS
+    return ' · '.join(f'{labels[key]} {count}' for key, count in counts.items() if count)
+
+
+def _recheck_counts(counts):
+    return ' · '.join(f'{_RECHECK_STATUS[key]} {count}' for key, count in counts.items() if count)
+
+
+def _recheck_panel(name, *, files=False):
+    panel = QWidget()
+    layout = QVBoxLayout(panel)
+    layout.setContentsMargins(0, 0, 0, 0)
+    summary = _label()
+    layout.addWidget(summary)
+    tree = _tree([name, '复查结果', '上一轮候选', '本轮候选'])
+    tree.setRootIsDecorated(files)
+    tree.setMinimumHeight(145)
+    layout.addWidget(tree, 1)
+    panel.hide()
+    return panel, summary, tree
+
+
+def _recheck_item(entry):
+    if 'case_entries' in entry:
+        text = _recheck_counts(entry['counts']) or '未能复查'
+    else:
+        text = _RECHECK_STATUS[entry['status']]
+    item = QTreeWidgetItem([entry['test_id'], text,
+                            *(_RECHECK_OUTCOMES[entry[side]] for side in ('previous', 'current'))])
+    item.setToolTip(0, entry['test_id'])
+    if entry.get('changes'):
+        item.setToolTip(1, '\n'.join(entry['changes']))
+    item.addChildren([_recheck_item(case) for case in entry.get('case_entries', [])])
+    return item
+
+
 def _ref_value(combo):
     index = combo.currentIndex()
     if index >= 0 and combo.currentText() == combo.itemText(index) and combo.currentData():
@@ -181,12 +242,285 @@ def _ref_value(combo):
 def _read_report(directory):
     return read_report_snapshot(directory)
 
+
+def _comparison_tool_paths(fields):
+    return {key: expanduser(value) if (value := field.text().strip()) else None
+            for key, field in fields.items()}
+
+
+def _replay_rounds(dialog, start):
+    from .replay_stability import MAX_ROUNDS
+
+    rounds = QSpinBox(dialog)
+    rounds.setObjectName('replayRounds')
+    rounds.setAccessibleName('重放轮数')
+    rounds.setRange(1, MAX_ROUNDS)
+    rounds.setToolTip('两轮或更多会逐轮保存报告，并检查测试结果是否在轮次间变化。')
+    dialog.overview.addRow('重放轮数', rounds)
+    rounds.valueChanged.connect(lambda value: start.setText('开始重放' if value == 1 else f'重放 {value} 轮'))
+    return rounds
+
+
+class _ComparisonRunOptions(QWidget):
+    def __init__(self, prefix):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.toggle = QToolButton()
+        self.toggle.setObjectName(prefix + 'RunOptionsToggle')
+        self.toggle.setText('运行选项')
+        self.toggle.setCheckable(True)
+        self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle.setArrowType(Qt.ArrowType.RightArrow)
+        layout.addWidget(self.toggle, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.panel = QWidget()
+        self.panel.setObjectName(prefix + 'RunOptionsPanel')
+        self.form = QFormLayout(self.panel)
+        self.form.setContentsMargins(0, 0, 0, 0)
+        self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        layout.addWidget(self.panel)
+        self.panel.hide()
+        self.toggle.toggled.connect(self._toggle_panel)
+
+    def _toggle_panel(self, expanded):
+        self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self.panel.setVisible(expanded)
+
+    def set_expanded(self, expanded):
+        self.toggle.setChecked(expanded)
+
+    def track_changes(self, is_modified, *signals):
+        def update_caption(*_):
+            modified = not self.toggle.isChecked() and is_modified()
+            self.toggle.setText('运行选项 · 已调整' if modified else '运行选项')
+
+        self.toggle.toggled.connect(update_caption)
+        for signal in signals:
+            signal.connect(update_caption)
+
+
+class _ReplayToolDialog(QDialog):
+    """Own the optional version check until its worker has finished."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.task = None
+        self._closing = False
+        self._revision = 0
+        layout = QVBoxLayout(self)
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName('replayScroll')
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        layout.addWidget(self.scroll, 1)
+        self.body = QWidget()
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(0, 0, 0, 0)
+        self.overview = QFormLayout()
+        self.body_layout.addLayout(self.overview)
+        self.options_toggle = QToolButton()
+        self.options_toggle.setObjectName('replayOptionsToggle')
+        self.options_toggle.setText('运行选项')
+        self.options_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.options_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.options_toggle.setCheckable(True)
+        self.options_toggle.toggled.connect(self._toggle_options)
+        self.body_layout.addWidget(self.options_toggle, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.options_panel = QWidget()
+        self.options_panel.setObjectName('replayOptionsPanel')
+        self.options = QFormLayout(self.options_panel)
+        self.options.setContentsMargins(0, 0, 0, 0)
+        for form in (self.overview, self.options):
+            form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.body_layout.addWidget(self.options_panel)
+        self.body_layout.addStretch(1)
+        self.options_panel.hide()
+        self.scroll.setWidget(self.body)
+        self.scroll.viewport().installEventFilter(self)
+
+    def set_controls(self, buttons, *, expanded):
+        self.buttons = buttons
+        self.layout().addWidget(buttons)
+        self.resize(min(640, self.screen().availableGeometry().width() - 32), self.height())
+        self.options_toggle.setChecked(expanded)
+        self._fit_dialog()
+
+    def _toggle_options(self, expanded):
+        self.options_toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self.options_panel.setVisible(expanded)
+        self._fit_dialog()
+
+    def _content_height(self, width):
+        return max(self.body_layout.minimumSize().height(),
+                   self.body_layout.totalHeightForWidth(max(1, width)))
+
+    def _fit_dialog(self):
+        layout = self.layout()
+        layout.activate()
+        margins = layout.contentsMargins()
+        # Reserve room for the vertical scrollbar when content exceeds the available height.
+        width = self.width() - margins.left() - margins.right() - self.scroll.verticalScrollBar().sizeHint().width()
+        height = self._content_height(width)
+        self.body.setMinimumHeight(height)
+        height += margins.top() + margins.bottom() + layout.spacing() + self.buttons.sizeHint().height()
+        self.resize(self.width(), min(height, self.screen().availableGeometry().height() - 64))
+
+    def eventFilter(self, watched, event):
+        if watched is self.scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self.body.setMinimumHeight(self._content_height(event.size().width()))
+        return super().eventFilter(watched, event)
+
+    def add_tool_check(self, *, runner, tools, fields, source, start, python_check=None):
+        self.runner, self.tools, self.fields, self.source = runner, tools, fields, source
+        self.python_check = python_check
+        self.start_button = start
+        self.check_result = _label()
+        self.check_result.setObjectName('replayToolCheckResult')
+        self.check_button = _button('检查本机 Python' if python_check else '检查本机工具', self._check_tools)
+        self.check_button.setObjectName('replayCheckTools')
+        self.check_button.setAutoDefault(False)
+        self.check_button.setToolTip('启动所选可信 Python，检查 pytest、依赖及插件元数据。'
+                                     if python_check else '仅查询本机工具的路径和版本。依赖和缓存由正式重放核对。')
+        self.check_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.options.addRow('', self.check_button)
+        self.check_result.hide()
+        self.options.addRow(self.check_result)
+        for field in fields.values():
+            field.textChanged.connect(self._paths_changed)
+
+    def _paths_changed(self):
+        if self._closing:
+            return
+        self._revision += 1
+        self._set_check_result('')
+        if self.task is not None:
+            self.task.control.cancel()
+
+    def _set_check_result(self, text):
+        self.check_result.setText(text)
+        self.check_result.setVisible(bool(text))
+        if self.options_toggle.isChecked():
+            self._fit_dialog()
+
+    def _check_tools(self):
+        if self.task is not None or self._closing:
+            return
+        runner = self.runner
+        paths = _comparison_tool_paths(self.fields)
+        revision = self._revision
+
+        def action(control):
+            if self.python_check:
+                return self.python_check(paths['python'], control)
+            return probe_replay_tools(runner, **paths, control=control)
+
+        task = self.task = Task(action, self)
+        task.succeeded.connect(lambda result: self._show_check(task, revision, result),
+                               Qt.ConnectionType.QueuedConnection)
+        task.failed.connect(lambda error: self._show_check_error(task, revision, error),
+                            Qt.ConnectionType.QueuedConnection)
+        task.finished.connect(lambda: self._check_finished(task), Qt.ConnectionType.QueuedConnection)
+        self.check_button.setEnabled(False)
+        self.start_button.setEnabled(False)
+        self._set_check_result('正在检查本机工具…')
+        task.start()
+
+    def _is_current(self, task, revision):
+        return task is self.task and revision == self._revision and not self._closing
+
+    def _show_check(self, task, revision, result):
+        if not self._is_current(task, revision):
+            return
+        if self.python_check:
+            self._set_check_result(self._python_check_text(result))
+            return
+        lines = []
+        for key, name in self.tools:
+            version = result[key + '_version']
+            original = self.source.get(key + '_version')
+            difference = ('原报告版本未记录' if not original else '版本相同' if version == original
+                          else f'版本不同 · 原报告 {original}')
+            lines.append(f'{name} · {version} · {difference}\n{result[key]}')
+        self._set_check_result('\n'.join(lines))
+
+    @staticmethod
+    def _python_check_text(result):
+        heading = {'ready': '本机 Python 检查完成', 'review': '本机环境有差异或需要核对',
+                   'blocked': '本机环境存在已知阻碍'}
+        lines = [heading[result['status']]]
+        runtime = result['runtime']
+        if 'python_version' in runtime:
+            lines.append(f'Python {runtime["python_version"]} · pytest {runtime["pytest_version"]}')
+        lines.extend(result['issues'])
+        pending = [item['name'] for item in result['plugins'] if item['status'] not in ('installed', 'local')]
+        if pending:
+            lines.append('需核对的 pytest 插件 · ' + '、'.join(pending))
+        for item in result['dependencies'][:6]:
+            status = {'missing': '缺少', 'incompatible': '版本不符'}.get(item['status'], '需核对')
+            lines.append(f'{status} · {item["name"]} {item["specifier"]}'.rstrip())
+        comparison = result['comparison']
+        if comparison['status'] == 'unknown':
+            lines.append('环境版本记录不足，无法核对两边的发行包。')
+        if comparison['python_changed'] or comparison['platform_changed']:
+            lines.append('Python 版本或系统平台与原报告有差异。')
+        for key, label in (('removed', '本机缺少的原有发行包'), ('changed', '版本不同的发行包')):
+            items = comparison[key]
+            if items:
+                versions = [f'{item["name"]} {item["version"]}' if key == 'removed'
+                            else f'{item["name"]} {item["before"]} → {item["after"]}' for item in items[:6]]
+                lines.append(f'{label} · ' + '、'.join(versions) + (f' 等 {len(items)} 项' if len(items) > 6 else ''))
+        if comparison['added']:
+            lines.append(f'本机多出 {len(comparison["added"])} 个发行包。')
+        lines.append('测试兼容性由正式重放核对。')
+        return '\n'.join(lines)
+
+    def _show_check_error(self, task, revision, error):
+        if not self._is_current(task, revision):
+            return
+        for key, name in self.tools:
+            error = error.replace(f'通过 --{key} 指定路径', f'在「{name} 路径」选择可执行文件')
+        self._set_check_result('工具检查未完成 · ' + error)
+
+    def _check_finished(self, task):
+        if task is not self.task:
+            return
+        self.task = None
+        task.deleteLater()
+        if self._closing:
+            super().reject()
+            return
+        self.check_button.setEnabled(True)
+        self.start_button.setEnabled(True)
+
+    def accept(self):
+        if self.task is None and not self._closing:
+            super().accept()
+
+    def reject(self):
+        if self.task is None:
+            super().reject()
+            return
+        self._closing = True
+        self.task.control.cancel()
+        self._set_check_result('正在结束工具检查…')
+
+    def closeEvent(self, event):
+        if self.task is not None:
+            self.reject()
+            event.ignore()
+        else:
+            super().closeEvent(event)
+
+
 class ProjectWorkbench(QWidget):
     """Freeze versions, select real pytest node IDs, and review paired results."""
 
     busyChanged = Signal(bool)
     projectOpened = Signal(str, str)
     casePrepared = Signal(str)
+    evidenceImported = Signal()
 
     def __init__(self, store, parent=None):
         super().__init__(parent)
@@ -195,6 +529,8 @@ class ProjectWorkbench(QWidget):
         self.state = None
         self.collection = None
         self.report = None
+        self.go_report = None
+        self.vitest_report = None
         self.review_progress = None
         self.ai_dialog = None
         self.environment_dialog = None
@@ -216,13 +552,19 @@ class ProjectWorkbench(QWidget):
         self._view_dirty = False
         self._has_restored_selection = False
         self._presets = {}
+        self._python_candidates = []
         self.comparison_dialog = None
         self.processing_dialog = None
+        self.replay_dialog = None
         self.selection_dialog = None
         self._selection_review = None
         self._pending_selection = None
         self._selection_intent = None
         self._report_reference = None
+        self._opened_evidence = None
+        self._replay_details = None
+        self._saved_replay_receipt = None
+        self._stability_result = None
         self.view_save_timer = QTimer(self)
         self.view_save_timer.setSingleShot(True)
         self.view_save_timer.setInterval(350)
@@ -252,7 +594,7 @@ class ProjectWorkbench(QWidget):
     def busy(self):
         if self.task is not None:
             return True
-        for dialog in (self.ai_dialog, self.environment_dialog, self.failure_dialog, self.processing_dialog):
+        for dialog in (self.ai_dialog, self.environment_dialog, self.failure_dialog, self.processing_dialog, self.replay_dialog):
             if dialog is not None:
                 for child in (dialog, *dialog.findChildren(QDialog)):
                     if getattr(child, 'task', None) is not None:
@@ -262,7 +604,11 @@ class ProjectWorkbench(QWidget):
     def _build_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        layout = outer
+        outer.setSpacing(10)
+        self.pytest_header = QWidget()
+        outer.addWidget(self.pytest_header)
+        layout = QVBoxLayout(self.pytest_header)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         self.session_combo = QComboBox()
         self.session_combo.setMinimumContentsLength(18)
@@ -270,8 +616,11 @@ class ProjectWorkbench(QWidget):
         self.session_combo.addItem('已保存的项目会话', None)
         self.open_saved_button = _button('打开', self._open_catalog_selection)
         self.open_session_button = _button('打开会话目录…', self.open_session)
+        self.open_project_report_button = _button('打开项目报告…', self.open_project_report)
         self.import_button = _button('导入项目证据…', self.import_bundle)
         self.import_button.setToolTip('校验并解压项目报告 ZIP，只读取保存的证据；不会执行项目代码。')
+        self.make_receipt_button = _button('从报告制作回执…', self.make_replay_receipt)
+        self.check_receipt_button = _button('复核回传回执…', self.check_returned_receipt)
         self.refresh_sessions_button = _button('刷新', self.refresh_sessions)
         self.new_button = _button('新建项目', self.new_project)
         self.refresh_workspace_button = _button('刷新当前工作区', self.refresh_workspace)
@@ -282,7 +631,8 @@ class ProjectWorkbench(QWidget):
         self.project_menu_button = QPushButton('项目操作')
         self.project_menu = QMenu(self)
         self.project_menu_actions = []
-        for item in (self.new_button, self.open_session_button, self.import_button,
+        for item in (self.new_button, self.open_session_button, self.open_project_report_button, self.import_button,
+                     self.make_receipt_button, self.check_receipt_button,
                      self.refresh_sessions_button, self.refresh_workspace_button):
             item.setParent(self)
             item.hide()
@@ -290,8 +640,12 @@ class ProjectWorkbench(QWidget):
             action.triggered.connect(lambda checked=False, target=item: target.click())
             self.project_menu_actions.append((item, action))
         self.project_menu_button.setMenu(self.project_menu)
-        catalog_row.addWidget(self.project_menu_button)
-        layout.addLayout(catalog_row)
+        self.acceptance_button = _button('修复验收…', self.open_project_acceptance)
+        self.acceptance_button.setObjectName('projectAcceptance')
+        self.acceptance_button.setToolTip('从当前报告核对指定测试、回归门槛、回执和多轮重放。')
+        catalog_row.addWidget(self.acceptance_button, alignment=Qt.AlignmentFlag.AlignRight)
+        catalog_row.addWidget(self.project_menu_button, alignment=Qt.AlignmentFlag.AlignRight)
+        outer.insertLayout(0, catalog_row)
 
         self.input_toggle = _button('收起配置', self.toggle_inputs)
         self.input_toggle.setObjectName('quiet')
@@ -350,11 +704,13 @@ class ProjectWorkbench(QWidget):
         for button in (self.python_button, self.environment_button, self.python_reset_button):
             button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         form.addRow('Python 环境', python_row)
-        self.environment_hint = _CompactLabel('选择已经安装项目依赖的环境。读取项目时会列出 .venv、venv 和 env，不会自动运行它们。')
+        self.environment_hint = _CompactLabel()
         self.environment_hint.setStyleSheet('color: #5a6b82; font-size: 12px;')
+        self.use_project_environment_button = _button('使用项目环境', self._use_project_environment)
         self.saved_options_button = _button('使用上次环境与时限', self.use_saved_options)
-        self.saved_options_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        form.addRow('', _row(self.environment_hint, self.saved_options_button))
+        for button in (self.use_project_environment_button, self.saved_options_button):
+            button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        form.addRow('', _row(self.environment_hint, self.use_project_environment_button, self.saved_options_button))
         self.input_section = QWidget()
         self.input_section.setObjectName('card')
         input_layout = QVBoxLayout(self.input_section)
@@ -439,6 +795,7 @@ class ProjectWorkbench(QWidget):
         layout.addWidget(self.problem_panel)
         self.problem_panel.hide()
 
+        layout = outer
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         layout.addWidget(self.tabs, 1)
@@ -446,6 +803,22 @@ class ProjectWorkbench(QWidget):
         self._build_tests_tab()
         self._build_results_tab()
         self._build_history_tab()
+        self._build_go_tab()
+        self._build_vitest_tab()
+
+        self.evidence_message = _CompactLabel()
+        self.preview_replay_button = _button('预览重放…', self._preview_opened_evidence, True)
+        self.preview_replay_button.setToolTip('查看保存的版本、测试范围和本机运行环境。')
+        self.save_replay_receipt_button = _button('保存回执…', self._save_displayed_replay_receipt, True)
+        self.open_replay_receipt_button = _button('打开回执目录', self._open_saved_replay_receipt, True)
+        self.replay_verification_button = _button('重放核对与回执…', self._open_replay_verification)
+        self.stability_result_button = _button('稳定性历史…', self._open_replay_stability)
+        self.stability_result_button.setToolTip('查看此原始报告关联的稳定性检查，再按每轮证据离线复核。')
+        self.evidence_actions = _row(self.evidence_message, self.preview_replay_button, self.replay_verification_button,
+                                     self.save_replay_receipt_button, self.open_replay_receipt_button,
+                                     self.stability_result_button)
+        self.evidence_actions.layout().setStretch(0, 1)
+        outer.insertWidget(1, self.evidence_actions)
 
         self.status_label = _CompactLabel()
         self.cancel_button = _button('取消当前操作', self.cancel_operation)
@@ -463,6 +836,11 @@ class ProjectWorkbench(QWidget):
 
     def _sync_stage_actions(self, *_):
         stage = self.tabs.currentIndex()
+        self._sync_evidence_actions()
+        pytest_tab = self.tabs.currentWidget() not in (self.go_page, self.vitest_page)
+        self.pytest_header.setVisible(pytest_tab)
+        self.session_combo.setVisible(pytest_tab)
+        self.open_saved_button.setVisible(pytest_tab)
         if stage == 1 and self.task is None and self.collection and self.problem_panel.isHidden():
             diagnosis = collection_diagnosis(self.collection)
             if diagnosis['code'] != 'collected':
@@ -482,6 +860,617 @@ class ProjectWorkbench(QWidget):
         self.change_panel.setVisible(self.state is not None)
         self.result_metrics.setVisible(self.report is not None and not self.report.get('review_source'))
         self.selection_review_panel.setVisible(self._pending_selection is not None)
+
+    def _build_go_tab(self):
+        self.go_page = QScrollArea()
+        self.go_page.setWidgetResizable(True)
+        content = QWidget()
+        body = QVBoxLayout(content)
+        body.setContentsMargins(0, 14, 8, 0)
+        body.setSpacing(10)
+        self.go_form = QWidget()
+        form = QFormLayout(self.go_form)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.go_repository_edit = QLineEdit()
+        self.go_repository_edit.setPlaceholderText('两版根目录均有 go.mod 的 Git 仓库')
+        form.addRow('代码仓库', _row(self.go_repository_edit, _button('选择文件夹',
+                    lambda: self._choose_comparison_repository(self.go_repository_edit))))
+        self.go_before_edit = QLineEdit('HEAD')
+        self.go_before_edit.setPlaceholderText('分支 / 标签 / 提交')
+        form.addRow('基线版本', self.go_before_edit)
+        self.go_after_edit = QLineEdit('HEAD')
+        self.go_after_edit.setPlaceholderText('分支 / 标签 / 提交')
+        self.go_workspace_check = QCheckBox('使用当前工作区')
+        self.go_workspace_check.setChecked(True)
+        self.go_after_edit.setEnabled(False)
+        self.go_workspace_check.toggled.connect(self.go_after_edit.setDisabled)
+        form.addRow('候选版本', _row(self.go_after_edit, self.go_workspace_check))
+        self.go_package_edit = QLineEdit('.')
+        self.go_package_edit.setPlaceholderText('. 或 internal/cart')
+        self.go_package_edit.setToolTip('填写相对于仓库根目录的包路径，根包使用 .')
+        form.addRow('包目录', self.go_package_edit)
+        self.go_tests_edit = QPlainTextEdit()
+        self.go_tests_edit.setPlaceholderText('例如 TestCheckout，多个名称用换行或空格分隔')
+        self.go_tests_edit.setFixedHeight(66)
+        self.go_discover_button = _button('发现并填入', lambda: self._run_go_comparison(discover=True))
+        self.go_discover_button.setToolTip('从可信候选的快照发现测试，用完整清单替换当前输入，可再编辑。')
+        form.addRow('顶层测试函数', _row(self.go_tests_edit, self.go_discover_button))
+        self.go_run_options = _ComparisonRunOptions('go')
+        options = self.go_run_options.form
+        self.go_path_edit = QLineEdit()
+        self.go_path_edit.setPlaceholderText('留空从 PATH 查找')
+        options.addRow('Go 路径', _row(self.go_path_edit, _button('选择 Go…',
+                    lambda: self._choose_comparison_executable(self.go_path_edit, 'Go'))))
+        self.go_timeout_spin = QDoubleSpinBox()
+        self.go_timeout_spin.setRange(.1, 3600)
+        self.go_timeout_spin.setDecimals(1)
+        self.go_timeout_spin.setValue(_DEFAULT_COMPARISON_TIMEOUT)
+        self.go_timeout_spin.setSuffix(' 秒')
+        self.go_timeout_spin.setToolTip('测试发现与两版测试各自使用此限时。')
+        options.addRow('每次限时', self.go_timeout_spin)
+        self.go_run_options.track_changes(
+            lambda: bool(self.go_path_edit.text().strip())
+            or self.go_timeout_spin.value() != _DEFAULT_COMPARISON_TIMEOUT,
+            self.go_path_edit.textChanged, self.go_timeout_spin.valueChanged,
+        )
+        form.addRow(self.go_run_options)
+        self.go_run_button = _button('开始 Go 对比', self._run_go_comparison, primary=True)
+        self.go_run_button.setToolTip('在独立快照中执行选定的测试，请选择可信的项目。')
+        self.go_plan_button = _button('按验收计划运行…', lambda: self._choose_comparison_plan('go'))
+        form.addRow('', _row(self.go_run_button, self.go_plan_button))
+        body.addWidget(self.go_form)
+        self.go_error_label = _label()
+        self.go_error_label.hide()
+        body.addWidget(self.go_error_label)
+
+        self.go_result_panel = QWidget()
+        results = QVBoxLayout(self.go_result_panel)
+        results.setContentsMargins(0, 0, 0, 0)
+        self.go_result_summary = _label()
+        self.go_open_button = _button('打开报告', self._open_go_report)
+        self.go_replay_button = _button('重放…', lambda: self._preview_comparison_followup(self.go_report))
+        self.go_recheck_button = _button('用当前工作区复查…',
+                                         lambda: self._preview_comparison_followup(self.go_report, recheck=True))
+        self.go_export_button = _button('导出证据 ZIP…', lambda: self._export_comparison_report(self.go_report))
+        self.go_export_button.setObjectName('goExportEvidence')
+        self.go_summary_button = _button('复制 PR 摘要', lambda: self.copy_review_summary(self.go_report))
+        actions = _row(self.go_open_button, self.go_replay_button, self.go_recheck_button,
+                       self.go_export_button, self.go_summary_button)
+        actions.layout().addStretch(1)
+        results.addWidget(self.go_result_summary)
+        results.addWidget(actions)
+        self.go_run_context = _label()
+        results.addWidget(self.go_run_context)
+        self.go_run_diagnostics = _label()
+        results.addWidget(self.go_run_diagnostics)
+        self.go_results_tree = _tree(['测试函数', '对比结果', '基线', '候选'])
+        self.go_results_tree.setMinimumHeight(145)
+        results.addWidget(self.go_results_tree, 1)
+        self.go_recheck_panel, self.go_recheck_summary, self.go_recheck_tree = _recheck_panel('测试函数')
+        results.addWidget(self.go_recheck_panel, 1)
+        body.addWidget(self.go_result_panel, 1)
+        self.go_result_panel.hide()
+        body.addStretch(0)
+        self.go_page.setWidget(content)
+        self.tabs.addTab(self.go_page, 'Go 项目对比')
+
+    def _choose_comparison_repository(self, edit):
+        path = QFileDialog.getExistingDirectory(edit.window(), '选择本地 Git 项目', edit.text())
+        if path:
+            edit.setText(path)
+
+    def _choose_comparison_executable(self, edit, name):
+        path, _ = QFileDialog.getOpenFileName(edit.window(), f'选择 {name} 可执行文件', edit.text(),
+                                             options=QFileDialog.Option.DontResolveSymlinks)
+        if path:
+            edit.setText(path)
+
+    def _choose_comparison_plan(self, runner):
+        if self.busy or self._closing:
+            return
+        from .acceptance_plan import execution_selection, read_acceptance_plan
+
+        location, _ = QFileDialog.getOpenFileName(self, '打开验收计划', str(self.report_root.parent),
+                                                  '验收计划 (*.json)')
+        if not location:
+            return
+        try:
+            plan = read_acceptance_plan(location)
+            targets = execution_selection(plan, runner)
+        except (OSError, ValueError) as exc:
+            failed = self._go_failed if runner == 'go' else self._vitest_failed
+            failed(str(exc))
+            return
+        scope = f'{len(targets)} 个顶层测试' if runner == 'go' else f'{len(targets)} 个完整测试文件'
+        if not self._confirm_choice('按验收计划运行',
+                                    f'{Path(location).name} · {scope}。\n使用当前表单的版本和运行环境执行两版。'):
+            return
+        run = self._run_go_comparison if runner == 'go' else self._run_vitest_comparison
+        run(acceptance_plan=plan)
+
+    def _run_go_comparison(self, *, discover=False, acceptance_plan=None):
+        if self.busy or self._closing:
+            return
+        repository = self.go_repository_edit.text().strip()
+        before = self.go_before_edit.text().strip()
+        after = WORKTREE if self.go_workspace_check.isChecked() else self.go_after_edit.text().strip()
+        package = self.go_package_edit.text().strip() or '.'
+        selected = self.go_tests_edit.toPlainText().split()
+        go = self.go_path_edit.text().strip() or None
+        timeout = self.go_timeout_spin.value()
+        output = self.report_root
+        if not repository or not before or not after:
+            self._go_failed('请选择 Git 仓库并填写基线和候选版本。')
+            return
+        if not discover and acceptance_plan is None and not selected:
+            self._go_failed('请填写至少一个顶层 Go 测试函数，或点击「发现并填入」。')
+            self.go_tests_edit.setFocus()
+            return
+        self.go_error_label.hide()
+        repository = Path(repository).expanduser()
+
+        if discover:
+            def discover_tests(control):
+                return list_go_tests(repository, before, after, package=package,
+                                     go=go, timeout=timeout, control=control)
+
+            def fill_tests(result):
+                tests = result['tests']
+                self.go_tests_edit.setPlainText('\n'.join(tests))
+                self.status_label.setText(f'已填入 {len(tests)} 项 Go 测试，可编辑后开始对比。')
+
+            self._start(discover_tests, fill_tests, '正在发现候选版本的 Go 测试…',
+                        operation='go_discover', runtime_values={})
+            return
+
+        def action(control):
+            from .acceptance_plan import PlanSelectionBlocked
+
+            plan_options = {'acceptance_plan': acceptance_plan} if acceptance_plan is not None else {}
+            try:
+                report = run_go_project(repository, before, after, output, package=package,
+                                        selected=selected if acceptance_plan is None else None,
+                                        go=go, timeout=timeout, control=control, **plan_options)
+            except PlanSelectionBlocked as exc:
+                raise ValueError('\n'.join([str(exc), *exc.review['missing_tests'][:20]])) from exc
+            return self._comparison_acceptance(report, acceptance_plan, control)
+
+        self._start(action, self._show_comparison_acceptance,
+                    '正在对比两版 Go 测试…', operation='go', runtime_values={})
+
+    def _go_failed(self, error, *, action='对比'):
+        missing_tool = action in ('对比', '测试发现') and error == '找不到 Go，请安装工具链或通过 --go 指定路径。'
+        location = '「重放 → 运行选项」中的' if action == '重放' else ''
+        error = error.replace('通过 --go 指定路径', f'在{location}「Go 路径」选择可执行文件')
+        self.go_error_label.setText(_short(error, 3000))
+        self.go_error_label.show()
+        if missing_tool:
+            self._reveal_comparison_tool(self.go_run_options, self.go_page, self.go_path_edit, self.go_error_label)
+        elif action in ('重放', '复查', '导出', '复制摘要'):
+            self.go_page.ensureWidgetVisible(self.go_error_label)
+        self.status_label.setText(f'Go {action}未完成')
+
+    def _reveal_comparison_tool(self, options, page, edit, error_label):
+        options.set_expanded(True)
+
+        def focus_path():
+            if self.tabs.currentWidget() is page and not self.busy:
+                page.ensureWidgetVisible(error_label, 0, 12)
+                page.ensureWidgetVisible(edit, 0, 12)
+                edit.setFocus()
+
+        if self.task is None:
+            focus_path()
+        else:
+            self._after_finished = focus_path
+
+    def _show_go_report(self, report):
+        self.go_recheck_panel.hide()
+        scope = comparison_scope(report)
+        status = comparison_verdict(report, scope)
+        verdict = '检测到回归' if status == 'regression_detected' else _RUN_STATUS[status]
+        if scope:
+            verdict += '\n' + comparison_scope_message(scope)
+        if archive := archive_preflight_text(report.get('archive_preflight')):
+            verdict += '\n' + archive
+        counts = _comparison_counts(report['counts'], scope)
+        self.go_result_summary.setText(f'最近保存的结果 · {verdict} · {counts}')
+        before, after = report['before_commit'], report['after_commit']
+        candidate = '运行时的工作区' if after == WORKTREE else after[:12]
+        self.go_run_context.setText(f'{report["title"]} · 包 {report["go_package"]} · {before[:12]} → {candidate}')
+        self.go_run_context.setToolTip(f'{report["repository"]}\n{before} → {after}\n{report["runtime"]["go_version"]}')
+        diagnostics = []
+        for side, label in (('before', '基线'), ('after', '候选')):
+            run = report[side]
+            if run['status'] == 'timed_out':
+                diagnostics.append(f'{label}运行超时')
+            elif run.get('reason'):
+                diagnostics.append(f'{label} · {run["reason"]}')
+        self.go_run_diagnostics.setText('\n'.join(diagnostics))
+        self.go_run_diagnostics.setVisible(bool(diagnostics))
+        items = []
+        def go_item(entry):
+            outcomes = [entry[side] for side in ('before', 'after')]
+            item = QTreeWidgetItem([entry['test_id'], _STATUS[entry['status']],
+                                    *(_STATUS.get(outcome['status'], '受阻 / 无法判断') for outcome in outcomes)])
+            for column, outcome in enumerate(outcomes, start=2):
+                if exception := outcome.get('exception'):
+                    item.setToolTip(column, exception['message'])
+            return item
+
+        for entry in report['entries']:
+            item = go_item(entry)
+            item.addChildren([go_item(case) for case in entry.get('case_entries', ())])
+            items.append(item)
+        self.go_results_tree.clear()
+        self.go_results_tree.addTopLevelItems(items)
+        self.go_report = report
+        self.go_result_panel.show()
+        self.status_label.setText('Go 报告已保存')
+
+    def _show_comparison_recheck(self, runner, comparison):
+        if runner == 'go':
+            panel, summary, tree = self.go_recheck_panel, self.go_recheck_summary, self.go_recheck_tree
+        else:
+            panel, summary, tree = self.vitest_recheck_panel, self.vitest_recheck_summary, self.vitest_recheck_tree
+        tree.clear()
+        if notice := comparison.get('notice'):
+            summary.setText('候选间复查 · ' + notice)
+            tree.hide()
+        else:
+            counts = _recheck_counts(comparison['counts'])
+            entries = comparison['entries']
+            reasons = list(comparison['changes'])
+            if runner == 'vitest':
+                unreviewed = sum(not entry['case_entries'] for entry in entries)
+                if counts:
+                    counts = '用例 · ' + counts
+                if unreviewed:
+                    counts = ' · '.join(filter(None, (counts, f'未能复查 {unreviewed} 个文件')))
+                reasons.extend(reason for entry in entries for reason in entry['changes'])
+            changes = '\n' + ' · '.join(dict.fromkeys(reasons)) if reasons else ''
+            summary.setText('上一轮候选 → 本轮候选 · ' + counts + changes)
+            tree.addTopLevelItems([_recheck_item(entry) for entry in entries])
+            if runner == 'vitest':
+                tree.expandAll()
+            tree.show()
+        panel.show()
+        return summary
+
+    def _open_go_report(self):
+        if self.go_report:
+            self._open_local(Path(self.go_report['report_dir']) / 'report.html', on_error=self._go_failed)
+
+    def _build_vitest_tab(self):
+        self.vitest_page = QScrollArea()
+        self.vitest_page.setWidgetResizable(True)
+        content = QWidget()
+        body = QVBoxLayout(content)
+        body.setContentsMargins(0, 14, 8, 0)
+        body.setSpacing(10)
+        self.vitest_form = QWidget()
+        form = QFormLayout(self.vitest_form)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.vitest_repository_edit = QLineEdit()
+        self.vitest_repository_edit.setPlaceholderText('包含 Vitest 项目的 Git 仓库')
+        form.addRow('代码仓库', _row(self.vitest_repository_edit, _button('选择文件夹',
+                    lambda: self._choose_comparison_repository(self.vitest_repository_edit))))
+        self.vitest_before_edit = QLineEdit('HEAD')
+        self.vitest_before_edit.setPlaceholderText('分支 / 标签 / 提交')
+        form.addRow('基线版本', self.vitest_before_edit)
+        self.vitest_after_edit = QLineEdit('HEAD')
+        self.vitest_after_edit.setPlaceholderText('分支 / 标签 / 提交')
+        self.vitest_workspace_check = QCheckBox('使用当前工作区')
+        self.vitest_workspace_check.setChecked(True)
+        self.vitest_after_edit.setEnabled(False)
+        self.vitest_workspace_check.toggled.connect(self.vitest_after_edit.setDisabled)
+        form.addRow('候选版本', _row(self.vitest_after_edit, self.vitest_workspace_check))
+        self.vitest_project_dir_edit = QLineEdit('.')
+        self.vitest_project_dir_edit.setPlaceholderText('. 或 frontend')
+        self.vitest_project_dir_edit.setToolTip('相对于 Git 仓库根目录。可选独立 npm 项目或已锁定的 workspace 成员。')
+        form.addRow('npm 项目目录', self.vitest_project_dir_edit)
+
+        self.vitest_files_edit = QPlainTextEdit()
+        self.vitest_files_edit.setPlaceholderText('每行一个仓库相对路径，例如 frontend/tests/cart.test.ts')
+        self.vitest_files_edit.setFixedHeight(66)
+        self.vitest_files_button = _button('选择测试文件…', self._choose_vitest_files)
+        self.vitest_discover_button = _button('发现并填入', lambda: self._run_vitest_comparison(discover=True))
+        self.vitest_discover_button.setToolTip('在可信候选的副本中安装依赖并加载 Vitest 配置，用发现清单替换当前输入。')
+        form.addRow('测试文件', _row(self.vitest_files_edit, self.vitest_discover_button, self.vitest_files_button))
+        self.vitest_run_options = _ComparisonRunOptions('vitest')
+        options = self.vitest_run_options.form
+        self.vitest_node_edit = QLineEdit()
+        self.vitest_npm_edit = QLineEdit()
+        for name, edit in (('Node', self.vitest_node_edit), ('npm', self.vitest_npm_edit)):
+            edit.setPlaceholderText('留空从 PATH 查找')
+            choose = _button(f'选择 {name}…', lambda field=edit, tool=name: self._choose_comparison_executable(field, tool))
+            options.addRow(f'{name} 路径', _row(edit, choose))
+        self.vitest_cache_edit = QLineEdit()
+        self.vitest_cache_edit.setPlaceholderText('留空使用 npm 默认缓存')
+        self.vitest_offline_check = QCheckBox('离线安装')
+        self.vitest_offline_check.setToolTip('离线安装需要预先填充锁文件依赖的 npm 缓存。')
+        options.addRow('npm 缓存', _row(self.vitest_cache_edit,
+                    _button('选择缓存…', self._choose_vitest_cache), self.vitest_offline_check))
+        self.vitest_timeout_spin = QDoubleSpinBox()
+        self.vitest_timeout_spin.setRange(.1, 3600)
+        self.vitest_timeout_spin.setDecimals(1)
+        self.vitest_timeout_spin.setValue(_DEFAULT_COMPARISON_TIMEOUT)
+        self.vitest_timeout_spin.setSuffix(' 秒')
+        self.vitest_timeout_spin.setToolTip('发现和两版测试各自使用此限时，包含安装依赖。')
+        options.addRow('每次限时', self.vitest_timeout_spin)
+        self.vitest_run_options.track_changes(
+            lambda: any(edit.text().strip() for edit in
+                        (self.vitest_node_edit, self.vitest_npm_edit, self.vitest_cache_edit))
+            or self.vitest_offline_check.isChecked() or self.vitest_timeout_spin.value() != _DEFAULT_COMPARISON_TIMEOUT,
+            self.vitest_node_edit.textChanged, self.vitest_npm_edit.textChanged, self.vitest_cache_edit.textChanged,
+            self.vitest_offline_check.toggled, self.vitest_timeout_spin.valueChanged,
+        )
+        form.addRow(self.vitest_run_options)
+        self.vitest_run_button = _button('开始 Vitest 对比', self._run_vitest_comparison, primary=True)
+        self.vitest_run_button.setToolTip('在两版独立快照中运行 npm ci 和所选测试，请选择可信的项目。')
+        self.vitest_plan_button = _button('按验收计划运行…', lambda: self._choose_comparison_plan('vitest'))
+        form.addRow('', _row(self.vitest_run_button, self.vitest_plan_button))
+        body.addWidget(self.vitest_form)
+        self.vitest_error_label = _label()
+        self.vitest_error_label.hide()
+        body.addWidget(self.vitest_error_label)
+
+        self.vitest_result_panel = QWidget()
+        results = QVBoxLayout(self.vitest_result_panel)
+        results.setContentsMargins(0, 0, 0, 0)
+        self.vitest_result_summary = _label()
+        self.vitest_open_button = _button('打开报告', self._open_vitest_report)
+        self.vitest_replay_button = _button('重放…', lambda: self._preview_comparison_followup(self.vitest_report))
+        self.vitest_recheck_button = _button('用当前工作区复查…',
+                                             lambda: self._preview_comparison_followup(self.vitest_report, recheck=True))
+        self.vitest_export_button = _button('导出证据 ZIP…', lambda: self._export_comparison_report(self.vitest_report))
+        self.vitest_export_button.setObjectName('vitestExportEvidence')
+        self.vitest_summary_button = _button('复制 PR 摘要', lambda: self.copy_review_summary(self.vitest_report))
+        actions = _row(self.vitest_open_button, self.vitest_replay_button, self.vitest_recheck_button,
+                       self.vitest_export_button, self.vitest_summary_button)
+        actions.layout().addStretch(1)
+        results.addWidget(self.vitest_result_summary)
+        results.addWidget(actions)
+        self.vitest_run_context = _label()
+        results.addWidget(self.vitest_run_context)
+        self.vitest_run_diagnostics = _label()
+        results.addWidget(self.vitest_run_diagnostics)
+        self.vitest_results_tree = _tree(['文件 / 用例', '对比结果', '基线', '候选'])
+        self.vitest_results_tree.setRootIsDecorated(True)
+        self.vitest_results_tree.setMinimumHeight(170)
+        results.addWidget(self.vitest_results_tree, 1)
+        self.vitest_recheck_panel, self.vitest_recheck_summary, self.vitest_recheck_tree = _recheck_panel(
+            '文件 / 用例', files=True)
+        results.addWidget(self.vitest_recheck_panel, 1)
+        body.addWidget(self.vitest_result_panel, 1)
+        self.vitest_result_panel.hide()
+        body.addStretch(0)
+        self.vitest_page.setWidget(content)
+        self.tabs.addTab(self.vitest_page, 'Vitest 项目对比')
+
+    def _vitest_file_paths(self):
+        return [line.strip() for line in self.vitest_files_edit.toPlainText().splitlines() if line.strip()]
+
+    def _choose_vitest_files(self):
+        directory = self.vitest_repository_edit.text().strip()
+        if not directory:
+            self._vitest_failed('请先选择 Git 仓库。')
+            return
+        try:
+            root = repository_root(Path(directory).expanduser())
+            project_dir = normalize_vitest_project_dir(self.vitest_project_dir_edit.text().strip() or '.')
+            project = root / project_dir
+            if not project.is_dir() or project.resolve() != project:
+                raise ValueError(f'当前工作区找不到可用的 npm 项目目录：{project_dir}')
+            paths, _ = QFileDialog.getOpenFileNames(
+                self, '选择 Vitest 测试文件', str(project),
+                'JavaScript / TypeScript (*.js *.jsx *.mjs *.cjs *.ts *.tsx *.mts *.cts)',
+            )
+            selected = []
+            for path in paths:
+                file = Path(path).resolve()
+                if not file.is_relative_to(project):
+                    raise ValueError(f'请选择 npm 项目目录内的测试文件：{path}')
+                selected.append(normalize_collection_path(file.relative_to(root).as_posix()))
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._vitest_failed(str(exc))
+            return
+        if selected:
+            self.vitest_files_edit.setPlainText('\n'.join(dict.fromkeys([*self._vitest_file_paths(), *selected])))
+            self.vitest_error_label.hide()
+
+    def _choose_vitest_cache(self, edit=None):
+        if edit is None:
+            edit = self.vitest_cache_edit
+        path = QFileDialog.getExistingDirectory(edit.window(), '选择 npm 缓存目录', edit.text())
+        if path:
+            edit.setText(path)
+
+    def _run_vitest_comparison(self, *, discover=False, acceptance_plan=None):
+        if self.busy or self._closing:
+            return
+        repository = self.vitest_repository_edit.text().strip()
+        before = self.vitest_before_edit.text().strip()
+        after = WORKTREE if self.vitest_workspace_check.isChecked() else self.vitest_after_edit.text().strip()
+        files = self._vitest_file_paths()
+        project_dir = self.vitest_project_dir_edit.text().strip() or '.'
+        node = self.vitest_node_edit.text().strip() or None
+        npm = self.vitest_npm_edit.text().strip() or None
+        timeout = self.vitest_timeout_spin.value()
+        offline = self.vitest_offline_check.isChecked()
+        npm_cache = self.vitest_cache_edit.text().strip() or None
+        output = self.report_root
+        if not repository or not before or not after:
+            self._vitest_failed('请选择 Git 仓库并填写基线和候选版本。')
+            return
+        if not discover and acceptance_plan is None and not files:
+            self._vitest_failed('请填写、选择或发现至少一个 Vitest 测试文件。')
+            self.vitest_files_edit.setFocus()
+            return
+        self.vitest_error_label.hide()
+        repository = Path(repository).expanduser()
+        options = {'project_dir': project_dir, 'node': str(Path(node).expanduser()) if node else None,
+                   'npm': str(Path(npm).expanduser()) if npm else None, 'timeout': timeout,
+                   'offline': offline, 'npm_cache': npm_cache}
+
+        if discover:
+            def discover_files(control):
+                return list_vitest_files(repository, before, after, control=control, **options)
+
+            def fill_files(result):
+                paths = result['files']
+                self.vitest_files_edit.setPlainText('\n'.join(paths))
+                self.status_label.setText(f'已填入 {len(paths)} 个 Vitest 测试文件，可编辑后开始对比。')
+
+            self._start(discover_files, fill_files, '正在发现候选版本的 Vitest 测试文件…',
+                        operation='vitest_discover', runtime_values={})
+            return
+
+        def action(control):
+            from .acceptance_plan import PlanSelectionBlocked
+
+            plan_options = {'acceptance_plan': acceptance_plan} if acceptance_plan is not None else {}
+            try:
+                report = run_vitest_project(repository, before, after, files if acceptance_plan is None else None,
+                                            output, control=control, **options, **plan_options)
+            except PlanSelectionBlocked as exc:
+                raise ValueError('\n'.join([str(exc), *exc.review['missing_tests'][:20]])) from exc
+            return self._comparison_acceptance(report, acceptance_plan, control)
+
+        self._start(action, self._show_comparison_acceptance,
+                    '正在对比两版 Vitest · 安装依赖并运行测试…',
+                    operation='vitest', runtime_values={})
+
+    def _comparison_acceptance(self, report, plan, control):
+        saved = _read_report(report['report_dir'])
+        if plan is None:
+            return saved, None, None, None
+        from .project_review_summary import review_summary
+
+        try:
+            summary = review_summary(saved['report_dir'], plan=plan,
+                                     expected_report=report_reference(saved), control=control)
+        except (OSError, ValueError) as exc:
+            return saved, plan, None, str(exc)
+        return saved, plan, summary, None
+
+    def _show_comparison_acceptance(self, result):
+        report, plan, summary, error = result
+        self._show_saved_project_report(report, select_page=False)
+        if plan is None:
+            return
+        from .desktop_acceptance import acceptance_headline
+
+        reference = report_reference(report)
+        self.status_label.setText(acceptance_headline(summary))
+        reveal = self._after_finished
+
+        def show():
+            if reveal is not None:
+                reveal()
+            current = self._displayed_result_report()
+            if current and report_reference(current) == reference:
+                self._show_project_acceptance(reference, {'plan': plan}, summary, error)
+
+        self._after_finished = show
+
+    def _vitest_failed(self, error, *, action='对比'):
+        missing_tool = {
+            '找不到 node，请安装它或通过 --node 指定路径。': self.vitest_node_edit,
+            '找不到 npm，请安装它或通过 --npm 指定路径。': self.vitest_npm_edit,
+        }.get(error) if action in ('对比', '测试发现') else None
+        location = '「重放 → 运行选项」中的' if action == '重放' else ''
+        error = (error.replace('通过 --node 指定路径', f'在{location}「Node 路径」选择可执行文件')
+                 .replace('通过 --npm 指定路径', f'在{location}「npm 路径」选择可执行文件')
+                 .replace('通过 --file 选择', '在「测试文件」填写或选择'))
+        self.vitest_error_label.setText(_short(error, 3000))
+        self.vitest_error_label.show()
+        if missing_tool is not None:
+            self._reveal_comparison_tool(self.vitest_run_options, self.vitest_page,
+                                         missing_tool, self.vitest_error_label)
+        elif action in ('重放', '复查', '导出', '复制摘要'):
+            self.vitest_page.ensureWidgetVisible(self.vitest_error_label)
+        self.status_label.setText(f'Vitest {action}未完成')
+
+    @staticmethod
+    def _vitest_result_item(entry):
+        item = QTreeWidgetItem([entry['test_id'], _STATUS[entry['status']]])
+        item.setToolTip(0, entry['test_id'])
+        if entry.get('reason'):
+            item.setToolTip(1, entry['reason'])
+        for column, side in enumerate(('before', 'after'), start=2):
+            outcome = entry[side]
+            status = _STATUS.get(outcome['status'], '受阻 / 无法判断')
+            if outcome.get('retry_passed'):
+                status = '重试后通过'
+            elif outcome.get('expected_failure'):
+                status += '（预期失败）'
+            item.setText(column, status)
+            detail = (outcome.get('exception') or {}).get('message') or outcome.get('reason')
+            if detail:
+                item.setToolTip(column, detail)
+        return item
+
+    def _show_vitest_report(self, report):
+        self.vitest_recheck_panel.hide()
+        scope = comparison_scope(report)
+        status = comparison_verdict(report, scope)
+        verdict = '检测到回归' if status == 'regression_detected' else _RUN_STATUS[status]
+        if scope:
+            verdict += '\n' + comparison_scope_message(scope)
+        if archive := archive_preflight_text(report.get('archive_preflight')):
+            verdict += '\n' + archive
+        files = _comparison_counts(report['counts'], scope)
+        cases = _comparison_counts(report.get('case_counts', {}), scope) or '无可核对结果'
+        self.vitest_result_summary.setText(f'最近保存的结果 · {verdict}\n文件 · {files}\n用例 · {cases}')
+        before, after = report['before_commit'], report['after_commit']
+        candidate = '运行时的工作区' if after == WORKTREE else after[:12]
+        project_dir = report.get('vitest_project_dir', '.')
+        install = report.get('vitest_install') or {}
+        scope = f'npm 项目 {project_dir}'
+        if install.get('workspaces'):
+            scope += f' · workspace 根目录 {install["root"]}'
+        self.vitest_run_context.setText(f'{report["title"]} · {scope} · {before[:12]} → {candidate}')
+        self.vitest_run_context.setToolTip(f'{report["repository"]}\n{before} → {after}')
+        diagnostics = []
+        cache_misses = vitest_offline_cache_misses(report)
+        self.vitest_replay_button.setText('调整缓存并重放…' if cache_misses else '重放…')
+        states = {'dependencies_failed': 'npm ci 失败', 'timed_out': '运行超时',
+                  'worker_error': 'Vitest 执行记录不完整', 'collection_failed': 'Vitest 测试收集失败'}
+        for side, label in (('before', '基线'), ('after', '候选')):
+            run = report[side]
+            if side in cache_misses:
+                diagnostics.append(f'{label} · {VITEST_OFFLINE_CACHE_MISSING}')
+            elif run['status'] in states:
+                diagnostics.append(f'{label} · {states[run["status"]]}')
+        if cache_misses:
+            diagnostics.append('请选择已准备的 npm 缓存，或关闭离线安装以允许下载。')
+        self.vitest_run_diagnostics.setText('\n'.join(diagnostics))
+        self.vitest_run_diagnostics.setVisible(bool(diagnostics))
+        items = []
+        for entry in report['entries']:
+            cases = entry.get('case_entries') or []
+            if cases:
+                counts = _comparison_counts(Counter(case['status'] for case in cases))
+                item = QTreeWidgetItem([entry['test_id'], counts])
+                item.setToolTip(0, entry['test_id'])
+                item.setToolTip(1, counts)
+                item.addChildren([self._vitest_result_item(case) for case in cases])
+            else:
+                item = self._vitest_result_item(entry)
+            items.append(item)
+        self.vitest_results_tree.clear()
+        self.vitest_results_tree.addTopLevelItems(items)
+        self.vitest_results_tree.expandAll()
+        self.vitest_report = report
+        self.vitest_result_panel.show()
+        self.status_label.setText('Vitest 报告已保存')
+
+    def _open_vitest_report(self):
+        if self.vitest_report:
+            self._open_local(Path(self.vitest_report['report_dir']) / 'report.html', on_error=self._vitest_failed)
 
     def _build_changes_tab(self):
         page = QWidget()
@@ -548,7 +1537,8 @@ class ProjectWorkbench(QWidget):
                                ('反选当前可见项', self.invert_visible_tests),
                                ('复制已勾选测试 ID', self.copy_test_selection),
                                ('导出选择清单…', self.export_test_selection),
-                               ('导入选择清单…', self.import_test_selection)):
+                               ('导入选择清单…', self.import_test_selection),
+                               ('按验收计划选择…', self.apply_acceptance_plan_selection)):
             selection_menu.addAction(text).triggered.connect(lambda checked=False, fn=callback: fn())
         self.selection_more_button.setMenu(selection_menu)
         for item in (self.only_visible_button, self.select_recommended_button):
@@ -686,6 +1676,7 @@ class ProjectWorkbench(QWidget):
                                ('重开已保存的修复准备（不执行）…', self.reopen_repair_preparation),
                                ('恢复修复说明草稿…', self.reopen_repair_brief),
                                ('重新定位当前报告…', self.relocate_current_report),
+                               ('复制 PR 摘要', self.copy_review_summary),
                                ('复制当前筛选结果摘要', self.copy_result_summary),
                                ('复制选中行的测试 ID', self.copy_result_ids),
                                ('复制此项诊断与建议', self.copy_entry_diagnosis),
@@ -868,6 +1859,7 @@ class ProjectWorkbench(QWidget):
 
     def _connect_inputs(self):
         self.repository_edit.textChanged.connect(self._repository_changed)
+        self.repository_edit.editingFinished.connect(self._find_project_environments)
         self.title_edit.textChanged.connect(self._invalidate)
         self.python_edit.textChanged.connect(self._python_changed)
         self.before_combo.currentTextChanged.connect(self._invalidate)
@@ -880,8 +1872,19 @@ class ProjectWorkbench(QWidget):
         if self._loading_inputs:
             return
         self._set_python_candidates([])
-        self.environment_hint.setText('选择已安装项目依赖的 Python；点击“读取提交”可查找常见项目环境。')
+        self.environment_hint.setText('选择已安装项目依赖的 Python。')
         self._invalidate()
+
+    def _find_project_environments(self):
+        repository = self.repository_edit.text().strip()
+        if self.busy or self._loading_inputs or self.state is not None or not repository:
+            return
+        try:
+            candidates = candidate_pythons(repository)
+        except (OSError, ValueError):
+            candidates = []
+        self._set_python_candidates(candidates)
+        self._sync_controls()
 
     def focus_search(self):
         searches = (self.change_search, self.test_search, self.result_search)
@@ -1010,6 +2013,7 @@ class ProjectWorkbench(QWidget):
         self.problem_panel.hide()
 
     def _set_python_candidates(self, candidates):
+        self._python_candidates = candidates
         selected = self.python_edit.text()
         self.python_combo.blockSignals(True)
         self.python_edit.blockSignals(True)
@@ -1026,6 +2030,10 @@ class ProjectWorkbench(QWidget):
         self.environment_hint.setText(
             f'发现 {len(candidates)} 个项目环境，可在下拉列表中选择；不会自动切换或执行。'
             if candidates else '未发现常见项目环境。可选择已有 Python，或点击“检查环境”准备项目外的新环境。')
+
+    def _use_project_environment(self):
+        if not self.busy and self.state is None and len(self._python_candidates) == 1:
+            self.python_edit.setText(self._python_candidates[0])
 
     def _update_next_step(self):
         stage = self.tabs.currentIndex()
@@ -1209,11 +2217,24 @@ class ProjectWorkbench(QWidget):
 
     def _sync_controls(self, *_):
         idle = self.task is None and not self._closing
+        self.go_form.setEnabled(idle)
+        self.go_open_button.setEnabled(idle and self.go_report is not None)
+        self.go_replay_button.setEnabled(self.go_open_button.isEnabled())
+        self.go_recheck_button.setEnabled(self.go_open_button.isEnabled())
+        self.go_export_button.setEnabled(self.go_open_button.isEnabled())
+        self.go_summary_button.setEnabled(self.go_open_button.isEnabled())
+        self.vitest_form.setEnabled(idle)
+        self.vitest_open_button.setEnabled(idle and self.vitest_report is not None)
+        self.vitest_replay_button.setEnabled(self.vitest_open_button.isEnabled())
+        self.vitest_recheck_button.setEnabled(self.vitest_open_button.isEnabled())
+        self.vitest_export_button.setEnabled(self.vitest_open_button.isEnabled())
+        self.vitest_summary_button.setEnabled(self.vitest_open_button.isEnabled())
         self.input_panel.setEnabled(idle)
         self.details_panel.setEnabled(idle)
         self.details_toggle.setEnabled(idle)
         self.after_combo.setEnabled(idle and not self.workspace_check.isChecked())
-        for widget in (self.prepare_button, self.open_session_button, self.import_button,
+        for widget in (self.prepare_button, self.open_session_button, self.open_project_report_button, self.import_button,
+                       self.make_receipt_button, self.check_receipt_button,
                        self.refresh_sessions_button, self.new_button, self.session_combo,
                        self.timeout_spin, self.collection_path_edit):
             widget.setEnabled(idle)
@@ -1235,6 +2256,12 @@ class ProjectWorkbench(QWidget):
         self.prepare_discover_button.setEnabled(self.prepare_button.isEnabled())
         saved = self.store.project_defaults(self.repository_edit.text())
         self.environment_hint.setVisible(bool(self.repository_edit.text().strip()))
+        candidate = self._python_candidates[0] if len(self._python_candidates) == 1 else ''
+        offer_candidate = bool(candidate and self.state is None and candidate != self.python_edit.text().strip())
+        self.use_project_environment_button.setVisible(offer_candidate)
+        self.use_project_environment_button.setEnabled(idle and offer_candidate)
+        if offer_candidate:
+            self.use_project_environment_button.setToolTip('填写项目 Python 路径，开始发现时使用。\n' + candidate)
         self.saved_options_button.setVisible(saved is not None and self.state is None)
         self.saved_options_button.setEnabled(idle)
         if saved is not None:
@@ -1250,6 +2277,8 @@ class ProjectWorkbench(QWidget):
                                    and not self._collection_path_pending()
                                    and 1 <= selected_count <= _MAX_SELECTED)
         self.run_button.setText(f'运行所选 {selected_count} 项' if selected_count else '运行所选测试')
+        candidate_rules = describe_pytest_rules((self.collection or {}).get('pytest_rules'))
+        self.run_button.setToolTip('候选发现配置 · ' + candidate_rules if candidate_rules else '')
         for widget in (self.select_visible_button, self.select_recommended_button, self.clear_tests_button):
             widget.setEnabled(idle and self.tests_tree.topLevelItemCount() > 0)
         for widget in (self.only_visible_button, self.selection_more_button, self.test_scope):
@@ -1326,10 +2355,13 @@ class ProjectWorkbench(QWidget):
     def _start(self, action, callback, message, *, operation='', runtime_repository=None, runtime_values=None):
         if self.busy or self._closing:
             return False
-        self._save_view_state()
+        comparison = operation.partition('_')[0] in _COMPARISON_RUNNERS
+        evidence_check = operation in ('replay_handoff', 'project_acceptance', 'acceptance_config')
+        if not comparison and not evidence_check:
+            self._save_view_state()
         generation = self._generation
         self._operation = operation
-        if operation != 'review_progress':
+        if operation != 'review_progress' and not comparison and not evidence_check:
             self._clear_problem()
             self.run_progress_panel.hide()
         self._after_finished = None
@@ -1382,6 +2414,25 @@ class ProjectWorkbench(QWidget):
         self.busyChanged.emit(self.busy)
 
     def _failed(self, error):
+        if self.task is not None and self._operation == 'project_acceptance':
+            self.status_label.setText('修复验收未完成 · ' + _short(error, 1000))
+            return
+        if self.task is not None and self._operation == 'replay_stability':
+            self.status_label.setText('稳定性检查未完成 · ' + _short(error, 1000))
+            self._after_finished = lambda: self._receipt_result_dialog('重放稳定性', '稳定性检查未完成', issues=[error])
+            return
+        if self.task is not None and self._operation == 'replay_handoff':
+            self.status_label.setText('回执操作未完成 · ' + _short(error, 1000))
+            self._after_finished = lambda: self._receipt_result_dialog('重放回执', '回执操作未完成', issues=[error])
+            return
+        runner, _, mode = self._operation.partition('_')
+        action = _COMPARISON_OPERATIONS.get(mode, '对比')
+        if self.task is not None and runner == 'go':
+            self._go_failed(error, action=action)
+            return
+        if self.task is not None and runner == 'vitest':
+            self._vitest_failed(error, action=action)
+            return
         self.status_label.setText('未完成：' + _short(error, 3000))
         self.run_progress_panel.hide()
         self._show_problem(error)
@@ -1394,6 +2445,23 @@ class ProjectWorkbench(QWidget):
         self._update_next_step()
 
     def _cancelled(self):
+        if self._operation == 'project_acceptance':
+            self.status_label.setText('已停止核对修复验收。')
+            return
+        if self._operation == 'acceptance_config':
+            self.status_label.setText('已取消导出 CI 配置。')
+            return
+        if self._operation == 'replay_stability':
+            self.status_label.setText('稳定性检查已取消。')
+            return
+        if self._operation == 'replay_handoff':
+            self.status_label.setText('已取消回执操作。')
+            return
+        runner, _, mode = self._operation.partition('_')
+        if name := _COMPARISON_RUNNERS.get(runner):
+            action = _COMPARISON_OPERATIONS.get(mode, '对比')
+            self.status_label.setText(f'{name} {action}已取消，已保存的报告仍可查看。')
+            return
         self._refresh_catalog()
         self.status_label.setText('已取消；已保存的会话、历史报告和运行材料仍可查看。')
         if self._live_entries:
@@ -1403,6 +2471,12 @@ class ProjectWorkbench(QWidget):
             self.result_summary.setText('已取消 · 未产生新的完整回归结论')
 
     def _progress(self, phase, payload):
+        if self._operation == 'replay_stability':
+            if phase == 'stability_round':
+                self.status_label.setText(f'稳定性检查 · 第 {payload["round"]}/{payload["total"]} 轮')
+                self.progress_bar.setRange(0, payload['total'])
+                self.progress_bar.setValue(payload['round'] - 1)
+            return
         if phase == 'project_before' and isinstance(payload, dict) and payload.get('selected_tests') and not self._live_entries:
             self.report = None
             self._report_reference = None
@@ -1474,6 +2548,21 @@ class ProjectWorkbench(QWidget):
         if self.task is not None:
             accepted = self.task.control.cancel()
             self.cancel_button.setEnabled(False)
+            if self._operation == 'replay_handoff':
+                self.status_label.setText('正在取消回执操作…' if accepted else '正在完成回执操作…')
+                return
+            if self._operation == 'project_acceptance':
+                self.status_label.setText('正在停止核对修复验收…')
+                return
+            if self._operation == 'acceptance_config':
+                self.status_label.setText('正在取消导出 CI 配置…' if accepted else '正在保存 CI 配置…')
+                return
+            if self._operation.endswith('summary'):
+                self.status_label.setText('正在停止核对 PR 摘要…')
+                return
+            if self._operation.endswith('_export'):
+                self.status_label.setText('正在取消证据导出…' if accepted else '正在完成证据导出…')
+                return
             self.status_label.setText('正在停止核对复查进展；本次执行报告保留。' if accepted and self._operation == 'review_progress' else
                                       '正在取消并清理测试进程，请等待操作结束…' if accepted else
                                       '测试已经结束，正在保存结果；请等待保存完成。')
@@ -1485,7 +2574,7 @@ class ProjectWorkbench(QWidget):
             self._closing = True
             self.cancel_operation()
             return False
-        for dialog in (self.ai_dialog, self.environment_dialog, self.failure_dialog, self.processing_dialog):
+        for dialog in (self.ai_dialog, self.environment_dialog, self.failure_dialog, self.processing_dialog, self.replay_dialog):
             if dialog is not None and dialog.isVisible():
                 if dialog is self.processing_dialog:
                     dialog.reject()
@@ -1608,7 +2697,6 @@ class ProjectWorkbench(QWidget):
             self.status_label.setText('请先选择本地 Git 仓库。')
             return
         from .desktop_creation import _commits
-        from .project_environment import candidate_pythons
         def action(control):
             root, commits = _commits(repository)
             control.check()
@@ -1913,7 +3001,9 @@ class ProjectWorkbench(QWidget):
         self._restoring_view = True
         self._loading_inputs = True
         try:
-            self.repository_edit.setText(str(state.get('repository') or ''))
+            repository = str(state.get('repository') or '')
+            repository_changed = repository != self.repository_edit.text()
+            self.repository_edit.setText(repository)
             self.before_combo.setEditText(str(state.get('before_commit') or ''))
             self.after_combo.setEditText('HEAD' if state.get('after_commit') == WORKTREE
                                          else str(state.get('after_commit') or ''))
@@ -1921,6 +3011,8 @@ class ProjectWorkbench(QWidget):
             runtime = state.get('runtime') or {}
             executable = runtime.get('executable') or ''
             self.python_edit.setText('' if executable == sys.executable else str(executable))
+            if repository_changed:
+                self._set_python_candidates([])
             self.title_edit.setText(str(state.get('title') or ''))
             self.issue_edit.setPlainText(str(state.get('issue') or ''))
             self.collection_path_edit.setText(state.get('collection_path', ''))
@@ -1973,8 +3065,11 @@ class ProjectWorkbench(QWidget):
         self.session_label.setText(f'固定输入：{before} → {after} · Python {runtime.get("python_version") or "已选定"}')
         if state.get('refresh_origin'):
             self.session_label.setText(self.session_label.text() + ' · 从旧会话刷新')
+        if archive := archive_preflight_text(state.get('archive_preflight')):
+            self.session_label.setText(self.session_label.text() + '\n' + archive)
         self.session_label.setToolTip(_format_json({key: state.get(key) for key in
-                                    ('directory', 'project_id', 'source_sha256', 'source_mode_sha256', 'runtime', 'refresh_origin', 'review_source')}, 5000))
+                                    ('directory', 'project_id', 'source_sha256', 'source_mode_sha256',
+                                     'runtime', 'refresh_origin', 'review_source', 'archive_preflight')}, 5000))
 
     def _show_changes(self):
         self.changes_tree.clear()
@@ -2159,8 +3254,8 @@ class ProjectWorkbench(QWidget):
         errors = collection.get('collection_errors') or []
         from .pytest_profile import describe_pytest_profile
         diagnosis = collection_diagnosis(collection)
-        pieces = [diagnosis['summary'],
-                  describe_pytest_profile(collection.get('pytest_profile'))]
+        pieces = [diagnosis['summary'], describe_pytest_profile(collection.get('pytest_profile')),
+                  describe_pytest_rules(collection.get('pytest_rules'))]
         if collection.get('truncated'):
             pieces.append('发现列表已达 10000 个目标的上限。请检查收集范围。')
         if errors:
@@ -2297,6 +3392,33 @@ class ProjectWorkbench(QWidget):
         except (OSError, ValueError) as exc:
             self._failed(str(exc))
 
+    def apply_acceptance_plan_selection(self):
+        if self.busy or not self.state or self._collection_path_pending():
+            self.status_label.setText('请先准备当前会话并完成测试发现。')
+            return False
+        from .acceptance_plan import read_acceptance_plan, review_pytest_plan
+
+        location, _ = QFileDialog.getOpenFileName(self, '打开 pytest 验收计划',
+                                                  str(self.project_root.parent), '验收计划 (*.json)')
+        if not location:
+            return False
+        try:
+            plan = read_acceptance_plan(location)
+            review = review_pytest_plan(plan, self.state, self.collection)
+        except (OSError, ValueError) as exc:
+            self._show_problem(str(exc))
+            self.status_label.setText('无法打开验收计划 · ' + _short(exc, 600))
+            return False
+        applied = self._review_and_apply_selection(review['requested_tests'], '按验收计划选择', plan_review=review)
+        if not applied or plan.protected_inputs is None:
+            return applied
+        count = len(plan.protected_inputs['values'])
+        if not self._confirm_choice('按固定失败样本运行',
+                                    f'{Path(location).name} · {count} 项测试将使用计划中的样本。'
+                                    '\n确认后运行两版并核对计划。'):
+            return False
+        return self.run_selected(review['requested_tests'], acceptance_plan=plan)
+
     def select_visible_tests(self):
         self._check_ids(set(self.selected_test_ids()) | self._visible_test_ids())
 
@@ -2325,14 +3447,17 @@ class ProjectWorkbench(QWidget):
         self.selection_review_label.setText(message)
         self.selection_review_panel.show()
 
-    def _review_and_apply_selection(self, selected, title):
+    def _review_and_apply_selection(self, selected, title, *, plan_review=None):
         if self.busy:
             return False
         collection = self.collection or {}
         self.selection_dialog = SelectionReviewDialog(selected, collection.get('tests') or [],
             title=title, parent=self, discovery_status=collection.get('status', 'uncollected'),
-            collection_complete=not (collection.get('partial') or collection.get('truncated')))
+            collection_complete=not (collection.get('partial') or collection.get('truncated')),
+            plan_review=plan_review)
         if self.selection_dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        if plan_review is not None and not plan_review['ready']:
             return False
         result = self.selection_dialog.review
         self.test_search.clear()
@@ -2420,7 +3545,7 @@ class ProjectWorkbench(QWidget):
         except (OSError, ValueError) as exc:
             self._failed(str(exc))
 
-    def run_selected(self, selected_ids=None):
+    def run_selected(self, selected_ids=None, *, acceptance_plan=None):
         if self.busy or not self.state:
             return False
         if self._collection_path_pending():
@@ -2456,18 +3581,28 @@ class ProjectWorkbench(QWidget):
         self.result_summary.setText(f'正在运行 {len(selected)} 个测试 · 前后版本各一个进程')
         self.tabs.setCurrentIndex(2)
         def action(control):
-            report = run_project(directory, output, selected_ids=selected,
-                                 python_executable=python, timeout=timeout,
-                                 confirmed=True, control=control)
+            from .acceptance_plan import PlanSelectionBlocked
+
+            plan_options = {'acceptance_plan': acceptance_plan} if acceptance_plan is not None else {}
+            try:
+                report = run_project(directory, output, selected_ids=selected,
+                                     python_executable=python, timeout=timeout,
+                                     confirmed=True, control=control, **plan_options)
+            except PlanSelectionBlocked as exc:
+                raise ValueError('\n'.join([str(exc), *exc.review['missing_tests'][:20]])) from exc
             try:
                 state = read_project(directory)
             except (OSError, ValueError):
                 state = None
-            return {'report': report, 'state': state}
+            acceptance = self._comparison_acceptance(report, acceptance_plan, control) if acceptance_plan else None
+            return {'report': report, 'state': state, 'acceptance': acceptance}
         def shown(result):
             if result['state'] is not None:
                 self.state = result['state']
-            self._apply_report(result['report'])
+            if result['acceptance'] is not None:
+                self._show_comparison_acceptance(result['acceptance'])
+            else:
+                self._apply_report(result['report'])
             self._remember_project_options()
             self._show_runs()
             self._refresh_catalog()
@@ -2485,6 +3620,8 @@ class ProjectWorkbench(QWidget):
         self.results_tree.blockSignals(True)
         self.results_tree.clear()
         self._report_items = {}
+        scope = comparison_scope(self.report) if self.report and not live else None
+        labels = {**_STATUS, **DIVERGENT_OUTCOME_LABELS} if scope and scope['divergent_outcomes'] else _STATUS
         priority = {'regression_detected': 0, 'inconclusive': 1, 'baseline_failure': 2, 'improved': 3, 'regression_passed': 4}
         displayed = entries if live else sorted(entries, key=lambda entry: priority.get(entry.get('status'), 5) if isinstance(entry, dict) else 5)
         for entry in displayed:
@@ -2495,7 +3632,7 @@ class ProjectWorkbench(QWidget):
             test_id = str(entry.get('test_id') or '')
             filename, separator, target = test_id.partition('::')
             display = target + '\n' + filename if separator else test_id
-            item = QTreeWidgetItem([display, '等待执行' if live else _STATUS.get(status, status),
+            item = QTreeWidgetItem([display, '等待执行' if live else labels.get(status, status),
                     _STATUS.get(before.get('status'), str(before.get('status') or '未执行')),
                     _STATUS.get(after.get('status'), str(after.get('status') or '未执行')),
                     _duration(before.get('duration_seconds')) + ' / ' + _duration(after.get('duration_seconds'))])
@@ -2543,10 +3680,17 @@ class ProjectWorkbench(QWidget):
         self.result_search.clear()
         self.result_filter.setCurrentIndex(0)
         counts = Counter(entry.get('status', 'inconclusive') for entry in entries if isinstance(entry, dict))
-        status = report.get('status', 'attention')
+        scope = comparison_scope(report)
+        status = comparison_verdict(report, scope)
         headline = _RUN_STATUS.get(status, _STATUS.get(status, status))
+        if scope:
+            headline += '\n' + comparison_scope_message(scope)
         if (report.get('collection') or {}).get('partial') or (report.get('collection') or {}).get('truncated'):
             headline += ' · 发现范围不完整，仅覆盖所选项'
+        if archive := archive_preflight_text(report.get('archive_preflight')):
+            headline += '\n' + archive
+        if order := pytest_order_difference(report):
+            headline += f'\n两版实际执行顺序不同 · {order["positions_changed"]} 个共同测试位置变化。详见 HTML 报告。'
         self.result_summary.setText(headline)
         interrupted = [(label, report.get(side) or {}) for side, label in (('before', '基线'), ('after', '候选'))
                        if (report.get(side) or {}).get('progress') and (report.get(side) or {}).get('status') in ('timed_out', 'cancelled', 'worker_error')]
@@ -2558,6 +3702,8 @@ class ProjectWorkbench(QWidget):
                 + ' · ' + PHASE_LABELS.get(run['progress'].get('current_phase'), '未知阶段') for label, run in interrupted))
         self.result_summary.setToolTip(self.report_context_label.text())
         for key, (metric, title) in self.result_metric_buttons.items():
+            if scope and scope['divergent_outcomes']:
+                title = DIVERGENT_OUTCOME_LABELS.get(key, title)
             metric.setText(str(counts[key]) + '\n' + title)
             metric.setProperty('attention', bool(counts[key] and key in ('regression_detected', 'baseline_failure', 'inconclusive')))
             metric.style().unpolish(metric)
@@ -2575,6 +3721,8 @@ class ProjectWorkbench(QWidget):
         self._sync_controls()
 
     def _filter_results(self, *_):
+        from .project_review_summary import _identity_label
+
         needle, mode = self.result_search.text().strip().casefold(), self.result_filter.currentData()
         group = self._selected_diagnostic_group()
         members = set(group['test_ids']) if group else None
@@ -2583,7 +3731,9 @@ class ProjectWorkbench(QWidget):
             item = self.results_tree.topLevelItem(index)
             entry = item.data(0, _ROLE)
             # Include exception text so a repeated failure can be found by its message.
-            searchable = str(entry.get('test_id') or '') + ' ' + ' '.join(item.text(column) for column in range(item.columnCount()))
+            name = str(entry.get('test_id') or '')
+            searchable = ' '.join((name, _identity_label(name), _identity_label(name, redact_parameters=True),
+                                   *(item.text(column) for column in range(item.columnCount()))))
             for side in ('before', 'after'):
                 error = (entry.get(side) or {}).get('exception')
                 if error:
@@ -2595,7 +3745,7 @@ class ProjectWorkbench(QWidget):
             item.setHidden(not show)
             visible += int(show)
         current = self.results_tree.currentItem()
-        if current is not None and current.isHidden():
+        if current is None or current.isHidden():
             chosen = self._first_attention_item()
             if chosen is None:
                 chosen = next((self.results_tree.topLevelItem(i) for i in range(self.results_tree.topLevelItemCount())
@@ -2737,6 +3887,108 @@ class ProjectWorkbench(QWidget):
             return
         QApplication.clipboard().setText('\n'.join(selected))
         self.status_label.setText(f'已复制 {len(selected)} 个结果行的测试 ID。')
+
+    def open_project_acceptance(self, *, options=None):
+        report = self._displayed_result_report()
+        if report is None or self.busy or self._closing:
+            return False
+
+        from .desktop_acceptance import AcceptanceOptionsDialog, acceptance_headline
+        from .project_review_summary import review_summary
+
+        reference = report_reference(report)
+        dialog = AcceptanceOptionsDialog(report, self, options=options)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return False
+            selected = dialog.options()
+        finally:
+            dialog.deleteLater()
+
+        def action(control):
+            try:
+                summary = review_summary(reference['report_dir'], expected_report=reference, control=control, **selected)
+            except (OSError, ValueError) as exc:
+                control.check()
+                return None, str(exc)
+            control.check()
+            return summary, None
+
+        def shown(result):
+            summary, error = result
+            self.status_label.setText(acceptance_headline(summary))
+            self._after_finished = lambda: self._show_project_acceptance(reference, selected, summary, error)
+
+        return self._start(action, shown, '正在离线核对修复验收…', operation='project_acceptance', runtime_values={})
+
+    def _show_project_acceptance(self, reference, options, summary, error, *, export_error=None):
+        from .desktop_acceptance import AcceptanceResultDialog
+
+        folder = Path(reference['report_dir'])
+        suggested = folder.with_name(folder.name + '-ci-config.zip')
+        dialog = AcceptanceResultDialog(summary, self, error=error, ci_suggested_path=suggested,
+                                        export_error=export_error)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            destination = dialog.ci_destination
+        finally:
+            dialog.deleteLater()
+        current = self._displayed_result_report()
+        if not current or report_reference(current) != reference:
+            return
+        if destination is None:
+            self.open_project_acceptance(options=options)
+        else:
+            self._export_acceptance_config(reference, options, summary, destination)
+
+    def _export_acceptance_config(self, reference, options, summary, destination):
+        from .acceptance_plan import export_ci_config
+
+        def action(control):
+            try:
+                return export_ci_config(reference, options['plan'], destination, control=control), None
+            except (OSError, ValueError) as exc:
+                control.check()
+                return None, str(exc)
+
+        def shown(result):
+            path, error = result
+            if path is None:
+                self.status_label.setText('未能导出 CI 配置。')
+                self._after_finished = lambda: self._show_project_acceptance(
+                    reference, options, summary, None, export_error=error)
+            else:
+                self.status_label.setText(f'已导出 CI 配置 · {path}')
+
+        return self._start(action, shown, '正在核对报告并导出 CI 配置…',
+                           operation='acceptance_config', runtime_values={})
+
+    def copy_review_summary(self, report=None):
+        if self.busy or self._closing:
+            return False
+        report = self.report if report is None else report
+        if report is None:
+            return False
+
+        from .project_review_summary import render_review_markdown, review_summary
+
+        reference = report_reference(report)
+        runner = report.get('runner')
+        operation = f'{runner}_summary' if runner in _COMPARISON_RUNNERS else 'summary'
+
+        def action(control):
+            result = review_summary(reference['report_dir'], expected_report=reference, control=control)
+            return render_review_markdown(result)
+
+        def shown(markdown):
+            QApplication.clipboard().setText(markdown)
+            self.status_label.setText('已复制已校验的 PR 摘要，可粘贴到审查记录。')
+
+        started = self._start(action, shown, '正在核对报告并生成 PR 摘要…', operation=operation, runtime_values={})
+        if started and runner in _COMPARISON_RUNNERS:
+            (self.go_error_label if runner == 'go' else self.vitest_error_label).hide()
+        return started
 
     def copy_result_summary(self):
         entries = self._visible_results()
@@ -3291,7 +4543,7 @@ class ProjectWorkbench(QWidget):
         self.comparison_dialog.show()
         self.status_label.setText('已核对来源并比较保存的两次运行；没有重新执行测试。')
 
-    def _open_local(self, path):
+    def _open_local(self, path, *, on_error=None):
         try:
             path = Path(path).expanduser().absolute()
             if not path.exists():
@@ -3300,7 +4552,7 @@ class ProjectWorkbench(QWidget):
                 raise ValueError('系统未能打开，请从保存目录手动查看：' + str(path))
             self.status_label.setText('已交给系统打开：' + str(path))
         except (OSError, ValueError) as exc:
-            self._failed(str(exc))
+            (on_error or self._failed)(str(exc))
 
     def open_report(self):
         if self.report:
@@ -3346,13 +4598,122 @@ class ProjectWorkbench(QWidget):
             include_sources=include_sources, locations=locations, expected_report=expected, control=control), shown,
             '正在校验证据并导出项目报告 ZIP…')
 
+    def _export_comparison_report(self, report):
+        if self.busy or self._closing or report is None:
+            return False
+        reference = report_reference(report)
+        directory = Path(reference['report_dir'])
+        destination, _ = QFileDialog.getSaveFileName(
+            self, '导出证据 ZIP（含保存的源码与日志）',
+            str(directory.with_name(directory.name + '.zip')), 'ZIP 证据包 (*.zip)',
+            options=QFileDialog.Option.DontUseNativeDialog | QFileDialog.Option.DontConfirmOverwrite,
+        )
+        if not destination:
+            return False
+        if not destination.lower().endswith('.zip'):
+            destination += '.zip'
+
+        def action(control):
+            return pack_project_report(directory, destination, expected_report=reference, control=control)
+
+        def shown(result):
+            self.status_label.setText(f'已导出证据 ZIP · {result["output"]}')
+
+        runner = report['runner']
+        started = self._start(action, shown, '正在校验并导出证据 ZIP…',
+                              operation=f'{runner}_export', runtime_values={})
+        if started:
+            error = self.go_error_label if runner == 'go' else self.vitest_error_label
+            error.hide()
+        return started
+
+    @staticmethod
+    def _saved_comparison_recheck(report, control):
+        runner = report.get('runner')
+        reference = report.get('review_source')
+        if runner not in _COMPARISON_RUNNERS or not reference:
+            return None
+        try:
+            directory = source_report_directory(report, reference)
+            source = _checked_report(directory, control=control)
+            _match_reference(source, reference)
+            if source.get('runner') != runner:
+                raise ValueError('来源报告的执行器不同。')
+            compare = compare_go_recheck if runner == 'go' else compare_vitest_recheck
+            return compare(source, report)
+        except (OSError, ValueError) as exc:
+            return {'notice': '来源报告无法核对 · ' + _short(str(exc), 1000)}
+
+    def _reveal_comparison_result(self, page, summary, expected_report):
+        if self.tabs.currentWidget() is not page or not page.isVisible():
+            return
+
+        def reveal():
+            displayed = self.go_report if page is self.go_page else self.vitest_report
+            if (self._closing or self.busy or self.tabs.currentWidget() is not page
+                    or not summary.isVisible() or displayed is not expected_report):
+                return
+            content = page.widget()
+            content.layout().activate()
+            page.verticalScrollBar().setValue(summary.mapTo(content, QPoint()).y() - 12)
+
+        # Wait until the task footer and the result panel have their final layout.
+        if self.task is None:
+            QTimer.singleShot(0, self, reveal)
+        else:
+            self._after_finished = reveal
+
+    def _show_saved_project_report(self, report, *, comparison=None, select_page=True):
+        runner = report.get('runner')
+        if runner == 'go':
+            self._show_go_report(report)
+            self.go_error_label.hide()
+            page, summary = self.go_page, self.go_result_summary
+        elif runner == 'vitest':
+            self._show_vitest_report(report)
+            self.vitest_error_label.hide()
+            page, summary = self.vitest_page, self.vitest_result_summary
+        else:
+            self._apply_report(report)
+            self.tabs.setCurrentIndex(2)
+            return
+        if select_page:
+            self.tabs.setCurrentWidget(page)
+        if comparison is not None:
+            summary = self._show_comparison_recheck(runner, comparison)
+        self._reveal_comparison_result(page, summary, report)
+
+    def open_project_report(self, path=None):
+        if self.busy or self._closing:
+            return False
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(self, '打开项目报告', str(self.report_root),
+                                                '项目报告 (report.json)')
+        if not path:
+            return False
+        source = Path(path).expanduser()
+
+        def action(control):
+            if source.name != 'report.json' or source.is_symlink() or not source.is_file():
+                raise ValueError('请选择已保存的 report.json 普通文件。')
+            report = _checked_report(source.parent, control=control)
+            return report, self._saved_comparison_recheck(report, control)
+
+        def shown(result):
+            report, comparison = result
+            self._show_saved_project_report(report, comparison=comparison)
+            self._mark_opened_evidence()
+            self.status_label.setText('已校验并打开项目报告 · ' + report['report_dir'])
+
+        return self._start(action, shown, '正在校验已保存的项目报告…')
+
     def import_bundle(self, path=None):
         """Verify and open a ZIP as historical evidence without executing code."""
         if self.busy or self._closing:
             return False
         if path is None or isinstance(path, bool):
-            path, _ = QFileDialog.getOpenFileName(self, '导入项目报告 ZIP 证据包',
-                        str(self.report_root), 'ZIP 证据包 (*.zip)')
+            path, _ = QFileDialog.getOpenFileName(self, '导入项目报告证据',
+                        str(self.report_root), '项目证据 (*.zip series.json)')
         if not path:
             return False
         bundle = Path(path).expanduser()
@@ -3361,63 +4722,337 @@ class ProjectWorkbench(QWidget):
         destination = root / ('project-import-' + uuid.uuid4().hex[:12])
         def action(control):
             control.check()
-            imported = unpack_project_report(bundle, destination, control=control)
+            if bundle.name == 'series.json':
+                from .project_series import receive_series
+
+                imported = receive_series(bundle.parent, output=destination, control=control)
+            else:
+                imported = unpack_project_report(bundle, destination, control=control)
             control.check()
             directory = imported.get('report_dir') or imported.get('directory')
             if not directory:
                 raise ValueError('导入结果缺少项目报告目录。')
             report = _read_report(directory)
             control.check()
-            return {'imported': imported, 'report': report}
+            return {'imported': imported, 'report': report, 'comparison': self._saved_comparison_recheck(report, control)}
         def shown(result):
             report = result['report']
-            if report.get('runner') in ('vitest', 'go'):
-                self._open_local(Path(report['report_dir']) / 'report.html')
-                runner = {'vitest': 'Vitest', 'go': 'Go'}[report['runner']]
-                self.status_label.setText(f'已校验并导入 {runner} 报告。可从命令行使用 project replay 重放。')
-                return
-            self._apply_report(report)
-            self.tabs.setCurrentIndex(2)
+            self._show_saved_project_report(report, comparison=result['comparison'])
+            self._mark_opened_evidence(imported=True)
             notice = result['imported'].get('notice') or '项目证据已校验并导入。'
             self.status_label.setText(f'已导入 {result["imported"]["report_count"]} 份项目报告。' + str(notice)
                                       + '\n' + str(result['report']['report_dir']))
-        return self._start(action, shown, '正在校验并导入项目报告 ZIP，只读取证据，不执行代码…')
+            self.evidenceImported.emit()
+        return self._start(action, shown, '正在校验并导入项目报告证据，只读取材料…')
+
+    def _displayed_result_report(self):
+        page = self.tabs.currentWidget()
+        if page is self.results_scroll:
+            return self.report
+        if page is self.go_page:
+            return self.go_report
+        if page is self.vitest_page:
+            return self.vitest_report
+        return None
+
+    def _mark_opened_evidence(self, *, imported=False):
+        report = self._displayed_result_report()
+        if report:
+            self._opened_evidence = (report_reference(report), imported)
+        self._sync_evidence_actions()
+
+    def _matches_opened_evidence(self, report):
+        return bool(report and self._opened_evidence and report_reference(report) == self._opened_evidence[0])
+
+    def _displayed_replay_details(self):
+        report = self._displayed_result_report()
+        if report and self._replay_details:
+            verification, _, replay = self._replay_details
+            if (report['report_dir'] == replay['report_dir'] and report['run_id'] == replay['run_id']
+                    and (verification['status'] == 'unavailable'
+                         or report['_report_sha256'] == verification['replay']['report_sha256'])):
+                return self._replay_details
+        return None
+
+    def _sync_evidence_actions(self):
+        from .replay_stability import stability_summary
+
+        current = self._displayed_result_report()
+        self.acceptance_button.setVisible(current is not None)
+        self.acceptance_button.setEnabled(current is not None and not self.busy and not self._closing)
+        preview = self._matches_opened_evidence(current)
+        replay = self._displayed_replay_details()
+        stability = self._displayed_stability_result(current)
+        idle = self.task is None and not self._closing
+        saved = bool(replay and self._saved_replay_receipt)
+        self.evidence_actions.setVisible(bool(preview or replay or stability))
+        if stability:
+            message = stability_summary(stability)
+        elif replay:
+            message = ('回执已保存 · ' if saved else '') + replay[0]['summary']
+        else:
+            message = '证据已导入 · 尚未重放' if preview and self._opened_evidence[1] else '已打开保存的报告'
+        self.evidence_message.setText(message)
+        for button, visible in (
+            (self.preview_replay_button, bool((preview or stability) and (not replay or stability))),
+            (self.replay_verification_button, bool(replay and not stability)),
+            (self.save_replay_receipt_button, bool(replay and not stability and not saved and replay[0]['status'] != 'unavailable')),
+            (self.open_replay_receipt_button, saved and not stability),
+            (self.stability_result_button, bool(current and (preview or replay or stability))),
+        ):
+            button.setVisible(visible)
+            button.setEnabled(idle and visible)
+
+    def _preview_opened_evidence(self):
+        report = self._displayed_result_report()
+        if not self._matches_opened_evidence(report) and not self._displayed_stability_result(report):
+            return False
+        if report.get('runner') in _COMPARISON_RUNNERS:
+            return self._preview_comparison_followup(report)
+        return self.replay_report()
+
+    def _preview_comparison_followup(self, report, *, recheck=False):
+        if self.busy or self._closing or not report:
+            return False
+        reference = report_reference(report)
+        output = self.report_root
+        operation = report['runner'] + ('_recheck' if recheck else '_replay')
+        action_name = '复查' if recheck else '重放'
+        if recheck:
+            execute = recheck_go_project if report['runner'] == 'go' else recheck_vitest_project
+        else:
+            execute = replay_project_report
+
+        def action(control):
+            preview = execute(reference['report_dir'], output, confirmed=False,
+                              expected_report=reference, control=control)
+            control.commit()
+            return preview
+
+        def shown(preview):
+            self.status_label.setText(f'来源报告已校验，可核对{action_name}范围。')
+            self._after_finished = lambda: self._confirm_comparison_followup(
+                report, reference, output, preview, execute, operation, recheck=recheck)
+
+        return self._start(action, shown, f'正在校验{action_name}来源与固定测试范围…',
+                           operation=operation, runtime_values={})
+
+    def _confirm_comparison_followup(self, report, reference, output, preview, execute, operation, *, recheck):
+        runner = preview['runner']
+        current = self.go_report if runner == 'go' else self.vitest_report
+        if self.busy or self._closing or current is not report:
+            return
+        name = _COMPARISON_RUNNERS[runner]
+        action_name = '复查' if recheck else '重放'
+        options = self._comparison_followup_options(name, report, preview, recheck=recheck)
+        if options is None:
+            if recheck:
+                self.status_label.setText('已关闭复查预览，来源报告仍可查看。')
+            return
+        rounds = options.pop('rounds', 1)
+        if rounds > 1:
+            self._start_replay_stability(reference, output, rounds, options)
+            return
+
+        def action(control):
+            if not recheck:
+                options['verify_result'] = True
+            result = execute(reference['report_dir'], output, confirmed=True,
+                             expected_report=reference, control=control, **options)
+            if recheck:
+                return _read_report(result['report']['report_dir']), result['comparison'], None
+            return _read_report(result['report_dir']), None, result.get('replay_verification')
+
+        def shown(result):
+            saved, comparison, verification = result
+            self._show_saved_project_report(saved, comparison=comparison, select_page=False)
+            self.status_label.setText(f'{name} {action_name}完成，已保存新报告。')
+            if verification:
+                self._show_replay_verification(verification, saved, reference['report_dir'])
+
+        message = f'正在冻结当前工作区并执行 {name} 复查…' if recheck else f'正在重放 {name} 的固定版本与测试范围…'
+        self._start(action, shown, message, operation=operation, runtime_values={})
+
+    def _comparison_followup_options(self, name, report, preview, *, recheck):
+        dialog = QDialog(self) if recheck else _ReplayToolDialog(self)
+        runner = preview['runner']
+        dialog.setObjectName(f'{runner}WorkspaceRecheckDialog' if recheck else 'projectReplayDialog')
+        dialog.setWindowTitle(f'用当前工作区复查 {name} 报告' if recheck else f'重放 {name} 项目报告')
+        prefix = runner + 'Recheck' if recheck else 'replay'
+        if recheck:
+            layout = options_layout = QFormLayout(dialog)
+            layout.addRow('来源报告', _label(f'{report["run_id"]}\n{preview["report_dir"]}'))
+        else:
+            layout, options_layout = dialog.overview, dialog.options
+            source = '\n'.join(filter(None, (report.get('title'), report['run_id'])))
+            layout.addRow('来源报告', _label(source))
+            options_layout.addRow('来源目录', _label(preview['report_dir']))
+        after = report['after_commit']
+        candidate = '原运行固定的工作区' if after == WORKTREE else after
+        if recheck:
+            layout.addRow('固定基线', _label(report['before_commit']))
+            workspace = QLineEdit(preview['repository'])
+            workspace.setObjectName(prefix + 'Repository')
+            layout.addRow('本机工作区', _row(workspace, _button('选择 Git 仓库…',
+                                                               lambda: self._choose_comparison_repository(workspace))))
+        else:
+            layout.addRow('固定版本', _label(f'{report["before_commit"]}\n→ {candidate}'))
+        if preview['runner'] == 'go':
+            layout.addRow('包目录', _label(preview['go_package']))
+        else:
+            layout.addRow('npm 项目目录', _label(preview.get('vitest_project_dir', '.')))
+            install = preview.get('vitest_install') or {}
+            if install.get('workspaces'):
+                layout.addRow('npm workspace 安装根目录', _label(install['root']))
+        scope = _text_view()
+        scope.setObjectName(prefix + 'SelectedTests')
+        scope.setFixedHeight(100)
+        scope.setPlainText('\n'.join(preview['selected_tests']))
+        layout.addRow(f'所选范围（{preview["count"]} 项）', scope)
+
+        source = preview['source_runtime']
+        tool_fields = {}
+        tools = (('go', 'Go'),) if preview['runner'] == 'go' else (('node', 'Node'), ('npm', 'npm'))
+        for key, tool in tools:
+            options_layout.addRow(f'原报告 {tool}', _label(f'{source.get(key + "_version") or "未记录"}\n{source.get(key) or "未记录"}'))
+            edit = tool_fields[key] = QLineEdit()
+            edit.setObjectName(f'{prefix}{key.title()}Path')
+            edit.setPlaceholderText('留空从本机 PATH 查找')
+            choose = _button(f'选择 {tool}…', lambda field=edit, label=tool: self._choose_comparison_executable(field, label))
+            options_layout.addRow(f'{tool} 路径', _row(edit, choose))
+
+        if preview['runner'] == 'vitest':
+            offline = QCheckBox('离线安装')
+            offline.setObjectName(prefix + 'Offline')
+            offline.setChecked(preview['offline'])
+            cache = QLineEdit()
+            cache.setObjectName(prefix + 'NpmCache')
+            cache.setPlaceholderText('留空使用本机 npm 默认缓存')
+            options_layout.addRow('npm 缓存', _row(cache, _button('选择缓存…', lambda: self._choose_vitest_cache(cache)), offline))
+        options_layout.addRow('原报告每版限时', _label(f'{preview["timeout"]:g} 秒'))
+        timeout = QDoubleSpinBox(dialog)
+        timeout.setObjectName(prefix + 'Timeout')
+        timeout.setDecimals(3)
+        timeout.setRange(.1, 3600)
+        timeout.setSuffix(' 秒')
+        timeout.setValue(preview['timeout'])
+        initial_timeout = timeout.value()
+        options_layout.addRow('本次每版限时', timeout)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        start = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        start.setObjectName(prefix + 'Start')
+        start.setText('开始复查' if recheck else '开始重放')
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        if recheck:
+            start.setEnabled(bool(workspace.text().strip()))
+            workspace.textChanged.connect(lambda value: start.setEnabled(bool(value.strip())))
+            layout.addRow(_label('复查会冻结所选工作区并执行测试，结果将另存为新报告。'))
+            layout.addRow(buttons)
+            dialog.resize(640, dialog.sizeHint().height())
+        else:
+            start.setToolTip('仅对可信证据启动重放。结果将保存为新报告。')
+            rounds = _replay_rounds(dialog, start)
+            buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
+            cache_recovery = bool(vitest_offline_cache_misses(report))
+            if cache_recovery:
+                options_layout.addRow(_label('请选择已准备的 npm 缓存，或关闭离线安装以允许下载。'))
+            dialog.add_tool_check(runner=runner, tools=tools, fields=tool_fields, source=source, start=start)
+            dialog.set_controls(buttons, expanded=cache_recovery)
+            self.replay_dialog = dialog
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return None
+            options = _comparison_tool_paths(tool_fields)
+            options['timeout'] = preview['timeout'] if timeout.value() == initial_timeout else timeout.value()
+            if preview['runner'] == 'vitest':
+                options.update(offline=offline.isChecked(), npm_cache=cache.text().strip() or None)
+            if recheck:
+                options['repository'] = workspace.text().strip()
+            elif rounds.value() > 1:
+                options['rounds'] = rounds.value()
+            return options
+        finally:
+            if not recheck:
+                self.replay_dialog = None
+            dialog.deleteLater()
 
     def replay_report(self):
         if self.busy or not self.report:
             return False
-        directory = self.report['report_dir']
-        settings = project_replay_settings(self.report, python_executable=self.python_edit.text().strip())
-        python = settings['runtime']['executable']
-        count = len(self.report.get('selected_tests') or self.report.get('entries') or [])
+        report = self.report
+        if report.get('version_order'):
+            self.status_label.setText('请用 project version-order 从原始报告重放两组版本先后对照。')
+            return False
+        directory = report['report_dir']
+        reference = report_reference(report)
+        output = self.report_root
+        settings = project_replay_settings(report, python_executable=self.python_edit.text().strip())
+        count = len(report.get('selected_tests') or report.get('entries') or [])
         source_timeout = settings['source_timeout']
-        source_python = settings['source_runtime']['executable'] or '未记录'
-        dialog = QDialog(self)
+        source = settings['source_runtime']
+        dialog = _ReplayToolDialog(self)
         dialog.setWindowTitle('重放项目报告')
-        layout = QFormLayout(dialog)
-        layout.addRow(_label(f'重放 {count} 个测试 · {directory}'))
-        layout.addRow('原报告 Python', _label(source_python))
-        layout.addRow('本次 Python', _label(python))
-        layout.addRow('原报告每版限时', _label(f'{source_timeout:g} 秒' if source_timeout is not None else '未记录'))
+        after = report.get('after_commit') or ''
+        candidate = '运行时的工作区' if after == WORKTREE else after or '未记录'
+        dialog.overview.addRow('固定版本', _label(f'{report.get("before_commit") or "未记录"}\n→ {candidate}'))
+        scope = _text_view()
+        scope.setObjectName('replaySelectedTests')
+        scope.setAccessibleName('重放所选测试')
+        scope.setFixedHeight(90)
+        scope.setPlainText('\n'.join(report.get('selected_tests') or []))
+        dialog.overview.addRow(f'所选范围（{count} 项）', scope)
+        dialog.overview.addRow('原报告 Python', _label(source['executable'] or '未记录'))
+        if source['python_version'] or source['pytest_version']:
+            dialog.overview.addRow('原报告版本',
+                                   _label(f'Python {source["python_version"] or "未记录"} · pytest {source["pytest_version"] or "未记录"}'))
+        python_input = QLineEdit(settings['runtime']['executable'])
+        python_input.setObjectName('replayPythonPath')
+        python_input.setAccessibleName('本次 Python')
+        python_input.setPlaceholderText('留空使用应用的 Python')
+        dialog.overview.addRow('本次 Python', _row(python_input, _button('选择 Python…',
+                               lambda: self._choose_comparison_executable(python_input, 'Python'))))
+        local_names = (report.get('runtime_environment') or {}).get('local_names', [])
+        if local_names:
+            dialog.overview.addRow('启动时提供的本机变量', _label('、'.join(local_names)))
+        dialog.options.addRow('原报告每版限时', _label(f'{source_timeout:g} 秒' if source_timeout is not None else '未记录'))
         timeout_input = QDoubleSpinBox(dialog)
         timeout_input.setDecimals(3)
         timeout_input.setRange(.1, 3600)
         timeout_input.setSuffix(' 秒')
         timeout_input.setValue(settings['timeout'])
         initial_value = timeout_input.value()
-        layout.addRow('本次每版限时', timeout_input)
-        layout.addRow(_label('确认信任报告中的项目代码后，重放并保存新报告。'))
+        dialog.options.addRow('本次每版限时', timeout_input)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText('重放')
+        start = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        start.setText('开始重放')
+        start.setToolTip('确认信任报告中的项目代码后，重放并保存新报告。')
+        rounds_input = _replay_rounds(dialog, start)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
-        layout.addRow(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return False
-        timeout = settings['timeout'] if timeout_input.value() == initial_value else timeout_input.value()
+
+        def check_python(executable, control):
+            preview = replay_project_report(directory, output, python_executable=executable,
+                                            check_environment=True, expected_report=reference, control=control)
+            return preview['environment_check']
+
+        dialog.add_tool_check(runner='pytest', tools=(('python', 'Python'),), fields={'python': python_input},
+                              source=source, start=start, python_check=check_python)
+        dialog.set_controls(buttons, expanded=True)
+        self.replay_dialog = dialog
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return False
+            python = python_input.text().strip() or None
+            timeout = settings['timeout'] if timeout_input.value() == initial_value else timeout_input.value()
+            rounds = rounds_input.value()
+        finally:
+            self.replay_dialog = None
+            dialog.deleteLater()
         from .pytest_profile import read_pytest_profile
         from .desktop_runtime_environment import LocalValuesDialog
-        local_values = self.store.local_runtime_values(self.report.get('repository'))
+        local_values = self.store.local_runtime_values(report.get('repository'))
         try:
             profile = read_pytest_profile(Path(directory) / 'evidence/project/inputs/after')
             if profile.get('pass_env'):
@@ -3428,16 +5063,208 @@ class ProjectWorkbench(QWidget):
         except (OSError, ValueError) as exc:
             self._failed(str(exc))
             return False
-        output = self.report_root
+        if rounds > 1:
+            return self._start_replay_stability(reference, output, rounds,
+                                                {'python_executable': python, 'timeout': timeout},
+                                                runtime_values=local_values)
         def action(control):
-            return replay_project_report(directory, output, python_executable=python,
-                                         timeout=timeout, confirmed=True, control=control)
+            return replay_project_report(directory, output, python_executable=python, timeout=timeout,
+                                         confirmed=True, expected_report=reference, control=control, verify_result=True)
         def shown(report):
             self._apply_report(report)
             self.tabs.setCurrentIndex(2)
             self._refresh_catalog()
+            if verification := report.get('replay_verification'):
+                self._show_replay_verification(verification, report, directory)
         return self._start(action, shown, '正在明确重放保存的固定输入，结果将保存为新报告…',
-                           runtime_repository=self.report.get('repository', ''), runtime_values=local_values)
+                           runtime_repository=report.get('repository', ''), runtime_values=local_values)
+
+    def _start_replay_stability(self, reference, output, rounds, options, *, runtime_values=None):
+        from .replay_stability import replay_stability, stability_summary
+
+        def action(control):
+            return replay_stability(reference['report_dir'], output, rounds=rounds, confirmed=True,
+                                    expected_report=reference, control=control, **options)
+
+        def shown(result):
+            self._stability_result = reference, result
+            self.status_label.setText(stability_summary(result))
+            self._after_finished = lambda: self._show_replay_stability(result)
+
+        return self._start(action, shown, '正在校验稳定性检查的来源证据…',
+                           operation='replay_stability', runtime_values=runtime_values or {})
+
+    def _displayed_stability_result(self, report):
+        if report and self._stability_result and report_reference(report) == self._stability_result[0]:
+            return self._stability_result[1]
+        return None
+
+    def _open_replay_stability(self):
+        report = self._displayed_result_report()
+        if self.busy or not report:
+            return False
+        from .stability_history import list_stability_history
+
+        reference = report_reference(report)
+        output = self.report_root
+
+        def action(control):
+            return list_stability_history(reference['report_dir'], output, expected_report=reference, control=control)
+
+        def shown(result):
+            self._after_finished = lambda: self._show_stability_history(reference, result)
+
+        return self._start(action, shown, '正在查找这份报告的稳定性历史…',
+                           operation='replay_stability', runtime_values={})
+
+    def _show_stability_history(self, reference, result):
+        from .desktop_stability import StabilityHistoryDialog
+        from .replay_stability import stability_summary
+        from .stability_history import check_saved_stability
+
+        dialog = StabilityHistoryDialog(result, self)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.selected_summary:
+                self.status_label.setText(f'已找到 {len(result["checks"])} 次稳定性检查。')
+                return
+            summary = dialog.selected_summary
+        finally:
+            dialog.deleteLater()
+
+        def action(control):
+            return check_saved_stability(reference['report_dir'], summary, expected_report=reference, control=control)
+
+        def shown(checked):
+            self.status_label.setText(stability_summary(checked))
+            self._after_finished = lambda: self._show_replay_stability(checked)
+
+        self._start(action, shown, '正在校验各轮报告并重新计算稳定性结果…',
+                    operation='replay_stability', runtime_values={})
+
+    def _show_replay_stability(self, result):
+        from .desktop_stability import StabilityResultDialog
+
+        folder = Path(result['summary_file']).parent
+        dialog = StabilityResultDialog(
+            result, self, open_report=lambda report: self._open_local(Path(report) / 'report.html'),
+            open_folder=lambda: self._open_local(folder),
+        )
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
+
+    def _show_replay_verification(self, verification, report, source):
+        replay = {key: report[key] for key in ('project_id', 'run_id', 'report_dir')}
+        self._replay_details = (verification, source, replay)
+        self._saved_replay_receipt = None
+        self.status_label.setText('新报告已保存 · ' + verification['summary'])
+        self._sync_evidence_actions()
+
+    def _open_replay_verification(self):
+        details = self._displayed_replay_details()
+        if self.busy or details is None:
+            return
+        verification, source, replay = details
+        headline = verification['summary'].partition(' · ')[0]
+        if self._receipt_result_dialog('重放核对与回执', headline, verification,
+                                       save=verification['status'] != 'unavailable'):
+            self._save_latest_replay_receipt(verification, source, replay)
+
+    def _save_displayed_replay_receipt(self):
+        details = self._displayed_replay_details()
+        if self.busy or details is None or details[0]['status'] == 'unavailable':
+            return False
+        return self._save_latest_replay_receipt(*details)
+
+    def _open_saved_replay_receipt(self):
+        if self._displayed_replay_details() and self._saved_replay_receipt:
+            self._open_local(self._saved_replay_receipt)
+
+    def _receipt_paths(self, title, fields, *, suggested_name='replay-receipt'):
+        from .desktop_receipt import ReceiptPathsDialog
+
+        dialog = ReceiptPathsDialog(title, fields, self.report_root.parent, self, suggested_name=suggested_name)
+        try:
+            return dialog.paths() if dialog.exec() == QDialog.DialogCode.Accepted else None
+        finally:
+            dialog.deleteLater()
+
+    def _receipt_result_dialog(self, title, headline, verification=None, *, issues=(), save=False, directory=None):
+        from .desktop_receipt import ReceiptResultDialog
+
+        open_folder = (lambda: self._open_local(directory)) if directory else None
+        dialog = ReceiptResultDialog(title, headline, verification, self, issues=issues,
+                                     save=save, directory=directory, open_folder=open_folder)
+        try:
+            return dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            dialog.deleteLater()
+
+    def _save_latest_replay_receipt(self, verification, source, replay):
+        from .replay_receipt import replay_receipt_destination, save_replay_receipt
+
+        paths = self._receipt_paths('保存回执', ('destination',), suggested_name=replay['run_id'] + '-receipt')
+        if not paths:
+            return False
+
+        def action(control):
+            target = replay_receipt_destination(paths['destination'], source)
+            save_replay_receipt({**replay, 'replay_verification': verification}, target, control=control)
+            return {'replay_verification': verification, 'receipt_dir': str(target)}
+
+        def shown(result):
+            self._saved_replay_receipt = result['receipt_dir']
+            self._receipt_saved(result)
+
+        return self._start(action, shown, '正在保存重放证据与回执…',
+                           operation='replay_handoff', runtime_values={})
+
+    def make_replay_receipt(self):
+        if self.busy or self._closing:
+            return False
+        from .replay_receipt import export_replay_receipt
+
+        paths = self._receipt_paths('制作回执', ('source', 'replay', 'destination'))
+        if not paths:
+            return False
+        return self._start(lambda control: export_replay_receipt(**paths, control=control),
+                           self._receipt_saved, '正在核对已保存的证据并制作回执…',
+                           operation='replay_handoff', runtime_values={})
+
+    def _receipt_saved(self, result):
+        verification = result['replay_verification']
+        directory = result.get('receipt_dir')
+        headline = '已保存回执' if directory else '回执未保存'
+        self.status_label.setText(headline + ' · ' + verification['summary'])
+        self._after_finished = lambda: self._receipt_result_dialog(
+            '重放回执', headline, verification, directory=directory)
+
+    def check_returned_receipt(self):
+        if self.busy or self._closing:
+            return False
+        from .replay_receipt import check_replay_receipt
+
+        paths = self._receipt_paths('复核回传回执', ('source', 'receipt'))
+        if not paths:
+            return False
+
+        def action(control):
+            result = check_replay_receipt(**paths, control=control)
+            control.commit()
+            return result
+
+        def shown(result):
+            verification = result['replay_verification']
+            headline = '回传材料一致' if result['status'] == 'consistent' else '回传材料需要核对'
+            issues = [f'{item["part"] if item["part"] != "evidence" else "证据"} · {item["message"]}'
+                      for item in result['issues']]
+            self.status_label.setText(headline + (' · ' + verification['summary'] if verification else ''))
+            self._after_finished = lambda: self._receipt_result_dialog(
+                '复核回传回执', headline, verification, issues=issues)
+
+        return self._start(action, shown, '正在离线复核回传材料…',
+                           operation='replay_handoff', runtime_values={})
 
     def prepare_ai(self):
         if self.busy or not self.state:

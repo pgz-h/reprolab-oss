@@ -33,7 +33,7 @@ python3 -m venv /path/to/reprolab-build/.venv
 5. 发布说明写明验证过的流程、系统范围和已知限制。macOS 构建当前为 arm64、ad-hoc 签名，Apple 公证仍未完成。
 6. 核对真实下载入口、附件版本和校验值后发布，再将首页指向实际可下载的附件。
 
-当前 GitHub 工作流执行定向核心检查、构建 Python 发行文件，并在独立环境中验收安装后的 wheel。远端结果须实际查看；桌面构建与界面验收另行完成。工作流产物与正式 Release 附件需要分别核对。
+GitHub 工作流执行定向核心检查、构建 Python 发行文件，并在独立环境中验收安装后的 wheel。Python 3.14 构建还将受控测试的证据 ZIP 和 wheel 交给独立 macOS runner。接收任务从 ZIP 预检后使用 `project replay --receipt-dir` 重放，再用 `project check-receipt` 离线复核回传目录并展示通过材料核对的回执。每个候选的远端结果以实际运行记录为准。桌面构建、界面验收和正式 Release 附件另行核对。
 
 GitHub 的 Release 支持草稿和 Pre-release 标记，操作步骤可参考官方说明。[管理 Release](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository)
 

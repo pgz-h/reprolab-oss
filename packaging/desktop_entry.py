@@ -11,6 +11,9 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == '--reprolab-project-worker':
         del sys.argv[1]
         from reprolab._project_worker import main
+    elif len(sys.argv) > 1 and sys.argv[1] == '--reprolab-network-replay':
+        del sys.argv[1]
+        from reprolab.project_network import isolated_main as main
     elif len(sys.argv) > 1 and sys.argv[1] == "--cli":
         del sys.argv[1]
         from reprolab.cli import main

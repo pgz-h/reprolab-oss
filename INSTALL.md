@@ -1,5 +1,7 @@
 # 安装 ReproLab
 
+[0.19.0a23 下载页](https://github.com/pgz-h/reprolab-oss/releases/tag/v0.19.0a23) 提供 Python 包和 macOS arm64 ZIP。Windows x64 便携附件待构建。
+
 ReproLab 仍处于 Alpha 阶段。源码安装需要 Python 3.11 或以上。macOS arm64 使用下方安装流程，Windows x64 的源码试用和构建步骤见[Windows 指南](docs/windows.md)。两端当前验证范围见[平台说明](docs/platforms.md)。
 
 ## 从已取得的源码安装

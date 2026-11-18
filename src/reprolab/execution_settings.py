@@ -64,9 +64,9 @@ def describe_execution_settings(settings):
              '插件：' + plugins + '。环境中的其他插件不会自动加载。',
              '导入方式：' + mode + '。两版共用候选快照中的这份插件及导入配置。',
              '项目配置与 fixture：各版本分别保留；两版使用同一份所选测试文件。', '',
-             '项目默认附加参数（addopts）会清空；实际范围由所选测试清单决定。']
+             '项目对比采用实际配置文件中的 addopts 警告筛选。实际测试范围仍由所选清单决定。']
     declarations = settings.get('detected_addopts') or []
-    lines.extend(('检测到但不会自动执行的声明：',) if declarations else ('没有检测到非空的附加参数声明。',))
+    lines.extend(('检测到的声明，实际采用情况见运行记录：',) if declarations else ('没有检测到非空的附加参数声明。',))
     for row in declarations:
         lines.append(row['file'] + ' [' + row['section'] + ']：' + row['value'] + (' …（显示截断）' if row['truncated'] else ''))
     lines.extend(['', '环境变量：仅允许继承 PATH、临时目录、语言等基础运行变量。',

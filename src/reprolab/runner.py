@@ -38,16 +38,19 @@ class RunCancelled(Exception):
 
 
 class RunControl:
-    def __init__(self, progress=None, *, runtime_values=None):
+    def __init__(self, progress=None, *, runtime_values=None, network_isolation=None, clock_control=None):
         self._cancelled = threading.Event()
         self._lock = threading.Lock()
         self._committed = False
         self.progress = progress or (lambda phase, result: None)
         self.runtime_values = dict(runtime_values or {})
+        self.network_isolation = network_isolation
+        self.clock_control = clock_control
 
     def child(self, progress=None):
         """Share cancellation atomically while keeping a separate commit boundary."""
-        child = RunControl(progress=progress, runtime_values=self.runtime_values)
+        child = RunControl(progress=progress, runtime_values=self.runtime_values, network_isolation=self.network_isolation,
+                           clock_control=self.clock_control)
         child._cancelled = self._cancelled
         child._lock = self._lock
         return child

@@ -1,8 +1,10 @@
 # ReproLab
 
+**0.19.0a23 Alpha** · [下载 Python 安装包和 macOS Apple 芯片版](https://github.com/pgz-h/reprolab-oss/releases/tag/v0.19.0a23)。Windows x64 便携附件待构建。
+
 **用实际测试核对一次修复，或比较一次项目改动，并留下可重放的证据。**
 
-ReproLab 面向 Python／pytest 项目，提供 macOS 桌面应用和 CLI。它冻结改动前后的源码，用同一份测试分别执行，显示新增失败、原有失败、改善和受阻项，保存报告、日志与源码快照。AI 可以帮助准备检查，正式结论来自实际执行，范围限于所选场景。
+ReproLab 冻结改动前后的源码，在两版上运行同一份选定测试，并保存可校验、可重放的报告、日志与快照。项目对比区分新增失败、原有失败、改善和受阻。严格修复验收先核对旧版是否出现声明的故障，再检查新版是否通过。AI 可以辅助准备和解读，结论来自实际执行，范围限于所选测试。
 
 [English](README.en.md) · [文档导航](docs/README.md) · [第一次使用](docs/first-run.md) · [安装](INSTALL.md) · [项目工作台](docs/project-workbench.md) · [CLI 与 CI](docs/cli-contract.md) · [更新记录](CHANGELOG.md)
 
@@ -18,7 +20,27 @@ python3 -m venv .venv
 
 以上命令在已取得的源码根目录执行。案例采用上游原始单模块和 ReproLab 编写的行为检查；它不是完整 humanize 项目适配，也不是上游采用证明。见[案例与来源](docs/history-case.md)。
 
-开发版提供 JavaScript／TypeScript 的 [Vitest 命令行预览](docs/vitest.md)和 [Go 命令行预览](docs/go.md)，均可比较两版并导出可校验、可重放的证据。
+在真实的 [async-lru PR #799](https://github.com/aio-libs/async-lru/pull/799) 上，ReproLab 运行了三个上游测试，基线均失败，候选均通过。[案例与重放指南](docs/replay-handoff-case.md)记录了固定提交、测试范围和接收方复跑步骤。
+
+桌面工作台支持[重放交接](docs/project-workbench.md#核对导出导入与明确重放)。接收方可以保存重放证据和回执，发送方可从原始证据与回传目录离线复核。Markdown 回执可附到 PR 或 CI。
+
+本版在「项目检查」提供 Python／pytest 工作台，以及 JavaScript／TypeScript 的 [Vitest 4 对比](docs/vitest.md)和 [Go 单包对比](docs/go.md)。Go 可从候选快照发现包内测试。后两项也可从 CLI 发起，保存可校验、可重放的证据。
+
+## 在终端体验一次 PR 审查
+
+安装本版 CLI 后，运行内置购物车教学项目。第一条命令实际测试两版，确认折扣修复，同时检测到故意留下的金额显示回归，预期返回 `1`。它会生成证据 ZIP、验收计划和 PR 摘要。最后一条命令模拟接收者，直接从这些文件复核摘要。
+
+```sh
+demo_dir="$(mktemp -d)"
+reprolab project demo --review-handoff --output "$demo_dir" > "$demo_dir/result.json" || test "$?" -eq 1
+handoff="$(python -c 'import json, sys; print(json.load(sys.stdin)["handoff_dir"])' < "$demo_dir/result.json")"
+reprolab project check-summary "$handoff/project.zip" "$handoff/review-summary.md" \
+  --acceptance-plan "$handoff/acceptance-plan.json"
+```
+
+看到 `status: consistent`，表示摘要与证据相符。`gate.status: failed` 仍记录这次审查发现的回归。供审查的 Markdown 位于交接目录中的 `review-summary.md`。 [离线核对 PR 摘要](docs/cli-contract.md#离线核对收到的-pr-摘要)
+
+开发版可在同一次运行中按计划确认必验测试由失败转为通过，并输出供 PR 审查的 Markdown。验收通过、失败和受阻会分别传回 CI；接收方仍可从交接 ZIP 离线复核证据。 [GitHub Actions 接入示例](docs/cli-contract.md#将验收摘要写入-github-actions)
 
 ## 适合什么任务
 
@@ -26,7 +48,7 @@ python3 -m venv .venv
 
 ## 当前版本
 
-**0.19.0a21 Alpha 候选**以 Python／pytest 为主，包含桌面项目工作台、一条命令完成的 CLI 项目对比，以及可携带复查记录的证据 ZIP。Vitest 4 作为 CLI 预览提供。见[更新记录](CHANGELOG.md)、[平台状态](docs/platforms.md)和[验证说明](docs/release-readiness.md)。
+本地开发功能见对应使用指南。公开预发行包支持的功能以 GitHub Releases 的版本说明为准。见[更新记录](CHANGELOG.md)、[平台状态](docs/platforms.md)和[验证说明](docs/release-readiness.md)。
 
 桌面面向 macOS arm64，采用 ad-hoc 签名，尚未完成 Apple 公证。下载入口和发行校验值以 GitHub Releases 中的实际附件为准。
 
@@ -102,7 +124,7 @@ AI 为可选功能，用于准备回归测试草稿、生成可审阅的验收�
 
 环境错误、收集或 fixture 失败、超时、跳过、xfail 和不完整记录不能计入通过。日志、源码与模型材料可能含项目数据，分享前应检查。证据哈希校验内容一致性，不证明作者身份。
 
-macOS arm64 用于本地开发与验证。Windows x64 开发候选已在 GitHub Actions 完成原生检查和实际 exe 验收。见[Windows 指南](docs/windows.md)和[安全边界](SECURITY.md)。
+macOS arm64 用于本地开发与验证。0.19.0a22 的 Windows x64 便携包有单独的 GitHub Actions 原生和实际 exe 验收记录。当前工作树的验证范围见[验证状态](docs/release-readiness.md)、[Windows 指南](docs/windows.md)和[安全边界](SECURITY.md)。
 
 ## 文档与贡献入口
 

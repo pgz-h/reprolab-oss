@@ -14,6 +14,7 @@ from test_desktop_ui import window
 from test_desktop_usability import project, wait_project
 from test_workflow import make_environment
 from reprolab.desktop_store import DesktopStore
+from reprolab.project_sessions import check_project_report
 
 
 def ready(window, repo):
@@ -51,6 +52,39 @@ def test_prepare_and_discover_stops_for_scope_review_then_prioritizes_failures(w
     bench.new_project()
     assert bench.tabs.currentIndex() == 0 and bench.session_combo.currentData() is None
     assert bench.result_count_label.text() == '尚无检查结果'
+
+
+def test_use_pasted_projects_environment_to_run_first_comparison(window, tmp_path):
+    repo = project(tmp_path, missing_dependency=True)
+    executable, purelib = make_environment(tmp_path, True)
+    (purelib / 'reprolab_missing_demo_dependency.py').write_text('AVAILABLE = True\n')
+    (repo / '.venv').symlink_to(executable.parent.parent, target_is_directory=True)
+    candidate = repo / '.venv/bin/python'
+
+    bench = ready(window, repo)
+    bench.repository_edit.setFocus()
+    QTest.keyClick(bench.repository_edit, Qt.Key.Key_Return)
+    assert bench.use_project_environment_button.isVisible()
+    assert bench.python_edit.text() == ''
+    QTest.mouseClick(bench.use_project_environment_button, Qt.MouseButton.LeftButton)
+    assert bench.python_edit.text() == str(candidate)
+    assert bench.state is None and bench.task is None
+    assert not bench.use_project_environment_button.isVisible()
+
+    bench.prepare_discover_button.click()
+    wait_project(bench)
+    assert bench.collection['status'] == 'collected'
+    assert len(bench.selected_test_ids()) == 5 and bench.report is None
+    bench.run_button.click()
+    wait_project(bench)
+    assert bench.report['runtime']['executable'] == str(candidate)
+    assert bench.report['counts'] == {'regression_passed': 3, 'regression_detected': 1, 'improved': 1}
+    assert check_project_report(bench.report['report_dir'])['status'] == 'consistent'
+    bench.result_actions['copy_review_summary'].trigger()
+    wait_project(bench)
+    markdown = QApplication.clipboard().text()
+    assert 'ReproLab comparison' in markdown and '| New failure | 1 |' in markdown
+    assert str(repo) not in markdown and 'test_regression' not in markdown
 
 
 def test_discovery_failure_exposes_recovery_and_keeps_the_snapshot(window, tmp_path):

@@ -15,18 +15,20 @@ def _digest(path: Path) -> str:
 def describe_changes(before: Path, after: Path) -> dict:
     trees = [{p.relative_to(root).as_posix(): p for p in root.rglob("*") if p.is_file()}
              for root in (before, after)]
-    changes = []
-    total = 0
-    for name in sorted(trees[0].keys() | trees[1].keys()):
+    inventory = []
+    for name in trees[0].keys() | trees[1].keys():
         old, new = trees[0].get(name), trees[1].get(name)
         old_mode = stat.S_IMODE(old.stat().st_mode) & 0o777 if old else None
         new_mode = stat.S_IMODE(new.stat().st_mode) & 0o777 if new else None
         same_content = bool(old and new and _digest(old) == _digest(new))
         if same_content and old_mode == new_mode:
             continue
-        total += 1
-        if len(changes) >= 20:
-            continue
+        # Surface deletions and permission changes before the files added in bulk.
+        priority = 0 if new is None else 1 if old and old_mode != new_mode else 2 if old else 3
+        inventory.append((priority, name, old, new, old_mode, new_mode, same_content))
+    total = len(inventory)
+    changes = []
+    for _, name, old, new, old_mode, new_mode, same_content in sorted(inventory)[:20]:
         change = {"path": name, "kind": "added" if old is None else "removed" if new is None else "modified",
                   "diff": "", "note": ""}
         if old and new and old_mode != new_mode:
@@ -38,12 +40,14 @@ def describe_changes(before: Path, after: Path) -> dict:
             change["note"] += "文件超过 128 KiB，省略文本预览。"
         else:
             try:
-                texts = [p.read_text(encoding="utf-8") if p else "" for p in (old, new)]
+                texts = [p.read_bytes().decode("utf-8") if p else "" for p in (old, new)]
                 if any("\x00" in t for t in texts):
                     raise ValueError("binary data")
                 lines = list(islice(difflib.unified_diff(texts[0].splitlines(), texts[1].splitlines(),
                                                        fromfile=f"before/{name}", tofile=f"after/{name}", lineterm=""), 201))
                 change["diff"] = "\n".join(lines[:200])[:20000]
+                if old and new and texts[0] != texts[1] and not lines:
+                    change["note"] += "字节发生变化，逐行文本相同；请核对换行符或末尾换行。"
                 if len(lines) > 200 or len("\n".join(lines[:200])) > 20000:
                     change["note"] += "差异预览已截断；完整文件保存在 evidence 目录。"
             except (UnicodeError, ValueError):
