@@ -17,6 +17,51 @@ from reprolab.runner import RunControl
 from reprolab.workspace import WORKTREE
 
 
+def test_frozen_plan_comparison_keeps_target_decision_and_identifies_missing_scope(tmp_path, capsys):
+    from test_project_review_audit import freeze, git, write
+
+    repo = tmp_path / 'fixture'
+    repo.mkdir()
+    git(repo, 'init', '-q')
+    fixed, neighbor, extra = (f'test_order.py::{name}' for name in ('test_fixed', 'test_neighbor', 'test_extra'))
+    write(repo, 'test_order.py',
+          'from model import ready\ndef test_fixed(): assert ready\n'
+          'def test_neighbor(): assert False\ndef test_extra(): assert False\n')
+    write(repo, 'model.py', 'ready = False\n')
+    target = AcceptancePlan('pytest', 'strict', (fixed,))
+    proposed = AcceptancePlan('pytest', 'no-new-failures', (fixed,))
+    filename = '.ci/plan.json'
+    selection = '.ci/selection'
+    write(repo, filename, json.dumps(target.record()))
+    write(repo, selection, f'{fixed}\n{neighbor}\n')
+    freeze(repo)
+    write(repo, 'model.py', 'ready = True\n')
+    write(repo, filename, json.dumps(proposed.record()))
+    write(repo, selection, f'{fixed}\n{neighbor}\n{extra}\n')
+    assert main(list(map(str, ('review', repo, '--before', 'HEAD', '--working-tree',
+                              '--test', fixed, '--test', neighbor, '--output', tmp_path / 'runs')))) == 2
+    report = json.loads(capsys.readouterr().out)
+    archive = tmp_path / 'evidence.zip'
+    pack_project_report(report['report_dir'], archive)
+    args = ['compare-plans', str(archive), '--plan-path', filename, '--format', 'json']
+    assert main(args) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result['gate'] == result['target']['gate']
+    assert result['target']['source']['revision']['commit'] == report['before_commit']
+    assert result['target']['acceptance_plan_sha256'] == target.fingerprint()
+    assert result['proposed']['acceptance_plan_sha256'] == proposed.fingerprint()
+    assert result['target']['gate']['exit_code'] == 2
+    assert result['proposed']['gate']['exit_code'] == 0
+    assert result['rule_changes'] == {'policy': {'target': 'strict', 'proposed': 'no-new-failures'}}
+
+    assert main([*args, '--selection-path', selection]) == 2
+    scoped = json.loads(capsys.readouterr().out)
+    assert scoped['proposed']['gate']['reason'] == 'selection_not_covered'
+    assert scoped['proposed']['missing_tests'] == [extra]
+    assert scoped['proposed']['rerun_selection'] == [fixed, neighbor, extra]
+    assert scoped['target']['gate'] == result['target']['gate']
+
+
 def test_plan_is_reusable_and_keeps_missing_requirements_visible(tmp_path, capsys):
     state = create_project_demo(tmp_path / 'sessions')
     fixed = 'tests/test_cart.py::test_discount_cannot_make_total_negative'

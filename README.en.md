@@ -1,6 +1,6 @@
 # ReproLab
 
-**0.19.0a23 Alpha** · [Download the Python packages and macOS Apple silicon app](https://github.com/pgz-h/reprolab-oss/releases/tag/v0.19.0a23). The Windows x64 portable package is pending.
+**0.19.0a24 Alpha** · [Published releases and downloads](https://github.com/pgz-h/reprolab-oss/releases)
 
 **Check a fix or project change with real tests, and keep replayable evidence.**
 

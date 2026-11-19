@@ -8,6 +8,16 @@ from ._input_samples import sample_digests
 CONTROL_FILE = 'input-control.json'
 
 
+def recorded_inputs(report):
+    samples = {}
+    for entry in report['entries']:
+        for side in ('before', 'after'):
+            outcome = entry.get(side, {})
+            if outcome.get('input_digests') or outcome.get('input_error'):
+                samples[side, entry['test_id']] = (outcome.get('input_digests'), outcome.get('input_error'))
+    return samples
+
+
 def control_metadata(record, selected):
     fields = {'source_report_sha256', 'values'}
     if (not isinstance(record, dict) or record.keys() not in (fields, fields | {'plan_sha256'})

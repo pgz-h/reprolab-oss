@@ -49,23 +49,47 @@ Vitest 可用 `project vitest … --all-files --output DIRECTORY` 从同一次�
 - `--gate no-new-failures` 在两版完成且所选结果可比较时允许原有失败。新增失败返回 `1`。跳过、受阻、取消和不完整执行仍需要处理，返回 `2`。只含文件级结果的旧 Vitest 报告无法用该规则豁免原有失败。Go 比较以选定的顶层函数为单位。
 - 门槛结果会写入摘要，原报告结论保持原样。两版均失败表示该测试在基线和候选都失败，仍可审阅完整报告中的两次故障。若同一次比较包含新增失败和受阻项，门槛返回 `1`，摘要同时保留两类结果。
 
-在已有可信项目的 GitHub Actions 任务中，先准备完整 Git 历史、两个提交、测试依赖和选择清单，再加入以下步骤。示例使用普通 `pull_request` 上下文中的两版 SHA，依赖安装沿用项目现有步骤。步骤写入 [GitHub 任务摘要](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#adding-a-job-summary)。
+Pytest 在两版均因测试主体的 `AssertionError` 失败时，会尽量比较记录的断言。位置指纹取自最内层 traceback 对应的项目相对文件、函数限定名和断言表达式的语法结构。行号用于查找表达式，指纹排除行号、绝对路径、断言消息及运行时值。指纹不同需要复核，返回 `2`，两版均失败的观察仍计入 `baseline_failure`。指纹相同支持继续沿用原有失败策略，证明范围限于所记录的断言表达式和位置标识。
+
+同一函数中有多个相同条件时，新记录包含条件的出现次序、次数和函数语法指纹。两版函数结构相同且次序不同会触发复核。次数或结构不同、或同一行有多个断言而无法定位时，也返回 `2`。仅移动行或加注释保留可比较性。
+
+旧 ZIP 可用新版直接重新生成摘要。只含上一版位置指纹时，等值指纹必须从保存的共享测试源码核对为唯一断言才能放行。对应多个语句、位于辅助模块或缺少可核对源码时需复核。更早、缺少断言位置字段的记录沿用消息比较兼容策略，消息指纹不同触发复核，消息一致或只能比较阶段与类型时显示所用依据。新版报告对显式抛出 `AssertionError` 或来自快照外的故障也可能无法取得位置，此时按阶段与类型处理。需要更完整的位置证据时，用新版重新执行两版。位置一致的断言仍可能因不同输入或根因失败。
+
+`assertion_comparison` 在 JSON 摘要中提供各依据的计数。`--include-test-ids` 可查看逐项依据，`--public-summary` 仅包含这些计数。
+
+在可信项目的 GitHub Actions 任务中，使用普通 `pull_request`、只读权限和 GitHub 提供的合并提交。示例安装合并工作区的测试依赖与固定版本 ReproLab，使用同一解释器运行两版。请按项目准备可同时运行两版的依赖。选择清单取自事件绑定的目标提交。ReproLab 核对合并结果的两个父提交分别是目标提交和 PR head，合并对象缺失或父提交不符时返回 `2`。步骤写入 [GitHub 任务摘要](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#adding-a-job-summary)。
 
 ```yaml
-- name: Compare selected tests
+- uses: actions/checkout@v7
+  with:
+    fetch-depth: 0
+    persist-credentials: false
+- uses: actions/setup-python@v7
+  with:
+    python-version: '3.14'
+- name: Install test dependencies and ReproLab
+  env:
+    REPROLAB_WHEEL_URL: ${{ vars.REPROLAB_WHEEL_URL }}
+  run: python -m pip install -r requirements-test.txt "$REPROLAB_WHEEL_URL"
+- name: Check selected tests on the merge result
   shell: bash
   env:
     BASE_SHA: ${{ github.event.pull_request.base.sha }}
-    CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
   run: |
-    result="$RUNNER_TEMP/reprolab-result.json"
+    run_dir="$(mktemp -d "$RUNNER_TEMP/reprolab.XXXXXXXX")"
+    if ! git show "$BASE_SHA:.ci/reprolab-tests.txt" > "$run_dir/selection.txt"; then
+      echo 'ReproLab blocked · target test selection unavailable.' >> "$GITHUB_STEP_SUMMARY"
+      exit 2
+    fi
+    result="$run_dir/result.json"
     comparison=0
-    reprolab project review "$GITHUB_WORKSPACE" --before "$BASE_SHA" --after "$CANDIDATE_SHA" \
-      --python "$(command -v python)" --selection-file .ci/reprolab-tests.txt \
-      --output "$RUNNER_TEMP/reprolab" > "$result" || comparison=$?
+    reprolab project review "$GITHUB_WORKSPACE" --github-event "$GITHUB_EVENT_PATH" \
+      --pr-mode merge --merge-commit "$GITHUB_SHA" --audit-discovery \
+      --python "$(command -v python)" --selection-file "$run_dir/selection.txt" \
+      --output "$run_dir/review" > "$result" || comparison=$?
     if (( comparison > 2 )); then exit "$comparison"; fi
     if ! report="$(python -c 'import json, sys; print(json.load(sys.stdin)["report_dir"])' < "$result")"; then
-      echo 'ReproLab did not produce a comparison report.' >> "$GITHUB_STEP_SUMMARY"
+      echo 'ReproLab blocked · no checked merge comparison report. See the step log.' >> "$GITHUB_STEP_SUMMARY"
       exit 2
     fi
     reprolab project summary "$report" --gate no-new-failures >> "$GITHUB_STEP_SUMMARY"
@@ -159,7 +183,7 @@ reprolab project review ./repo --before BASE --after CANDIDATE \
 
 摘要使用 UTF-8，父目录须已存在，目标须是新文件。写入成功时 stdout JSON 包含 `summary_file`。如果无法写入，JSON 仍保留 `report_dir`、`acceptance` 和 `summary_error`。此时已确认失败仍返回 `1`，其余情况返回 `2`。计划中的必验测试名会出现在 Markdown 中。
 
-以下 pytest workflow 使用普通 `pull_request`、GitHub 托管 runner 和只读权限。先在仓库中设置 `REPROLAB_WHEEL_URL` 指向包含 `--summary-file` 的固定版本 wheel，再按项目调整依赖安装步骤。从桌面验收结果导出 CI 配置后，将两份 JSON 放入 `.ci/` 并核对其中的目标。两版按 PR 事件的基线和候选 SHA 执行。把清单和计划的变更也纳入 PR 审查。
+以下 pytest workflow 使用普通 `pull_request`、GitHub 托管 runner 和只读权限。先在仓库中设置 `REPROLAB_WHEEL_URL` 指向支持这里各选项的固定版本 wheel，再按项目调整依赖安装步骤。从桌面验收结果导出 CI 配置后，将两份 JSON 放入目标分支的 `.ci/` 并核对其中的目标。门禁比较事件目标提交与已核对父提交的合并结果，并使用目标提交中的计划和选择清单。PR 对这些规则的提议可另行核对。
 
 ```yaml
 name: Review selected regressions
@@ -175,7 +199,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v7
@@ -185,23 +208,28 @@ jobs:
         env:
           REPROLAB_WHEEL_URL: ${{ vars.REPROLAB_WHEEL_URL }}
         run: python -m pip install -r requirements-test.txt "$REPROLAB_WHEEL_URL"
-      - name: Compare selected tests and verify the repair plan
+      - name: Check the merge result against the target plan
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           run_dir="$(mktemp -d "$RUNNER_TEMP/reprolab.XXXXXXXX")"
+          if ! git show "$BASE_SHA:.ci/regression-tests.json" > "$run_dir/selection.json" ||
+             ! git show "$BASE_SHA:.ci/acceptance-plan.json" > "$run_dir/plan.json"; then
+            echo 'ReproLab blocked · target selection or plan unavailable.' >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
           verdict=0
-          reprolab project review "$GITHUB_WORKSPACE" --before "$BASE_SHA" --after "$CANDIDATE_SHA" \
-            --python "$(command -v python)" --selection-file .ci/regression-tests.json \
-            --acceptance-plan .ci/acceptance-plan.json --verify-plan \
+          reprolab project review "$GITHUB_WORKSPACE" --github-event "$GITHUB_EVENT_PATH" \
+            --pr-mode merge --merge-commit "$GITHUB_SHA" --audit-discovery \
+            --python "$(command -v python)" --selection-file "$run_dir/selection.json" \
+            --acceptance-plan "$run_dir/plan.json" --verify-plan \
             --summary-file "$run_dir/summary.md" --output "$run_dir/review" \
             > "$run_dir/result.json" || verdict=$?
           if [[ -f "$run_dir/summary.md" ]]; then
             cat "$run_dir/summary.md" >> "$GITHUB_STEP_SUMMARY"
           else
-            printf 'ReproLab could not produce a checked summary (exit %s).\n' \
+            printf 'ReproLab blocked · no checked merge summary (exit %s). See the step log.\n' \
               "$verdict" >> "$GITHUB_STEP_SUMMARY"
             if [[ -s "$run_dir/result.json" ]] &&
               status="$(python -c 'import json, sys; print(json.dumps(json.load(sys.stdin)["status"]))' \
@@ -209,10 +237,22 @@ jobs:
               printf 'ReproLab result status: %s\n' "$status"
             fi
           fi
+          if [[ ! -f "$run_dir/summary.md" && "$verdict" == 0 ]]; then exit 2; fi
           exit "$verdict"
 ```
 
 Go 或 Vitest 可替换为各自的命令和显式测试范围，保留同样的验收参数与退出码处理。示例只将 Markdown 发送到任务摘要。按项目的数据要求另行决定是否上传完整证据，报告可包含源码快照、日志和本机环境信息。[GitHub 任务摘要](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#adding-a-job-summary) · [GitHub PR 运行权限](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target)
+
+### 比较目的和计划变更
+
+`review --github-event EVENT --pr-mode head` 从唯一共同祖先比较到 PR head，用于检查分支改动。`--pr-mode merge --merge-commit SHA` 从事件目标提交比较到已核对两位父提交的合并结果，用于检查合入。手工指定两个版本会标为指定版本对比。摘要开头显示比较目的、实际版本、范围及门禁结果。公开摘要保留比较类型和数量。已有 ZIP 可重新生成新版摘要。
+
+```sh
+reprolab project compare-plans ./evidence.zip --plan-path .ci/acceptance-plan.json \
+  --selection-path .ci/regression-tests.json
+```
+
+`compare-plans` 从两版冻结快照读取同一路径的计划，用同一份已核对报告计算两个结果。它显示计划来源、指纹、变化的规则和各自的门禁。命令的退出码取目标计划，候选计划的结果供审查提议。可选的 `--selection-path` 核对两版 pytest 的独立测试清单，显示未覆盖的测试和建议复跑清单。若计划有额外的回执或稳定性要求，摘要显示缺少的材料，可另用 `summary` 带相应材料核对。报告仅保存共同祖先而未包含目标提交时，目标计划受阻，需使用合并模式获取对应证据。
 
 ### 离线核对收到的 PR 摘要
 
@@ -223,12 +263,25 @@ reprolab project check-summary ./project.zip ./review-summary.md \
   --acceptance-plan ./acceptance-plan.json
 ```
 
-`check-summary` 支持与 `summary` 相同的验收和用例显示选项。原摘要附了测试 ID、额外回执或稳定性材料时，请传入原来的 `--include-test-ids`、`--require-receipt` 或 `--require-stability`。它先校验项目证据，再按这些条件生成摘要并比较 Markdown。Windows 的 CRLF 换行可以直接核对。
+`check-summary` 支持与 `summary` 相同的验收和用例显示选项。请传入生成原摘要时的策略、显示选项、计划与外部证据。命令先核对项目证据，再重建当前摘要和已支持的历史摘要。完整 Markdown 必须匹配其中一种，允许 CRLF 换行。`different` 可能来自格式不受支持、选项有异或内容被编辑。
 
 - 一致时返回 `0`，JSON 的 `status` 为 `consistent`。内容不同返回 `2`，`status` 为 `different`。证据校验失败或摘要无法读取时也返回 `2`，错误写入 stderr。
-- `gate` 记录重新计算的业务验收结果及其退出码。摘要核对通过时，也可能记录真实的回归或受阻。CI 如要直接执行验收门槛，使用 `project summary` 或 `--verify-plan`。
+- `markdown_format` 记录匹配的是 `current`、`pre_phase`（增加阶段判断前）、`pre_scope`（增加运行范围前）或 `cb56b04`。配套 JSON 须匹配同一格式。当按旧规则重建的门禁与当前不同时，`historical_gate` 保留旧决定。`cb56b04` 格式也会返回其历史门禁。`gate` 始终记录当前规则的业务决定及其退出码。CI 直接执行验收时，使用 `project summary` 或 `--verify-plan`。
+- `expected_markdown_sha256` 是当前规范正文的指纹。`matched_markdown_sha256` 是匹配到的规范正文指纹。摘要核对使用完整内容。要求签名批准时，请同时提供原计划、签名、可信公钥和预期身份。签名与业务门禁分别核对。
 
 `project demo --review-handoff --output DIRECTORY` 可生成一套对应文件。JSON 的 `handoff_dir` 指向交接目录。内置案例的折扣修复生效，仍有一项金额显示回归，因此运行返回 `1`，摘要核对返回 `0`。
+
+### pytest 报告的发现、推荐与执行范围
+
+摘要的 `run_scope` 分别给出当轮发现、保存的推荐清单、实际选择和每版观察到的执行。发现与推荐来自 ZIP 挂接并可核验的候选侧发现记录。部分或截断发现的数量为保存的唯一测试 ID 提供的下界。缺失记录显示未知。明确保存的空推荐清单显示零项。推荐计数仅覆盖当轮保存的线索，未纳入项的结果在本轮未知。普通摘要加 `--include-test-ids` 可查看最多 20 个未纳入的推荐及原理由。公开摘要只显示计数和状态。
+
+执行显示每版状态、已开始数量和已完成的 pytest 阶段记录数。跳过或准备失败的测试可能已有完整阶段记录，结论仍见逐项结果。取消或不完整日志只提供已观察到的下界。明确未执行的版本显示零项及未开始数量。推荐和范围信息用于解释证据，门禁仍评估实际选择与验收条件。
+
+### pytest 主体失败与清理异常
+
+`pytest_phases` 分别汇总测试主体（`call`）和准备、清理阶段。例如准备时跳过的测试可能有完整生命周期记录，同时没有 `call` 观察。候选主体通过但清理失败时，整项仍受阻。若基线整项通过，候选准备成功、主体失败且清理也失败，两侧记录完整且可比较时，把主体绿转红计为一项新增失败，门禁返回 `1`。同一测试的清理问题在阶段汇总和逐项记录中另有标记。公开摘要只显示固定阶段状态和计数。
+
+报告的原始 `status`、`counts` 与阶段事件保留按生命周期归并的观察。新版运行可以附带 `phase_decisions`，CLI 同时给出独立的 `comparison_verdict` 和 `comparison_counts`。新版 `summary` 能从带有足够阶段与比较证据的旧 ZIP 重判，若比较计数变化则附上 `observed_counts`。xfail、未完成执行、缺失阶段、不可比较的源码、输入、参数或诊断对照仍按证据约束处理。严格修复案例与重放仍使用各自的生命周期证据条件。
 
 ## 输出和退出码
 
@@ -413,9 +466,9 @@ reprolab project pin-test-contract ./passing.zip ./protected.json \
 
 `summary` 和 `check-summary` 接受 `--expect-before`、`--expect-after` 和 `--expect-plan-sha256`。版本可用完整 Git 提交，或用 `sha256:...` 绑定冻结源码。CI 应将期望版本和批准计划指纹从审批或工作流传入。旧绿报告若对不上候选会受阻，已确认失败仍保留。 如需时效门槛，可加 `--max-report-age-hours 24 --report-as-of 2026-11-18T12:00:00+08:00`，同一评估时间可用于事后独立核对。
 
-用 `summary --format json` 导出一份结构化摘要后，`check-summary --facts-file` 可同时对照 Markdown 与 JSON，两项结果分开。机器记录一致的情况下，已修改的文字仍需核对。
+用 `summary --format json` 导出结构化摘要后，`check-summary --facts-file` 可对照 Markdown 与 JSON。两项都必须完整匹配同一套重建结果才返回 `0`。若两项各自匹配不同格式，会同时显示 `markdown_format` 和 `facts_format`，整套材料返回 `2 summary_format_mismatch`。
 
-`summary --public-summary` 只包含执行器、范围计数、结果计数、门禁和证据指纹。原报告持有者可用 `check-summary --public-summary` 复核。公开摘要可单独供阅读，回放、逐例定位和离线验证需要原证据和相应计划。
+`summary --public-summary` 只提供比较类型、执行器、计数、门禁和摘要绑定字段。原报告持有者可用 `check-summary --public-summary` 复核。公开 Markdown 的门禁文字可能在不同策略下相同。需要核对具体策略时附上配套的公开 JSON，核对其中的 `gate.policy`。回放、逐例定位和离线验证需要原证据和相应计划。
 
 ### 有期限的已知故障豁免
 

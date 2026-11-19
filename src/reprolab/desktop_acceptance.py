@@ -11,8 +11,11 @@ from PySide6.QtWidgets import (
 )
 
 from .acceptance_plan import AcceptancePlan, baseline_pin, read_acceptance_plan, save_acceptance_plan
-from .project_comparison import comparison_scope_message
+from .project_comparison import ASSERTION_REVIEW_REASONS, comparison_scope_message
+from .project_pr_context import COMPARISON_LABELS
+from .project_pytest_phases import phase_overview_text
 from .project_review_summary import render_review_markdown
+from .project_run_scope import run_scope_lines
 from .replay_stability import MAX_ROUNDS, MIN_ROUNDS, STABILITY_SUMMARY
 from .replay_verification import _CONDITION_LABELS
 
@@ -29,6 +32,17 @@ _COMPARISON = {
     'selected_scope_passed': '所选范围通过', 'new_failures': '出现新增失败',
     'existing_failures_allowed': '策略允许原有失败', 'existing_failures': '仍有原有失败',
     'blocked_or_incomplete': '所选范围包含受阻项或执行未完成',
+}
+_ASSERTION_BASES = {
+    'site_changed': '断言位置变化，需复核',
+    'site_ambiguous': '重复断言的位置无法可靠对应，需复核',
+    'legacy_site_unverified': '旧断言指纹缺少位置出现记录，需复核',
+    'legacy_fingerprint_changed': '旧证据缺少断言位置，消息指纹不同，需复核',
+    'site_matched': '断言位置一致',
+    'legacy_site_unique': '旧指纹对应冻结共享测试中的唯一断言',
+    'site_unavailable': '断言位置不可用，依据失败阶段和类型',
+    'legacy_fingerprint_matched': '旧证据消息指纹一致，断言位置未知',
+    'legacy_phase_and_type': '旧证据仅有失败阶段和类型可比较',
 }
 _REPLAY = {
     'verified': '所选结果全部复现', 'different': '所选结果有变化', 'incomplete': '重放记录不足',
@@ -419,8 +433,12 @@ def _result_rows(summary):
     title = '回归门槛 · ' + _POLICIES[comparison['policy']]
     scope = summary.get('comparison_scope')
     details = _COMPARISON.get(comparison['reason'], '')
-    if scope:
+    if scope and scope['reason'] not in ASSERTION_REVIEW_REASONS.values():
         details = ' · '.join(filter(None, (details, comparison_scope_message(scope))))
+    if assertions := summary.get('assertion_comparison'):
+        counts = assertions['counts']
+        bases = [f'{label} {counts[basis]} 项' for basis, label in _ASSERTION_BASES.items() if basis in counts]
+        details = ' · '.join(filter(None, [details, *bases]))
     yield title, title, comparison['status'], details
     if baseline := summary.get('baseline_check'):
         details = {'matched': '基线源码及文件权限一致', 'different': '基线与计划锁定的快照不同',
@@ -635,8 +653,17 @@ class AcceptanceResultDialog(QDialog):
         runner = {'pytest': 'pytest', 'go': 'Go', 'vitest': 'Vitest'}[summary['runner']]
         unit = '个测试文件' if summary['runner'] == 'vitest' else '项测试'
         scope = QLabel(f'{runner} · 所选范围 {summary["selected_count"]} {unit}')
+        if run_scope := summary.get('run_scope'):
+            text = run_scope_lines(run_scope)
+            if phases := summary.get('pytest_phases'):
+                text.extend(phase_overview_text(phases))
+            scope.setText('\n'.join(text))
+            scope.setTextFormat(Qt.TextFormat.PlainText)
+            scope.setWordWrap(True)
         scope.setObjectName('acceptanceScope')
         overview.addWidget(scope)
+        if summary.get('comparison_type') in ('pr_head', 'pr_merge'):
+            overview.addWidget(QLabel(COMPARISON_LABELS[summary['comparison_type']]))
         layout.addLayout(overview, 1)
 
         totals = Counter(row[2] for row in checks)

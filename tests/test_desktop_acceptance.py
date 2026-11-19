@@ -17,11 +17,48 @@ from PySide6.QtWidgets import (
 from reprolab import desktop_project, project_review_summary
 from reprolab.acceptance_plan import AcceptancePlan, BaselinePin, read_acceptance_plan, save_acceptance_plan
 from reprolab.project_history import read_report_snapshot
-from reprolab.project_sessions import prepare_project, replay_project_report, run_project
+from reprolab.project_sessions import pack_project_report, prepare_project, replay_project_report, run_project
 from reprolab.replay_receipt import save_replay_receipt
 from reprolab.replay_stability import replay_stability
 from reprolab.runner import RunControl
 from reprolab.workspace import WORKTREE
+
+
+def test_imported_pytest_zip_requires_review_when_double_red_assertion_changes(window, tmp_path, monkeypatch):
+    repo = make_project(tmp_path / 'project')
+    (repo / 'tests/test_calc.py').write_text(
+        'from calc import answer\ndef test_answer(expected):\n'
+        '    assert answer() == expected\n    assert answer() < expected\n', encoding='utf-8')
+    state = prepare_project(repo, 'HEAD', WORKTREE, tmp_path / 'sessions')
+    original = run_project(state['directory'], tmp_path / 'original', confirmed=True)
+    evidence = tmp_path / 'evidence.zip'
+    pack_project_report(original['report_dir'], evidence)
+
+    bench = start_workbench(window)
+    assert bench.import_bundle(evidence)
+    wait_idle(bench)
+    assert '记录的断言位置不同' in bench.result_summary.text()
+    seen = []
+
+    def respond(dialog):
+        if dialog.objectName() == 'projectAcceptanceOptions':
+            policy = dialog.findChild(QComboBox, 'acceptancePolicy')
+            policy.setCurrentIndex(policy.findData('no-new-failures'))
+            dialog.findChild(QPushButton, 'acceptanceStart').click()
+        elif dialog.objectName() == 'projectAcceptanceResult':
+            headline = dialog.findChild(QLabel, 'acceptanceHeadline').text()
+            row = dialog.findChild(QTreeWidget, 'acceptanceChecks').topLevelItem(0)
+            seen.append((headline, row.text(0), row.text(1), row.text(2)))
+            dialog.reject()
+        return dialog.result()
+
+    monkeypatch.setattr(QDialog, 'exec', respond)
+    bench.acceptance_button.click()
+    wait_idle(bench)
+    [(headline, title, status, details)] = seen
+    assert (headline, title, status) == ('验收受阻', '回归门槛 · 允许原有失败', '受阻')
+    assert '断言位置变化，需复核 1 项' in details
+    assert bench.report['counts'] == {'baseline_failure': 1}
 
 
 def test_acceptance_preserves_hidden_targets_and_rechecks_saved_materials(window, tmp_path, monkeypatch):
@@ -170,7 +207,7 @@ def test_acceptance_exports_checked_report_scope_and_plan_to_ci(window, tmp_path
 
     def respond(dialog):
         assert dialog.objectName() == 'projectAcceptanceResult'
-        assert dialog.findChild(QLabel, 'acceptanceScope').text() == 'pytest · 所选范围 2 项测试'
+        assert '实际选择 2 项' in dialog.findChild(QLabel, 'acceptanceScope').text()
         counts = dialog.findChild(QLabel, 'acceptanceCheckCounts').text()
         assert '通过 2' in counts and '失败 0' in counts and '受阻 0' in counts
         feedback = dialog.findChild(QLabel, 'acceptanceExportError')

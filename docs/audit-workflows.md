@@ -63,10 +63,16 @@ reprolab project summary REPORT --acceptance-plan plan.json \
 
 ## 候选、行为与反例
 
-- `project compare-candidates REPO --before BASE --candidate LABEL_A SHA_A --candidate LABEL_B SHA_B --test ID --confirm-run --output EVIDENCE` 分别跑候选，也可改用 `--plan`。已有独立报告时用 `candidate-history --candidate LABEL_A REPORT_A --candidate LABEL_B REPORT_B`，它保留各候选的父引用、范围与条件。生成候选本身仍由调用方进行。
+- `project compare-candidates REPO --before BASE --candidate LABEL_A SHA_A --candidate LABEL_B SHA_B --test ID --confirm-run --output EVIDENCE` 分别跑候选，也可用 `--selection-file` 或 `--plan` 指定范围。已有独立报告或 ZIP 时用 `candidate-history --candidate LABEL_A REPORT_A --candidate LABEL_B REPORT_B`。两者使用相同的候选可比性判断，保留各候选的局部门禁、父引用、范围与条件。`same_selection` 核对成员，`same_requested_order` 核对请求列表顺序。pytest 的 `observed_orders` 按基线和候选分别列出已记录的启动序列及出处。进度日志与可核验的旧工作进程事件都可作为顺序证据。完整序列须跨候选、跨两版一致才支持可比通过。顺序不同或证据不足时保留局部结果并返回 `2`，同基线上已有独立失败时返回 `1` 并保留不可比原因。
 - `project minimize-input REPORT --test ID --confirm-run --output EVIDENCE` 试探更小的 JSON 值，并保留基线同一记录失败。用 `check-input-reduction EVIDENCE --source REPORT` 复核。命名样本键保持，内容可缩减。结果是操作范围内的局部缩减。
 - `project capture-behavior REPO --before A --after B --probe probe.py --policy shape --confirm-run --output EVIDENCE` 在两版运行同一份输出 JSON 的探针。shape 保留既有字段与类型，exact 也比较值。可改用 `--module NAME` 提取公开 Python API 与参数签名。`check-behavior` 从观察重算差异。通过的结构检查只覆盖已声明的接口。
 - `project mutation-check REPORT --source-path app.py --confirm-run --output EVIDENCE` 保持原测试，分别翻转应用源码的布尔字面量。见 `check-mutations`。记录一种可复核的测试有效性证据，位置及探针报告可查。
+
+候选历史的 `execution_order_status` 区分 `matched`、`different`、`unknown`、`not_applicable`、`not_comparable` 和 `insufficient_candidates`。其中 Go 和 Vitest 的文件或测试列表在此处没有可比的实际启动顺序。pytest 的不完整序列会保留已观察的启动列表。当可核对同一基线与成员，但实际顺序不同或未知时，可把结果的 `order_rerun.test_ids` 保存为 JSON 数组，再经 `compare-candidates --selection-file` 重跑。优先采用已观察的完整序列作为请求，缺少完整序列时使用标为 `requested_order` 的请求顺序。pytest 插件可能调整启动顺序，重跑后继续以保存的启动记录复核。即使顺序一致，其他运行条件也应查阅对应记录。顺序改变时出现结果变化只支持这组运行的观察，业务与环境根因仍需分别核对。
+
+pytest 候选比较也核对固定时钟、记录的业务样本和参数。每个候选列出保存的固定时钟及核验状态，并单独核对本报告内部的基线和候选输入。`scenario_comparison` 给出候选之间的场景结论。不同设置或样本、以及对齐所需的缺失记录，会在 `issues` 中指明报告、版本侧和相关测试。两边都没有配置固定时钟或采集业务样本时，这些字段显示 `not_recorded`，门禁按其他证据处理。参数化测试的同名 node ID 需要已记录的参数指纹支持。比较 JSON 仅展示样本的比较结论，保存的原始运行证据可能包含样本。
+
+复跑固定日期场景时，用 `compare-candidates --freeze-clock '2026-11-30T12:00:00+00:00' --timezone UTC --locale C` 为整组候选设置同一个 Python 时钟。复跑样本场景时，在测试的输入提供端固定同一份业务输入，由 `reprolab_input` 实际采集，再用 `scenario_comparison` 核对。涉及的测试列于 `tests_requiring_aligned_inputs`，复跑时保留核对所需的共同范围与顺序。未采集的外部值仍未知。
 
 ## 长期案例和受限材料
 

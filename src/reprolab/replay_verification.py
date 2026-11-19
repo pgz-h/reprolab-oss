@@ -4,8 +4,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from ._clock_control import compare_clock_controls
 from .environment import compare_environments
 from .project_history import _checked_report, _match_reference, report_reference
+from .project_input_control import recorded_inputs
 from .runtime_environment import compare_variable_records
 
 
@@ -177,16 +179,6 @@ def _summary(result):
     return label
 
 
-def _captured_inputs(report):
-    samples = {}
-    for entry in report['entries']:
-        for side in ('before', 'after'):
-            outcome = entry.get(side, {})
-            if outcome.get('input_digests') or outcome.get('input_error'):
-                samples[side, entry['test_id']] = (outcome.get('input_digests'), outcome.get('input_error'))
-    return samples
-
-
 def compare_replay_reports(source, replay):
     """Compare the inputs and outcomes of two already checked reports."""
     runner = source.get('runner', 'pytest')
@@ -207,8 +199,9 @@ def compare_replay_reports(source, replay):
         inputs['version_order'] = source.get('version_order') == replay.get('version_order')
     if source.get('snapshot_scope') or replay.get('snapshot_scope'):
         inputs['snapshot_scope'] = source.get('snapshot_scope') == replay.get('snapshot_scope')
-    if source.get('clock_control') or replay.get('clock_control'):
-        inputs['clock_control'] = source.get('clock_control') == replay.get('clock_control')
+    clock = compare_clock_controls(source.get('clock_control'), replay.get('clock_control'))
+    if clock is not None:
+        inputs['clock_control'] = clock
     if source.get('test_source_control') or replay.get('test_source_control'):
         inputs['test_source_control'] = source.get('test_source_control') == replay.get('test_source_control')
     if source.get('fixture_control') or replay.get('fixture_control'):
@@ -216,7 +209,7 @@ def compare_replay_reports(source, replay):
     if source.get('input_control') or replay.get('input_control'):
         inputs['input_control'] = source.get('input_control') == replay.get('input_control')
     if runner == replay_runner == 'pytest':
-        left, right = _captured_inputs(source), _captured_inputs(replay)
+        left, right = recorded_inputs(source), recorded_inputs(replay)
         if left or right:
             inputs['recorded_inputs'] = left == right
     result = {'kind': 'project_replay_verification', 'schema_version': 1, 'runner': runner,

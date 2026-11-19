@@ -1,6 +1,7 @@
 """Explicit pytest order controls for comparisons over saved evidence."""
 import hashlib
 import json
+from pathlib import Path
 import re
 
 
@@ -27,3 +28,50 @@ def order_control_completed(report):
     return (report['status'] != 'cancelled' and not report['counts'].get('inconclusive')
             and all(report[side]['status'] == 'completed' and report[side].get('execution_order') == order
                     for side in ('before', 'after')))
+
+
+def _legacy_started_tests(report, side):
+    from .project_sessions import _read
+
+    name = f'{side}.events.json'
+    try:
+        digest = report['persistence']['sha256'][name]
+        if not isinstance(digest, str):
+            return None
+        raw = _read(Path(report['report_dir']) / name, expected_sha256=digest)
+        if raw.get('mode') == 'run' and raw.get('requested_tests') == report['selected_tests']:
+            return raw.get('started_tests')
+    except (OSError, KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def observed_pytest_orders(report):
+    """Read start order from a checked report while its evidence directory is available."""
+    if report.get('runner', 'pytest') != 'pytest':
+        return {side: {'status': 'not_applicable', 'source': None, 'started_tests': None}
+                for side in ('before', 'after')}
+    orders = {}
+    selected = set(report['selected_tests'])
+    for side in ('before', 'after'):
+        run = report[side]
+        if run['status'] == 'not_run':
+            orders[side] = {'status': 'not_run', 'source': None, 'started_tests': []}
+            continue
+        progress = run.get('progress')
+        recorded = progress is not None and progress.get('status') == 'recorded'
+        started = run.get('execution_order') if recorded else None
+        source = 'progress_journal'
+        if started is None and (progress is None or recorded) and run.get('worker_record_complete') is True:
+            started, source = _legacy_started_tests(report, side), 'worker_events'
+        if (not isinstance(started, list) or not all(isinstance(test, str) for test in started)
+                or len(set(started)) != len(started) or not set(started) <= selected):
+            orders[side] = {'status': 'unknown', 'source': None, 'started_tests': None}
+            continue
+        complete = (run['status'] == 'completed' and run.get('worker_record_complete') is True
+                    and set(started) == selected
+                    and (progress is None or (progress.get('session_finished') is True
+                                              and progress.get('tail_ignored') is False
+                                              and progress.get('completed') == len(selected))))
+        orders[side] = {'status': 'complete' if complete else 'partial', 'source': source, 'started_tests': started}
+    return orders

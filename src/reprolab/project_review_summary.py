@@ -6,23 +6,44 @@ import json
 from pathlib import Path
 import re
 
-from .acceptance_plan import GATE_POLICIES, baseline_pin
+from .acceptance_plan import GATE_POLICIES, _unique_fields, baseline_pin
 from .project_archive import archive_preflight_text
-from .project_comparison import comparison_blocked, comparison_scope, comparison_verdict, pytest_order_difference, pytest_parameter_changes
+from .project_comparison import (
+    ASSERTION_REVIEW_REASONS, comparison_blocked, comparison_scope, comparison_verdict, comparison_view,
+    pytest_assertion_comparisons, pytest_order_difference, pytest_parameter_changes,
+)
 from .project_fixture import test_uses_changed_conftest
 from .project_input_control import input_changes, protected_input_check
 from .project_history import _checked_report, _match_reference, report_reference
+from .project_pr_context import comparison_type
+from .project_pytest_phases import PHASE_BLOCKERS, phase_observations
+from .project_run_scope import public_run_scope, pytest_run_scope
+from .project_sessions import saved_report_collection
 from .replay_verification import open_replay_evidence
 from .workspace import WORKTREE
 
 
 DETAIL_LIMIT = 20
+_HISTORICAL_FORMAT = 'cb56b04'
+_PRE_SCOPE_FORMAT = 'pre_scope'
+_PRE_PHASE_FORMAT = 'pre_phase'
 OUTCOMES = {
     'regression_detected': 'New failure',
     'inconclusive': 'Blocked',
     'baseline_failure': 'Existing failure',
     'improved': 'Improved',
     'regression_passed': 'Passed on both versions',
+}
+ASSERTION_BASES = {
+    'site_changed': 'Different recorded assertion sites · needs review',
+    'site_ambiguous': 'Repeated assertion sites cannot be aligned · needs review',
+    'legacy_site_unverified': 'Legacy assertion fingerprint lacks occurrence evidence · needs review',
+    'legacy_fingerprint_changed': 'Legacy evidence has differing message fingerprints · needs review',
+    'site_matched': 'Matching recorded assertion sites',
+    'legacy_site_unique': 'Legacy fingerprint matches a unique assertion in the frozen shared test',
+    'site_unavailable': 'Assertion site unavailable · phase and type only',
+    'legacy_fingerprint_matched': 'Legacy evidence · matching message fingerprints, assertion site unknown',
+    'legacy_phase_and_type': 'Legacy evidence · phase and type only',
 }
 VERDICTS = {
     'regression_detected': 'New failures detected',
@@ -31,6 +52,11 @@ VERDICTS = {
     'cancelled': 'Comparison cancelled',
 }
 RUNNERS = {'pytest': 'Python / pytest', 'go': 'Go', 'vitest': 'Vitest'}
+COMPARISONS = {
+    'direct': 'Direct version comparison',
+    'pr_head': 'PR change review · common ancestor to PR head',
+    'pr_merge': 'PR merge acceptance · target commit to verified merge result',
+}
 RUN_STATUS = {
     'completed': 'Completed',
     'cancelled': 'Cancelled',
@@ -298,11 +324,16 @@ def _as_of(value):
     return instant
 
 
-def review_summary(directory, *, include_test_ids=False, policy=None, expected_report=None,
+def review_summary(directory, **options):
+    """Summarize checked evidence and optionally enforce repair and replay requirements."""
+    return _review_summaries(directory, **options)['current']
+
+
+def _review_summaries(directory, *, include_test_ids=False, policy=None, expected_report=None,
                    required_improvements=(), required_vitest_cases=(), receipt=None, stability=None,
                    min_stability_rounds=None, plan=None, control=None, _reviewed_inputs=(),
-                   expected_sources=None, expected_plan_sha256=None, public=False, waiver_file=None, waiver_as_of=None, max_report_age=None, report_as_of=None, approval=(None, None, None)):
-    """Summarize checked evidence and optionally enforce repair and replay requirements."""
+                   expected_sources=None, expected_plan_sha256=None, public=False, waiver_file=None, waiver_as_of=None,
+                   max_report_age=None, report_as_of=None, approval=(None, None, None), include_historical=False):
     if plan is not None:
         if policy is not None or required_improvements or required_vitest_cases or min_stability_rounds is not None:
             raise ValueError('使用验收计划时，回归门槛、测试目标和最少轮数由计划指定。')
@@ -342,17 +373,20 @@ def review_summary(directory, *, include_test_ids=False, policy=None, expected_r
         policy = 'strict'
     with open_replay_evidence(directory, control=control) as source:
         report = _checked_report(source, control=control)
+        if expected_report is not None:
+            _match_reference(report, expected_report)
         if plan is not None and report.get('runner', 'pytest') != plan.runner:
             raise ValueError(f'验收计划使用 {plan.runner}，当前报告使用 {report.get("runner", "pytest")}。')
         protected = protected_input_check(report, plan) if plan and plan.protected_inputs is not None else None
         if protected and protected['plan_bound']:
             # In this evaluation the exact plan already accounts for input substitution.
             report = {key: value for key, value in report.items() if key != 'input_control'}
-        summary = _review_summary(report, include_test_ids, policy, expected_report, reviewed_inputs=_reviewed_inputs)
+        formats = ('current', _PRE_PHASE_FORMAT, _HISTORICAL_FORMAT) if include_historical else ('current',)
+        shared = {}
         if protected:
-            summary['protected_inputs'] = protected
+            shared['protected_inputs'] = protected
         if plan is not None:
-            summary['acceptance_plan_sha256'] = plan.fingerprint()
+            shared['acceptance_plan_sha256'] = plan.fingerprint()
         bindings = {}
         for side, expected in (expected_sources or {}).items():
             if expected.startswith('sha256:'):
@@ -362,7 +396,7 @@ def review_summary(directory, *, include_test_ids=False, policy=None, expected_r
                 actual = report.get(side + '_commit')
             bindings[side] = {'expected': expected, 'actual': actual, 'matches': expected == actual}
         if expected_plan_sha256 is not None:
-            actual_plan = summary.get('acceptance_plan_sha256')
+            actual_plan = shared.get('acceptance_plan_sha256')
             bindings['plan'] = {'expected': expected_plan_sha256, 'actual': actual_plan,
                                 'matches': expected_plan_sha256 == actual_plan}
         if evaluation_time is not None:
@@ -375,26 +409,48 @@ def review_summary(directory, *, include_test_ids=False, policy=None, expected_r
             bindings['age'] = {'expected': f'{report_as_of} · max {max_report_age}h',
                                'actual': actual, 'matches': fresh}
         if bindings:
-            summary['expected_bindings'] = bindings
+            shared['expected_bindings'] = bindings
         if waiver_file is not None:
             from .project_failure_waivers import check_failure_waivers
 
-            summary['failure_waivers'] = check_failure_waivers(report, waiver_file, waiver_as_of)
+            shared['failure_waivers'] = check_failure_waivers(report, waiver_file, waiver_as_of)
         if received_approval:
             from .project_attestation import required_review_approval
 
             document, key, actor = approval
-            summary['review_approval'] = required_review_approval(
+            shared['review_approval'] = required_review_approval(
                 report, plan, document=document, key=key, actor=actor, control=control)
-        if requirements:
-            _apply_requirements(summary, report, required_improvements, required_vitest_cases,
-                                receipt, stability, min_stability_rounds, plan=plan, control=control,
-                                reviewed_inputs=_reviewed_inputs)
-        return _public_summary(summary) if public else summary
+        if receipt is not None:
+            shared['receipt'] = _required_receipt(report['report_dir'], receipt, report['_report_sha256'], control=control)
+        elif plan is not None and plan.require_receipt:
+            shared['receipt'] = {'status': 'blocked', 'receipt_status': 'missing', 'issues': []}
+        if stability is not None:
+            shared['stability'] = _required_stability(report['report_dir'], stability, report_reference(report),
+                                                      min_stability_rounds, control=control)
+        elif plan is not None and min_stability_rounds is not None:
+            shared['stability'] = {'status': 'blocked', 'verification_status': 'missing',
+                                   'minimum_rounds': min_stability_rounds}
+        if plan is not None and plan.test_contract is not None:
+            from .project_test_contract import check_test_contract
+
+            shared['test_contract'] = check_test_contract(report, plan, control=control)
+        results = {}
+        for summary_format in formats:
+            summary = _review_summary(report, include_test_ids, policy, None,
+                                      reviewed_inputs=_reviewed_inputs, historical=summary_format == _HISTORICAL_FORMAT,
+                                      phase_evidence=summary_format == 'current')
+            if summary_format != _HISTORICAL_FORMAT and summary['runner'] == 'pytest':
+                summary['run_scope'] = pytest_run_scope(report, collection=saved_report_collection(report),
+                                                        include_omitted=include_test_ids and not public)
+            summary.update(shared)
+            if requirements:
+                _apply_requirements(summary, report, required_improvements, required_vitest_cases,
+                                    plan=plan, reviewed_inputs=_reviewed_inputs)
+            results[summary_format] = _public_summary(summary) if public else summary
+        return results
 
 
-def _apply_requirements(summary, report, improvements, vitest_cases, receipt, stability, minimum, *, plan, control, reviewed_inputs=()):
-    source = report['report_dir']
+def _apply_requirements(summary, report, improvements, vitest_cases, *, plan, reviewed_inputs=()):
     comparison = summary['gate']
     checks = [comparison['status']]
     if plan is not None and plan.baseline is not None:
@@ -412,29 +468,9 @@ def _apply_requirements(summary, report, improvements, vitest_cases, receipt, st
         targets = _required_passes(report, plan, summary.get('comparison_scope'))
         summary['required_passes'] = targets
         checks.extend(row['status'] for row in targets)
-    if protected := summary.get('protected_inputs'):
-        checks.append(protected['status'])
-    if plan is not None and plan.test_contract is not None:
-        from .project_test_contract import check_test_contract
-
-        summary['test_contract'] = check_test_contract(report, plan, control=control)
-        checks.append(summary['test_contract']['status'])
-    if receipt is not None:
-        summary['receipt'] = _required_receipt(source, receipt, report['_report_sha256'], control=control)
-    elif plan is not None and plan.require_receipt:
-        summary['receipt'] = {'status': 'blocked', 'receipt_status': 'missing', 'issues': []}
-    if 'receipt' in summary:
-        checks.append(summary['receipt']['status'])
-    if stability is not None:
-        summary['stability'] = _required_stability(source, stability, report_reference(report), minimum, control=control)
-    elif plan is not None and minimum is not None:
-        summary['stability'] = {'status': 'blocked', 'verification_status': 'missing', 'minimum_rounds': minimum}
-    if 'stability' in summary:
-        checks.append(summary['stability']['status'])
-    if approval := summary.get('review_approval'):
-        checks.append(approval['status'])
-    if waived := summary.get('failure_waivers'):
-        checks.append(waived['status'])
+    checks.extend(summary[key]['status'] for key in
+                  ('protected_inputs', 'test_contract', 'receipt', 'stability', 'review_approval', 'failure_waivers')
+                  if key in summary)
     if any(not binding['matches'] for binding in summary.get('expected_bindings', {}).values()):
         checks.append('blocked')
     status = 'failed' if 'failed' in checks else 'blocked' if 'blocked' in checks else 'passed'
@@ -444,7 +480,7 @@ def _apply_requirements(summary, report, improvements, vitest_cases, receipt, st
                        'reason': 'acceptance_requirements'}
 
 
-def _review_summary(report, include_test_ids, policy, expected_report, *, reviewed_inputs=()):
+def _review_summary(report, include_test_ids, policy, expected_report, *, reviewed_inputs=(), historical=False, phase_evidence=True):
     if expected_report is not None:
         _match_reference(report, expected_report)
     runner = report.get('runner', 'pytest')
@@ -452,14 +488,20 @@ def _review_summary(report, include_test_ids, policy, expected_report, *, review
         raise ValueError('此项目报告的执行器或判定无法生成审查摘要。')
     runs = {side: report[side]['status'] if report[side]['status'] in RUN_STATUS else 'unknown'
             for side in ('before', 'after')}
-    counts = _counts(report['counts'])
     cases = _counts(report['case_counts']) if runner == 'vitest' and report.get('vitest_report_version', 1) >= 2 else None
-    scope = comparison_scope(report, reviewed_inputs=reviewed_inputs)
+    # cb56b04 compared failure phase and type only and had no assertion-site section.
+    assertions = [] if historical else pytest_assertion_comparisons(report)
+    scope = comparison_scope(report, reviewed_inputs=reviewed_inputs, assertion_comparisons=assertions)
+    observed = report
+    if phase_evidence and not historical:
+        report, decisions = comparison_view(observed, scope)
+    counts = _counts(report['counts'])
     result = {
         'kind': 'project_review_summary',
         'schema_version': 1,
         'report_sha256': report['_report_sha256'],
         'runner': runner,
+        **({} if historical else {'comparison_type': comparison_type(report)}),
         'verdict': comparison_verdict(report, scope),
         'revisions': {side: _revision(report.get(side + '_commit'), report['source_sha256'][side])
                       for side in runs},
@@ -469,7 +511,12 @@ def _review_summary(report, include_test_ids, policy, expected_report, *, review
     }
     if scope:
         result['comparison_scope'] = {key: value for key, value in scope.items() if key != 'failure_changes'}
-        result['observed_verdict'] = report['status']
+        result['observed_verdict'] = observed['status']
+    if report is not observed:
+        result['observed_verdict'] = observed['status']
+        result['observed_counts'] = _counts(observed['counts'])
+    if runner == 'pytest' and phase_evidence and not historical:
+        result['pytest_phases'] = phase_observations(observed, decisions, include_test_ids=include_test_ids, limit=DETAIL_LIMIT)
     if discovery := report.get('discovery_audit'):
         result['discovery_audit'] = {key: value for key, value in discovery.items() if key != 'baseline_only'}
         result['discovery_audit']['baseline_only_count'] = len(discovery['baseline_only'])
@@ -479,6 +526,11 @@ def _review_summary(report, include_test_ids, policy, expected_report, *, review
         result['failure_change_count'] = len(changes)
         if include_test_ids:
             result['failure_changes'] = changes[:DETAIL_LIMIT]
+    if assertions:
+        result['assertion_comparison'] = {'counts': dict(Counter(row['basis'] for row in assertions))}
+        if include_test_ids:
+            result['assertion_comparison']['items'] = sorted(
+                assertions, key=lambda row: row['basis'] not in ASSERTION_REVIEW_REASONS)[:DETAIL_LIMIT]
     if runner == 'pytest' and include_test_ids and report.get('review_summary_version', 1) >= 2:
         from .project_failure_waivers import recorded_existing_failures
 
@@ -570,6 +622,8 @@ def _review_summary(report, include_test_ids, policy, expected_report, *, review
     if include_test_ids:
         display = _identity_label if version >= 2 else _label
         result['details'] = _details(report['entries'], include_cases=runner != 'go', display=display)
+        if not historical:
+            result['selected_tests'] = [display(identity) for identity in report['selected_tests'][:DETAIL_LIMIT]]
     if policy is not None:
         if policy not in GATE_POLICIES:
             raise ValueError('未知的项目回归门槛。')
@@ -590,20 +644,115 @@ def _revision_text(revision):
 
 
 def _public_summary(summary):
-    fields = ('runner', 'verdict', 'selected_count', 'counts', 'case_counts', 'report_sha256',
+    fields = ('runner', 'comparison_type', 'verdict', 'selected_count', 'counts', 'case_counts', 'report_sha256',
               'acceptance_plan_sha256', 'gate')
-    return {'kind': 'project_review_public_summary', 'schema_version': 1,
-            **{key: summary[key] for key in fields if key in summary}}
+    result = {'kind': 'project_review_public_summary', 'schema_version': 1,
+              **{key: summary[key] for key in fields if key in summary}}
+    if assertions := summary.get('assertion_comparison'):
+        result['assertion_comparison'] = {'counts': assertions['counts']}
+    if scope := summary.get('run_scope'):
+        result['run_scope'] = public_run_scope(scope)
+    if phases := summary.get('pytest_phases'):
+        result['pytest_phases'] = {key: phases[key] for key in
+                                   ('calls', 'lifecycle_issues', 'retained_call_regressions', 'blocked_call_regressions')}
+    return result
 
 
-def _render_public_markdown(summary):
-    lines = ['### ReproLab public comparison summary', '',
-             f'**{VERDICTS[summary["verdict"]]}** · {RUNNERS[summary["runner"]]}',
-             f'Selected scope · {summary["selected_count"]}', '',
-             '| Outcome | Count |', '| --- | ---: |']
-    lines.extend(f'| {name} | {summary["counts"].get(key, 0)} |' for key, name in OUTCOMES.items())
+def _assertion_markdown(summary):
+    if not (assertions := summary.get('assertion_comparison')):
+        return []
+    counts = assertions['counts']
+    lines = ['', '**Tests failing with AssertionError on both versions**', '']
+    lines.extend(f'- {label} · {counts[basis]}' for basis, label in ASSERTION_BASES.items() if basis in counts)
+    lines.extend(f'- {_code(_identity_label(row["test_id"]))} · {ASSERTION_BASES[row["basis"]]}'
+                 for row in assertions.get('items', ()))
+    return lines
+
+
+def _run_scope_markdown(scope):
+    discovery, recommendations = scope['discovery'], scope['recommendations']
+
+    def number(value, accuracy):
+        return 'unknown' if value is None else f'at least {value}' if accuracy == 'at_least' else str(value)
+
+    status = {'complete': 'complete', 'partial': 'partial', 'truncated': 'truncated',
+              'partial_truncated': 'partial and truncated', 'unknown': 'completeness unknown'}[discovery['status']]
+    line = ('- Discovery · unknown' if discovery['count'] is None
+            else f'- Discovery · {number(discovery["count"], discovery["accuracy"])} tests · {status}')
+    if path := discovery.get('path'):
+        line += ' · ' + _code(_label(path))
+    lines = [line]
+    if recommendations['status'] == 'recorded':
+        lines.append(f'- Recommendations · {recommendations["count"]} recorded, '
+                     f'{recommendations["selected_count"]} selected, {recommendations["omitted_count"]} omitted'
+                     + (' · outcomes of omitted tests unknown' if recommendations['omitted_count'] else ''))
+    else:
+        lines.append('- Recommendations · unknown')
+    for side, label in (('before', 'Baseline execution'), ('after', 'Candidate execution')):
+        run = scope['execution'][side]
+        started, finished = (number(run[key], run['accuracy']) for key in ('started', 'finished'))
+        line = f'- {label} · {RUN_STATUS.get(run["status"], "Unknown")} · started {started}, finished records {finished}'
+        if run['not_started']:
+            line += f', {run["not_started"]} did not start'
+        lines.append(line)
+    if omitted := recommendations.get('omitted_tests'):
+        lines.extend(['', '**Omitted recommendations**', ''])
+        lines.extend(f'- {_code(_identity_label(item["test_id"]))} · {_code(_label(item["reason"]))}'
+                     for item in omitted)
+        if remaining := recommendations['omitted_count'] - len(omitted):
+            lines.append(f'- {remaining} additional omitted recommendations in the saved discovery record.')
+    return lines
+
+
+def _phase_markdown(phases):
+    lines = ['', '**Pytest test body and lifecycle observations**', '']
+    labels = {'passed': 'passed', 'failed': 'failed', 'skipped': 'skipped',
+              'xfail_marked': 'marked xfail', 'not_observed': 'no call recorded'}
+    for side, title in (('before', 'Baseline'), ('after', 'Candidate')):
+        body = phases['calls'][side]
+        lifecycle = phases['lifecycle_issues'][side]
+        line = f'- {title} call · ' + ', '.join(f'{label} {body[key]}' for key, label in labels.items() if key in body)
+        if lifecycle:
+            line += ' · ' + ', '.join(f'{name.replace("_", " ")} {count}' for name, count in lifecycle.items())
+        lines.append(line)
+    if retained := phases['retained_call_regressions']:
+        lines.append(f'- {retained} new call failure(s) retained with a teardown failure on the same test.')
+    if blocked := phases['blocked_call_regressions']:
+        lines.append(f'- {blocked} call pass-to-fail observation(s) with teardown failure require review.')
+    for row in phases.get('details', ()):
+        phases_text = (' / '.join(f'{name} {outcome.replace("_", " ")}' for name, outcome in row[side].items())
+                       for side in ('before', 'after'))
+        left, right = phases_text
+        lines.append(f'- {_code(_identity_label(row["test_id"]))} · baseline {left} → candidate {right}')
+        if decision := row.get('comparison'):
+            if decision['status'] == 'blocked':
+                reason = decision['reason']
+                lines.append(f'  · Needs review · {PHASE_BLOCKERS.get(reason, reason.replace("_", " "))}')
+    if phases.get('omitted'):
+        lines.append(f'- {phases["omitted"]} additional phase detail(s) in the full report.')
+    return lines
+
+
+def _render_public_markdown(summary, *, historical=False):
+    lines = ['### ReproLab public comparison summary', '']
+    if not historical:
+        lines.append(COMPARISONS[summary.get('comparison_type', 'direct')])
+    lines.extend([f'**{VERDICTS[summary["verdict"]]}** · {RUNNERS[summary["runner"]]}',
+                  f'Selected scope · {summary["selected_count"]}'])
+    gate_line = None
     if gate := summary.get('gate'):
-        lines.extend(['', f'**CI gate** · {gate["status"].title()} · {_code(gate["reason"])}'])
+        gate_line = f'**CI gate** · {gate["status"].title()} · {_code(gate["reason"])}'
+    if not historical and gate_line:
+        lines.extend(['', gate_line])
+    if scope := summary.get('run_scope'):
+        lines.extend(['', *_run_scope_markdown(scope)])
+    lines.extend(['', '| Outcome | Count |', '| --- | ---: |'])
+    lines.extend(f'| {name} | {summary["counts"].get(key, 0)} |' for key, name in OUTCOMES.items())
+    lines.extend(_assertion_markdown(summary))
+    if phases := summary.get('pytest_phases'):
+        lines.extend(_phase_markdown(phases))
+    if historical and gate_line:
+        lines.extend(['', gate_line])
     if plan := summary.get('acceptance_plan_sha256'):
         lines.extend(['', f'Acceptance plan SHA-256 · {_code(plan)}'])
     lines.extend(['', f'Report SHA-256 · {_code(summary["report_sha256"])}',
@@ -611,16 +760,23 @@ def _render_public_markdown(summary):
     return '\n'.join(lines) + '\n'
 
 
-def render_review_markdown(summary):
+def render_review_markdown(summary, *, historical=False):
     if summary.get('kind') == 'project_review_public_summary':
-        return _render_public_markdown(summary)
+        return _render_public_markdown(summary, historical=historical)
     project_dir = summary.get('vitest_project_dir')
     install = summary.get('vitest_install')
-    lines = [
-        '### ReproLab comparison',
-        '',
-        f'**{VERDICTS[summary["verdict"]]}** · {RUNNERS[summary["runner"]]}',
-        '',
+    verdict = VERDICTS[summary['verdict']]
+    heading = verdict if historical else COMPARISONS[summary.get('comparison_type', 'direct')]
+    lines = ['### ReproLab comparison', '', f'**{heading}** · {RUNNERS[summary["runner"]]}', '']
+    gate_line = None
+    if gate := summary.get('gate'):
+        suffix = ' · Existing failures allowed by policy' if gate['reason'] == 'existing_failures_allowed' else ''
+        gate_line = f'**CI gate** · {gate["status"].title()} ({_code(gate["policy"])}){suffix}'
+    if not historical:
+        if gate_line:
+            lines.extend([gate_line, ''])
+        lines.append(f'**{verdict}**')
+    lines.extend([
         f'- Baseline · {_revision_text(summary["revisions"]["before"])} · '
         + RUN_STATUS.get(summary['runs']['before'], 'Unknown'),
         f'- Candidate · {_revision_text(summary["revisions"]["after"])} · '
@@ -629,10 +785,17 @@ def render_review_markdown(summary):
         + ('test files' if summary['runner'] == 'vitest' else 'tests')
         + (f' in {_code(project_dir)}' if project_dir else '')
         + (f' · npm workspace root {_code(install["root"])}' if install else ''),
+    ])
+    if selected := summary.get('selected_tests'):
+        lines.append('- Selected · ' + ', '.join(_code(name) for name in selected)
+                     + (' …' if len(selected) < summary['selected_count'] else ''))
+    if run_scope := summary.get('run_scope'):
+        lines.extend(_run_scope_markdown(run_scope))
+    lines.extend([
         '',
         '| Outcome | ' + ('Files | Cases |' if 'case_counts' in summary else 'Count |'),
         '| --- | ---: |' + (' ---: |' if 'case_counts' in summary else ''),
-    ]
+    ])
     labels = OUTCOMES
     if summary.get('comparison_scope', {}).get('divergent_outcomes'):
         labels = {**OUTCOMES, 'improved': 'Observed fail-to-pass', 'regression_detected': 'Observed pass-to-fail'}
@@ -641,6 +804,8 @@ def render_review_markdown(summary):
         if 'case_counts' in summary:
             cells.append(str(summary['case_counts'].get(status, 0)))
         lines.append('| ' + ' | '.join(cells) + ' |')
+    if phases := summary.get('pytest_phases'):
+        lines.extend(_phase_markdown(phases))
     if failures := summary.get('new_failure_tests'):
         observed = summary.get('comparison_scope', {}).get('divergent_outcomes')
         lines.extend(['', '**Observed pass-to-fail tests**' if observed else '**Newly failing tests**', ''])
@@ -691,6 +856,7 @@ def render_review_markdown(summary):
             before, after = (' + '.join(f'{row["phase"]} / {row["type"]}' for row in change[side])
                              for side in ('before', 'after'))
             lines.append(f'- {name} · {_code(_label(before))} → {_code(_label(after))}')
+    lines.extend(_assertion_markdown(summary))
     if resources := summary.get('pytest_resources'):
         lines.extend(['', '**Pytest worker resources**', ''])
         for side, record in resources.items():
@@ -772,9 +938,8 @@ def render_review_markdown(summary):
     if order := summary.get('pytest_order_difference'):
         lines.extend(['', f'**Pytest execution order differs.** {order["positions_changed"]} of '
                       f'{order["common_tests"]} common tests changed position. See the execution report for the sequences.'])
-    if gate := summary.get('gate'):
-        suffix = ' · Existing failures allowed by policy' if gate['reason'] == 'existing_failures_allowed' else ''
-        lines.extend(['', f'**CI gate** · {gate["status"].title()} ({_code(gate["policy"])}){suffix}'])
+    if historical and gate_line:
+        lines.extend(['', gate_line])
     if plan_digest := summary.get('acceptance_plan_sha256'):
         lines.extend(['', f'Acceptance plan SHA-256 · {_code(plan_digest)}'])
     if comparison := summary.get('comparison_gate'):
@@ -896,44 +1061,71 @@ def render_review_markdown(summary):
     return '\n'.join(lines) + '\n'
 
 
-def markdown_matches(markdown, location):
-    """Compare a bounded read with Markdown generated from checked evidence."""
+def _matching_markdown(location, candidates):
     path = Path(location).expanduser()
     if path.is_symlink() or not path.is_file():
         raise ValueError('请选择普通 Markdown 摘要文件。')
-    expected = markdown.encode('utf-8')
     # Accept CRLF while bounding reads to the largest equivalent representation.
-    limit = len(expected) + expected.count(b'\n')
+    limit = max(len(expected) + expected.count(b'\n') for expected in candidates.values())
     with path.open('rb') as stream:
         received = stream.read(limit + 1)
-    return len(received) <= limit and received.replace(b'\r\n', b'\n') == expected
+    if len(received) > limit:
+        return None
+    received = received.replace(b'\r\n', b'\n')
+    return next((name for name, expected in candidates.items() if received == expected), None)
+
+def markdown_matches(markdown, location):
+    """Compare a bounded read with Markdown generated from checked evidence."""
+    return _matching_markdown(location, {'current': markdown.encode('utf-8')}) == 'current'
 
 
-def check_review_markdown(summary, location, *, facts=None):
-    expected = render_review_markdown(summary)
-    same = markdown_matches(expected, location)
+def check_review_summary(directory, location, *, facts=None, **options):
+    """Check every supplied artifact against a complete supported reconstruction."""
+    summaries = _review_summaries(directory, **options, include_historical=True)
+    current = summaries['current']
+    previous = summaries[_PRE_PHASE_FORMAT]
+    if 'run_scope' in previous:
+        summaries[_PRE_SCOPE_FORMAT] = {key: value for key, value in previous.items() if key != 'run_scope'}
+    markdown = {name: render_review_markdown(summary, historical=name == _HISTORICAL_FORMAT).encode('utf-8')
+                for name, summary in summaries.items()}
+    markdown_format = _matching_markdown(location, markdown)
     result = {'kind': 'project_review_summary_check', 'schema_version': 1,
-              'status': 'consistent' if same else 'different',
-              'report_sha256': summary['report_sha256'],
-              'expected_markdown_sha256': hashlib.sha256(expected.encode('utf-8')).hexdigest()}
+              'status': 'consistent' if markdown_format else 'different',
+              'report_sha256': current['report_sha256'],
+              'expected_markdown_sha256': hashlib.sha256(markdown['current']).hexdigest()}
+    if markdown_format:
+        result['markdown_format'] = markdown_format
+        result['matched_markdown_sha256'] = hashlib.sha256(markdown[markdown_format]).hexdigest()
+    if markdown_format == _HISTORICAL_FORMAT and 'gate' in summaries[_HISTORICAL_FORMAT]:
+        result['historical_gate'] = summaries[_HISTORICAL_FORMAT]['gate']
+    if markdown_format in (_PRE_PHASE_FORMAT, _PRE_SCOPE_FORMAT) and previous.get('gate') != current.get('gate'):
+        result['historical_gate'] = previous['gate']
     if facts is not None:
         path = Path(facts).expanduser()
-        if not path.is_file() or path.is_symlink() or path.stat().st_size > 16 * 1024 * 1024:
+        limit = 16 * 1024 * 1024
+        if not path.is_file() or path.is_symlink() or path.stat().st_size > limit:
             raise ValueError('请选择不超过 16 MiB 的普通摘要 JSON。')
         with path.open('rb') as stream:
-            try:
-                supplied = json.loads(stream.read(16 * 1024 * 1024 + 1))
-            except (ValueError, RecursionError, UnicodeError) as exc:
-                raise ValueError('收到的摘要 JSON 无效。') from exc
+            raw = stream.read(limit + 1)
+        try:
+            if len(raw) > limit:
+                raise ValueError('摘要 JSON 超过 16 MiB。')
+            canonical = json.dumps(json.loads(raw, object_pairs_hook=_unique_fields), sort_keys=True, ensure_ascii=True)
+        except (ValueError, RecursionError, UnicodeError) as exc:
+            raise ValueError('收到的摘要 JSON 无效。') from exc
         result['markdown_status'] = result['status']
-        same_facts = (json.dumps(supplied, sort_keys=True, ensure_ascii=True)
-                      == json.dumps(summary, sort_keys=True, ensure_ascii=True))
-        result['facts_status'] = 'consistent' if same_facts else 'different'
-        if result['facts_status'] != 'consistent':
+        facts_format = next((name for name, summary in summaries.items()
+                             if canonical == json.dumps(summary, sort_keys=True, ensure_ascii=True)), None)
+        result['facts_status'] = 'consistent' if facts_format else 'different'
+        if facts_format:
+            result['facts_format'] = facts_format
+        if not facts_format or facts_format != markdown_format:
             result['status'] = 'different'
+        if markdown_format and facts_format and markdown_format != facts_format:
+            result['reason'] = 'summary_format_mismatch'
     for field in ('acceptance_plan_sha256', 'gate'):
-        if field in summary:
-            result[field] = summary[field]
+        if field in current:
+            result[field] = current[field]
     return result
 
 

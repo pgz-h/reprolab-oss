@@ -38,7 +38,7 @@ from .recipes import repository_root
 from .project_sessions import (
     check_project_report, collect_project, list_projects, pack_project_report,
     prepare_project, prepare_project_ai, project_replay_settings, read_project, replay_project_report,
-    run_project, unpack_project_report,
+    run_project, saved_report_collection, unpack_project_report,
 )
 from .workspace import WORKTREE
 from .persistence import atomic_write, save_json
@@ -53,8 +53,12 @@ from .desktop_selection import SelectionReviewDialog
 from .project_presets import list_presets, read_preset, save_preset, delete_preset
 from .project_archive import archive_preflight_text
 from .project_comparison import (
-    DIVERGENT_OUTCOME_LABELS, comparison_scope, comparison_scope_message, comparison_verdict, pytest_order_difference,
+    DIVERGENT_OUTCOME_LABELS, comparison_scope, comparison_scope_message, comparison_verdict, comparison_view,
+    pytest_order_difference,
 )
+from .project_pr_context import COMPARISON_LABELS, comparison_type
+from .project_pytest_phases import phase_observations, phase_overview_text, phase_pair_text
+from .project_run_scope import pytest_run_scope, run_scope_lines
 from .pytest_profile import describe_pytest_rules
 from .project_diagnostics import (
     VITEST_OFFLINE_CACHE_MISSING, entry_action, entry_guidance, group_project_failures,
@@ -1524,6 +1528,7 @@ class ProjectWorkbench(QWidget):
         self.select_visible_button = _button('选中可见', self.select_visible_tests)
         self.only_visible_button = _button('仅选可见', self.select_only_visible_tests)
         self.select_recommended_button = _button('只选推荐', self.select_recommended_tests)
+        self.select_recommended_button.setToolTip('按静态源码与已收集的 fixture 绑定勾选推荐项，可继续手动调整。')
         self.clear_tests_button = _button('清空', self.clear_selected_tests)
         self.test_scope = QComboBox()
         self.test_scope.addItem('全部文件与目录', '')
@@ -1608,6 +1613,14 @@ class ProjectWorkbench(QWidget):
         self.result_summary.setMaximumHeight(28)
         self.result_summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         body.addWidget(self.result_summary)
+        self.result_run_scope = _label()
+        self.result_run_scope.setObjectName('projectRunScope')
+        self._omitted_recommendations = {}
+        self.omitted_recommendations_button = _button('查看未纳入的推荐', self._show_omitted_recommendations)
+        self.result_scope_panel = _row(self.result_run_scope, self.omitted_recommendations_button)
+        self.result_scope_panel.layout().setStretch(0, 1)
+        self.result_scope_panel.hide()
+        body.addWidget(self.result_scope_panel)
         self.review_panel = QWidget()
         review_layout = QVBoxLayout(self.review_panel)
         review_layout.setContentsMargins(0, 0, 0, 0)
@@ -2148,6 +2161,7 @@ class ProjectWorkbench(QWidget):
         self.result_filter.setCurrentIndex(0)
         self.test_count_label.setText('Python 已改变；请重新实际发现测试，取得此环境下的完整测试 ID。')
         self.result_summary.setText('Python 已改变 · 尚无当前环境的回归结果')
+        self.result_scope_panel.hide()
         self._clear_diagnostics()
         self.ai_button.setText('AI 验收计划…')
         self.session_label.setText('固定源码已保留 · Python 已改变，请重新发现测试')
@@ -2196,6 +2210,7 @@ class ProjectWorkbench(QWidget):
         self.change_count.setText('尚未冻结版本')
         self.test_count_label.setText('尚未实际发现测试；请先准备项目。')
         self.result_summary.setText('尚无项目回归报告')
+        self.result_scope_panel.hide()
         self.result_count_label.setText('尚无检查结果')
         self.history_label.setText('项目会话保存输入、已发现测试和每次运行记录；重开后可以继续。')
         self.ai_button.setText('AI 验收计划…')
@@ -3189,11 +3204,10 @@ class ProjectWorkbench(QWidget):
         return self._start(action, shown, '正在实际发现测试（会执行可信项目的测试收集代码）…', operation='collect')
 
     def _recommendation(self, test_id):
-        sources = ((self.collection or {}).get('recommendations') or {},
-                   (self.state or {}).get('recommendations') or {})
-        for mapping in sources:
-            if not isinstance(mapping, dict):
-                continue
+        mapping = (self.collection or {}).get('recommendations')
+        if not isinstance(mapping, dict):
+            mapping = (self.state or {}).get('recommendations')
+        if isinstance(mapping, dict):
             for candidate in (test_id, test_id.split('[', 1)[0], test_id.split('::', 1)[0]):
                 if mapping.get(candidate):
                     return str(mapping[candidate])
@@ -3247,7 +3261,7 @@ class ProjectWorkbench(QWidget):
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(0, Qt.CheckState.Checked if test_id in selected else Qt.CheckState.Unchecked)
             item.setToolTip(0, test_id)
-            item.setToolTip(1, reason or '没有直接文件关联；仍可选择运行。')
+            item.setToolTip(1, reason or '没有静态推荐；仍可选择运行。')
             self.tests_tree.addTopLevelItem(item)
         self.tests_tree.setUpdatesEnabled(True)
         self._changing_checks = False
@@ -3427,7 +3441,7 @@ class ProjectWorkbench(QWidget):
                     for index in range(self.tests_tree.topLevelItemCount())
                     if self.tests_tree.topLevelItem(index).data(1, _ROLE)}
         if self._check_ids(selected) and not selected:
-            self.status_label.setText('没有直接关联的推荐测试。可搜索并手动选择，或选中全部可见测试。')
+            self.status_label.setText('没有静态推荐测试。可搜索并手动选择，或选中全部可见测试。')
 
     def clear_selected_tests(self):
         self._check_ids(set())
@@ -3579,6 +3593,7 @@ class ProjectWorkbench(QWidget):
                               for test in selected}
         self._render_results(list(self._live_entries.values()), live=True)
         self.result_summary.setText(f'正在运行 {len(selected)} 个测试 · 前后版本各一个进程')
+        self.result_scope_panel.hide()
         self.tabs.setCurrentIndex(2)
         def action(control):
             from .acceptance_plan import PlanSelectionBlocked
@@ -3638,6 +3653,8 @@ class ProjectWorkbench(QWidget):
                     _duration(before.get('duration_seconds')) + ' / ' + _duration(after.get('duration_seconds'))])
             item.setData(0, _ROLE, entry)
             item.setToolTip(0, test_id)
+            if entry.get('observed_status') == 'inconclusive':
+                item.setText(1, '主体新增失败 · 同项清理失败')
             if status in _COLOR:
                 item.setForeground(1, QColor(_COLOR[status]))
             self.results_tree.addTopLevelItem(item)
@@ -3675,14 +3692,18 @@ class ProjectWorkbench(QWidget):
         self._set_inputs_expanded(False)
         self._live_entries = {}
         self.results_scroll.verticalScrollBar().setValue(0)
-        entries = report.get('entries') or []
         self._load_diagnostics(report)
         self.result_search.clear()
         self.result_filter.setCurrentIndex(0)
-        counts = Counter(entry.get('status', 'inconclusive') for entry in entries if isinstance(entry, dict))
         scope = comparison_scope(report)
-        status = comparison_verdict(report, scope)
+        compared, decisions = comparison_view(report, scope)
+        entries = compared.get('entries') or []
+        counts = Counter(entry.get('status', 'inconclusive') for entry in entries if isinstance(entry, dict))
+        status = comparison_verdict(compared, scope)
         headline = _RUN_STATUS.get(status, _STATUS.get(status, status))
+        purpose = comparison_type(report)
+        if purpose != 'direct':
+            headline = f'{COMPARISON_LABELS[purpose]} · {len(report["selected_tests"])} 项测试\n{headline}'
         if scope:
             headline += '\n' + comparison_scope_message(scope)
         if (report.get('collection') or {}).get('partial') or (report.get('collection') or {}).get('truncated'):
@@ -3692,6 +3713,12 @@ class ProjectWorkbench(QWidget):
         if order := pytest_order_difference(report):
             headline += f'\n两版实际执行顺序不同 · {order["positions_changed"]} 个共同测试位置变化。详见 HTML 报告。'
         self.result_summary.setText(headline)
+        scope_record = pytest_run_scope(report, collection=saved_report_collection(report), include_omitted=True)
+        phase_text = phase_overview_text(phase_observations(report, decisions))
+        self.result_run_scope.setText('\n'.join([*run_scope_lines(scope_record), *phase_text]))
+        self._omitted_recommendations = scope_record['recommendations']
+        self.omitted_recommendations_button.setVisible(bool(self._omitted_recommendations.get('omitted_tests')))
+        self.result_scope_panel.show()
         interrupted = [(label, report.get(side) or {}) for side, label in (('before', '基线'), ('after', '候选'))
                        if (report.get(side) or {}).get('progress') and (report.get(side) or {}).get('status') in ('timed_out', 'cancelled', 'worker_error')]
         self.run_progress_panel.setVisible(bool(interrupted))
@@ -3719,6 +3746,28 @@ class ProjectWorkbench(QWidget):
             self.status_label.setText(self.status_label.text() + '\n' + view_warning)
         self._queue_review_progress()
         self._sync_controls()
+
+    def _show_omitted_recommendations(self):
+        recommendations = self._omitted_recommendations
+        rows = recommendations.get('omitted_tests', ())
+        if not rows:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle('未纳入的推荐测试')
+        dialog.resize(720, 390)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(_label(f'{recommendations["omitted_count"]} 项推荐未纳入本轮，结果未知。'))
+        text = '\n\n'.join(row['test_id'] + '\n' + row['reason'] for row in rows)
+        if remaining := recommendations['omitted_count'] - len(rows):
+            text += f'\n\n另有 {remaining} 项，见保存的发现记录。'
+        detail = _text_view()
+        detail.setPlainText(text)
+        detail.setObjectName('omittedRecommendationDetails')
+        layout.addWidget(detail)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def _filter_results(self, *_):
         from .project_review_summary import _identity_label
@@ -4063,6 +4112,8 @@ class ProjectWorkbench(QWidget):
         summary = [str(entry.get('test_id') or ''),
             '实际两版：基线 ' + _STATUS.get((entry.get('before') or {}).get('status'), '未执行')
             + ' → 变更后 ' + _STATUS.get((entry.get('after') or {}).get('status'), '未执行')]
+        if any((entry.get(side) or {}).get('phases') for side in ('before', 'after')):
+            summary.extend(phase_pair_text(entry))
         error = (entry.get('after') or {}).get('exception') or (entry.get('before') or {}).get('exception') or {}
         if isinstance(error, dict) and error:
             summary.extend([str(error.get('type') or ''), str(error.get('message') or '')])

@@ -145,6 +145,103 @@ def test_small_window_keeps_project_inputs_and_actions_readable(window):
         assert widget.height() >= widget.minimumSizeHint().height()
 
 
+def test_project_recommendation_chain_keeps_recollection_and_manual_selection_distinct(window, tmp_path):
+    from test_project_review_audit import freeze as commit, write
+
+    repo = tmp_path / 'receipt-project'
+    repo.mkdir()
+    git(repo, 'init', '-b', 'main')
+    write(repo, 'money.py', 'VALUE, FLOOR = "5.00", -3\n')
+    write(repo, 'receipt.py', 'from money import VALUE\n')
+    write(repo, 'test_receipt.py', 'from receipt import VALUE\ndef test_decimals(): assert VALUE == "5.00"\n')
+    write(repo, 'test_discount.py', 'from money import FLOOR\ndef test_floor(): assert FLOOR == 0\n')
+    write(repo, 'test_catalog.py', 'def test_slug(): assert "SKU".lower() == "sku"\n')
+    commit(repo)
+    write(repo, 'money.py', 'VALUE, FLOOR = "5", 0\n')
+    bench = freeze(window, repo)
+    assert bench.discover()
+    wait_project(bench)
+    catalog, discount, receipt = (f'test_{file}.py::test_{test}' for file, test in
+                                  (('catalog', 'slug'), ('discount', 'floor'), ('receipt', 'decimals')))
+    items = {bench.tests_tree.topLevelItem(i).text(0): bench.tests_tree.topLevelItem(i)
+             for i in range(bench.tests_tree.topLevelItemCount())}
+    assert '直接静态导入' in items[discount].text(1)
+    assert 'test_receipt.py:1 → receipt.py:1 → money.py' in items[receipt].toolTip(1)
+    assert items[catalog].text(1) == ''
+    assert bench.selected_test_ids() == [discount, receipt]
+    items[receipt].setCheckState(0, Qt.CheckState.Unchecked)
+    assert bench.discover()
+    wait_project(bench)
+    assert bench.selected_test_ids() == [discount]
+    bench.select_recommended_button.click()
+    assert bench.selected_test_ids() == [discount, receipt]
+    QTest.mouseClick(bench.run_button, Qt.MouseButton.LeftButton)
+    wait_project(bench)
+    assert bench.report['selected_tests'] == [discount, receipt]
+    assert bench.report['counts'] == {'improved': 1, 'regression_detected': 1}
+
+
+def test_project_fixture_recommendation_keeps_other_tests_in_the_file_unselected(window, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QPlainTextEdit
+    from test_project_review_audit import freeze as commit, write
+
+    repo = tmp_path / 'fixture-project'
+    repo.mkdir()
+    git(repo, 'init', '-b', 'main')
+    write(repo, 'money.py', 'PRICE, FLOOR = "5.00", -3\n')
+    write(repo, 'tests/conftest.py',
+          'import pytest\nfrom money import PRICE\n'
+          '@pytest.fixture\ndef receipt_text(): return PRICE\n'
+          '@pytest.fixture\ndef catalog_item(): return "SKU"\n')
+    write(repo, 'tests/test_customer.py',
+          'def test_receipt(receipt_text): assert receipt_text == "5.00"\n'
+          'def test_catalog(catalog_item): assert catalog_item == "SKU"\n')
+    write(repo, 'test_discount.py', 'from money import FLOOR\ndef test_floor(): assert FLOOR == 0\n')
+    commit(repo)
+    write(repo, 'money.py', 'PRICE, FLOOR = "5", 0\n')
+    bench = freeze(window, repo)
+    discount = 'test_discount.py::test_floor'
+    receipt = 'tests/test_customer.py::test_receipt'
+    catalog = 'tests/test_customer.py::test_catalog'
+    assert set(bench.state['recommendations']) == {discount}
+    assert bench.discover()
+    wait_project(bench)
+    items = {bench.tests_tree.topLevelItem(i).text(0): bench.tests_tree.topLevelItem(i)
+             for i in range(bench.tests_tree.topLevelItemCount())}
+    assert 'receipt_text' in items[receipt].toolTip(1)
+    assert items[catalog].text(1) == ''
+    assert bench.selected_test_ids() == [discount, receipt]
+    items[receipt].setCheckState(0, Qt.CheckState.Unchecked)
+    assert bench.discover()
+    wait_project(bench)
+    assert bench.selected_test_ids() == [discount]
+    QTest.mouseClick(bench.run_button, Qt.MouseButton.LeftButton)
+    wait_project(bench)
+    assert bench.report['selected_tests'] == [discount]
+    assert '发现 3 项（完整）' in bench.result_run_scope.text()
+    assert '已记录推荐 2 项，纳入 1 项，未纳入 1 项（本轮结果未知）' in bench.result_run_scope.text()
+    assert bench.omitted_recommendations_button.isVisible()
+    shown = []
+
+    def read_details(dialog):
+        shown.append(dialog.findChild(QPlainTextEdit, 'omittedRecommendationDetails').toPlainText())
+        return 0
+
+    with monkeypatch.context() as patch:
+        patch.setattr(QDialog, 'exec', read_details)
+        bench.omitted_recommendations_button.click()
+    assert len(shown) == 1 and receipt in shown[0] and 'receipt_text' in shown[0] and catalog not in shown[0]
+    bench.tabs.setCurrentIndex(1)
+    bench.select_recommended_button.click()
+    assert bench.selected_test_ids() == [discount, receipt]
+    QTest.mouseClick(bench.run_button, Qt.MouseButton.LeftButton)
+    wait_project(bench)
+    assert bench.report['selected_tests'] == [discount, receipt]
+    assert bench.report['counts'] == {'improved': 1, 'regression_detected': 1}
+    assert '已记录推荐 2 项，纳入 2 项，未纳入 0 项' in bench.result_run_scope.text()
+    assert not bench.omitted_recommendations_button.isVisible()
+
+
 def test_filtered_selection_runs_all_checked_tests_and_focuses_the_new_failure(window, tmp_path):
     from reprolab.project_sessions import check_project_report, pack_project_report, unpack_project_report, replay_project_report
     repo = project(tmp_path)

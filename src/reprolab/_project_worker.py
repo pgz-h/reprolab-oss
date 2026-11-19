@@ -1,4 +1,5 @@
 """Standalone multi-test pytest worker for trusted project regression sessions."""
+import ast
 import hashlib
 from inspect import signature
 import json
@@ -17,11 +18,16 @@ from _pytest.skipping import xfailed_key
 
 
 if __package__:
+    from ._assertion_sites import assertion_site_digest, assertions_by_scope
+    from ._fixture_bindings import collect_fixture_bindings
     from ._input_samples import InputCapture, sample_digest
 else:
     # The external interpreter runs this script in isolated mode without ReproLab installed.
     _samples = run_path(str(Path(__file__).with_name('_input_samples.py')))
     InputCapture, sample_digest = _samples['InputCapture'], _samples['sample_digest']
+    _sites = run_path(str(Path(__file__).with_name('_assertion_sites.py')))
+    assertion_site_digest, assertions_by_scope = _sites['assertion_site_digest'], _sites['assertions_by_scope']
+    collect_fixture_bindings = run_path(str(Path(__file__).with_name('_fixture_bindings.py')))['collect_fixture_bindings']
 
 
 def warning_policy(source, targets):
@@ -60,12 +66,15 @@ def warning_policy(source, targets):
 
 
 class Recorder:
-    def __init__(self, selected, collecting, journal=None, *, source=None, watched_modules=(), fixed_order=None, input_values=None):
+    def __init__(self, selected, collecting, journal=None, *, source=None, watched_modules=(), fixed_order=None,
+                 input_values=None, record_fixture_bindings=False):
         self.journal = journal
         self.sequence = 0
         self.selected = set(selected)
         self.collecting = collecting
         self.collected = []
+        self.record_fixture_bindings = record_fixture_bindings
+        self.fixture_bindings = None
         self.started = []
         self.started_ids = set()
         self.parameter_digests = {}
@@ -74,6 +83,7 @@ class Recorder:
         self.watched_modules = set(watched_modules)
         self.module_origins = {}
         self._origin_cache = {}
+        self._assertions = {}
         self.events = {}
         self.errors = []
         self.guard = {'status': 'allowed', 'reason': ''}
@@ -120,10 +130,13 @@ class Recorder:
             return 'installed-package'
         return 'external'
 
+    @pytest.hookimpl(trylast=True)
     def pytest_collection_finish(self, session):
         self._record_imports()
         self.collected = [item.nodeid for item in session.items]
         self.emit('collected', count=len(self.collected))
+        if self.collecting and self.record_fixture_bindings:
+            self.fixture_bindings = collect_fixture_bindings(session.items, self.source)
 
     def _check_inventory(self, session):
         actual = [entry.nodeid for entry in session.items]
@@ -203,6 +216,44 @@ class Recorder:
             self.errors.append(str(report.longrepr)[-6000:])
             self.emit('collection_error', message=self.errors[-1])
 
+    def _assertion_site(self, traceback):
+        if traceback is None:
+            return None
+        # The innermost frame is where the error surfaced, including assertions in project helpers.
+        while traceback.tb_next is not None:
+            traceback = traceback.tb_next
+        code = traceback.tb_frame.f_code
+        path = Path(code.co_filename)
+        try:
+            if not path.is_absolute() or self.source is None:
+                return None
+            path = path.resolve()
+            relative = path.relative_to(self.source).as_posix()
+            if path not in self._assertions:
+                tree = ast.parse(path.read_bytes())
+                self._assertions[path] = assertions_by_scope(tree)
+            line = traceback.tb_lineno
+            scopes = self._assertions[path]
+            matches = [(scope, node) for scope, nodes in scopes.items()
+                       for node in nodes if node.lineno <= line <= node.end_lineno]
+            if len(matches) > 1:
+                return {'assertion_site_sha256': None, 'assertion_location_ambiguous': True}
+            if not matches:
+                return None
+            scope, assertion = matches[0]
+            predicate = ast.dump(assertion.test)
+            if any(key != scope and key[1] == scope[1] for key in scopes):
+                return {'assertion_site_sha256': None, 'assertion_location_ambiguous': True}
+            peers = sorted((node for node in scopes[scope] if ast.dump(node.test) == predicate),
+                           key=lambda node: (node.lineno, node.col_offset))
+            structure = hashlib.sha256(ast.dump(scope[0]).encode()).hexdigest() if len(peers) > 1 else None
+        except (OSError, ValueError, RuntimeError, SyntaxError):
+            return None
+        return {
+            'assertion_site_sha256': assertion_site_digest(relative, code.co_qualname, predicate),
+            'assertion_occurrence': {'index': peers.index(assertion) + 1, 'count': len(peers), 'scope_sha256': structure},
+        }
+
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_makereport(self, item, call):
         result = yield
@@ -214,12 +265,17 @@ class Recorder:
             exception = {'type': call.excinfo.typename[:200], 'message': str(value)[:2000]}
             if isinstance(value, OSError) and type(value.errno) is int:
                 exception['errno'] = value.errno
-        self.events.setdefault(item.nodeid, []).append({
+        observation = {
             'phase': report.when, 'outcome': report.outcome,
             'xfail': bool(hasattr(report, 'wasxfail') or item.stash.get(xfailed_key, None)),
             'exception': exception, 'duration_seconds': round(report.duration, 6),
-        })
-        self.emit('phase_result', test_id=item.nodeid, phase=report.when, result=self.events[item.nodeid][-1])
+        }
+        if (report.when == 'call' and report.failed and not observation['xfail']
+                and exception and exception['type'] == 'AssertionError'):
+            site = self._assertion_site(value.__traceback__) if type(value) is AssertionError else None
+            observation.update(site or {'assertion_site_sha256': None})
+        self.events.setdefault(item.nodeid, []).append(observation)
+        self.emit('phase_result', test_id=item.nodeid, phase=report.when, result=observation)
 
 
 def main():
@@ -255,7 +311,7 @@ def main():
     journal = Path(options['progress_path']).open('w', encoding='utf-8') if options.get('progress_path') else None
     recorder = Recorder(selected, collecting, journal, source=source,
                         watched_modules=options.get('watched_modules', ()), fixed_order=fixed_order,
-                        input_values=options.get('input_values'))
+                        input_values=options.get('input_values'), record_fixture_bindings=options.get('record_fixture_bindings') is True)
     recorder.emit('session', schema_version=1, mode='collect' if collecting else 'run',
                   selection_sha256=hashlib.sha256(json.dumps(selected, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest(),
                   python_version=sys.version.split()[0], pytest_version=pytest.__version__,
@@ -287,6 +343,8 @@ def main():
               'runtime_environment': options.get('runtime_environment')}
     if not collecting:
         result['runtime_context'] = context
+    if recorder.fixture_bindings is not None:
+        result['fixture_bindings'] = recorder.fixture_bindings
     if sys.platform == 'darwin' or sys.platform.startswith('linux'):
         import resource
 

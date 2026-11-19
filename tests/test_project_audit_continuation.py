@@ -342,11 +342,26 @@ def test_pr_context_uses_real_local_merge_parents_and_refuses_wrong_candidate(tm
     report = json.loads(capsys.readouterr().out)
     assert [report['before_commit'], report['after_commit']] == [target_sha, merged]
     assert report['pr_context']['mode'] == 'merge'
+    assert 'PR 合入检查' in Path(report['report_dir'], 'report.html').read_text(encoding='utf-8')
+    assert main(['summary', report['report_dir'], '--gate', 'strict', '--public-summary', '--format', 'json']) == 0
+    public = capsys.readouterr().out
+    assert json.loads(public)['comparison_type'] == 'pr_merge'
+    assert all(private not in public for private in (target_sha, head, merged, 'test_basic.py', str(repo)))
+    assert main(['summary', report['report_dir'], '--gate', 'strict', '--include-test-ids']) == 0
+    markdown = capsys.readouterr().out
+    assert 'PR merge acceptance' in markdown
+    assert markdown.index('CI gate') < markdown.index('| Outcome')
+    assert 'test_basic.py::test_basic' in markdown
     assert main([*args, 'head', '--output', str(tmp_path / 'head')]) == 0
     report = json.loads(capsys.readouterr().out)
     assert [report['before_commit'], report['after_commit']] == [base, head]
     assert main([*args, 'merge', '--merge-commit', head, '--output', str(tmp_path / 'wrong')]) == 2
-    assert '父提交' in capsys.readouterr().err
+    error = json.loads(capsys.readouterr().err)
+    assert error['status'] == 'blocked' and error['reason'] == 'pr_merge_parent_mismatch'
+    assert '父提交' in error['error']['message']
+    assert main([*args, 'merge', '--merge-commit', '1' * 40, '--output', str(tmp_path / 'missing')]) == 2
+    assert json.loads(capsys.readouterr().err)['reason'] == 'pr_merge_missing'
+    assert not (tmp_path / 'wrong').exists() and not (tmp_path / 'missing').exists()
 
 
 def test_private_projection_reduces_standalone_data_and_checks_source_binding(tmp_path, capsys):
@@ -549,6 +564,275 @@ def test_candidate_history_reads_normal_reports_and_distinguishes_children(tmp_p
     assert missing['issues'][0]['name'] == 'unavailable'
     assert missing['candidates'][0]['gate']['status'] == 'failed'
 
+
+def test_candidate_history_keeps_local_gates_but_requires_common_start_order(tmp_path, capsys):
+    from reprolab.project_sessions import _manifest
+    from test_project_review_audit import freeze, git, write
+    import shutil
+
+    repo = tmp_path / 'stock'
+    repo.mkdir()
+    git(repo, 'init', '-q')
+    reserve = 'test_stock.py::test_reserve'
+    other = 'test_stock.py::test_other_customer'
+    order = [reserve, other]
+    inventory = ('stock = 1\ndef reserve():\n    global stock\n    stock -= 1\n'
+                 'def available(): return ')
+    write(repo, 'inventory.py', inventory + '1\n')
+    write(repo, 'test_stock.py', 'import inventory\n'
+          'def test_reserve():\n    inventory.reserve()\n    assert inventory.stock == 0\n'
+          'def test_other_customer(): assert inventory.available() == 1\n')
+    freeze(repo)
+    write(repo, 'inventory.py', inventory + '1\n# Candidate A\n')
+    freeze(repo)
+    write(repo, 'inventory.py', inventory + 'stock\n')
+    freeze(repo)
+
+    def cli(*args, code=0):
+        assert main(list(map(str, args))) == code
+        return json.loads(capsys.readouterr().out)
+
+    def run(name, revision, tests, *, code=0):
+        flags = [flag for test in tests for flag in ('--test', test)]
+        report = cli('review', repo, '--before', 'HEAD~2', '--after', revision,
+                     '--output', tmp_path / name, *flags, code=code)
+        archive = tmp_path / f'{name}.zip'
+        cli('pack', report['report_dir'], '--output', archive)
+        return Path(report['report_dir']), archive
+
+    def history(*candidates, code):
+        flags = [flag for name, path in candidates for flag in ('--candidate', name, path)]
+        return cli('candidate-history', *flags, code=code)
+
+    _, first = run('A', 'HEAD~1', order)
+    reverse_source, reverse = run('B-reverse', 'HEAD', list(reversed(order)))
+    _, same = run('B-same', 'HEAD', order, code=1)
+    comparison = history(('A', first), ('B', reverse), code=2)
+    assert comparison['same_selection'] is True and comparison['same_requested_order'] is False
+    assert comparison['same_execution_order'] is False and comparison['comparable'] is False
+    assert comparison['execution_order_status'] == 'different'
+    assert [row['gate']['exit_code'] for row in comparison['candidates']] == [0, 0]
+    assert comparison['order_rerun'] == {'test_ids': order, 'name': 'A', 'side': 'before', 'basis': 'progress_journal'}
+    assert {item['side'] for item in comparison['issues'] if item['reason'] == 'observed_execution_order_changed'} == {'before', 'after'}
+
+    aligned = history(('A', first), ('B', same), code=1)
+    assert aligned['comparable'] is True and aligned['same_execution_order'] is True
+    assert [row['gate']['exit_code'] for row in aligned['candidates']] == [0, 1]
+    mixed = history(('A', first), ('B-reverse', reverse), ('B-same', same), code=1)
+    assert mixed['comparable'] is False and mixed['issues']
+    assert [row['gate']['exit_code'] for row in mixed['candidates']] == [0, 0, 1]
+
+    selection = tmp_path / 'rerun-selection.json'
+    selection.write_text(json.dumps(comparison['order_rerun']['test_ids']), encoding='utf-8')
+    rerun = cli('compare-candidates', repo, '--before', 'HEAD~2', '--candidate', 'base', 'HEAD~2',
+                '--candidate', 'A', 'HEAD~1', '--selection-file', selection, '--confirm-run',
+                '--output', tmp_path / 'green')
+    assert rerun['comparable'] and rerun['same_execution_order']
+    assert [row['gate']['exit_code'] for row in rerun['candidates']] == [0, 0]
+
+    # Model legacy worker evidence without the progress journal. Only the recorded
+    # starts can establish the order, even though saved phase results still pass.
+    legacy = tmp_path / 'legacy'
+    shutil.copytree(reverse_source, legacy)
+    report_file, execution_file = legacy / 'report.json', legacy / 'execution.json'
+    report, execution = (json.loads(path.read_bytes()) for path in (report_file, execution_file))
+    for side in ('before', 'after'):
+        execution[side].pop('progress_schema')
+        report[side].pop('execution_order')
+        report[side].pop('progress')
+        (legacy / f'{side}.progress.jsonl').unlink()
+    execution_file.write_text(json.dumps(execution), encoding='utf-8')
+    report['persistence'] = _manifest(legacy)
+    report_file.write_text(json.dumps(report), encoding='utf-8')
+    worker_archive = tmp_path / 'legacy-worker.zip'
+    cli('pack', legacy, '--output', worker_archive)
+    worker = history(('A', first), ('B', worker_archive), code=2)
+    assert worker['execution_order_status'] == 'different'
+    assert worker['candidates'][1]['observed_orders']['before']['source'] == 'worker_events'
+
+    for side in ('before', 'after'):
+        event_file = legacy / f'{side}.events.json'
+        events = json.loads(event_file.read_bytes())
+        events['started_tests'] = [other]
+        event_file.write_text(json.dumps(events), encoding='utf-8')
+    report['persistence'] = _manifest(legacy)
+    report_file.write_text(json.dumps(report), encoding='utf-8')
+    incomplete_archive = tmp_path / 'legacy-incomplete.zip'
+    cli('pack', legacy, '--output', incomplete_archive)
+    unknown = history(('A', first), ('B', incomplete_archive), code=2)
+    assert unknown['same_execution_order'] is None and unknown['execution_order_status'] == 'unknown'
+    assert [row['gate']['exit_code'] for row in unknown['candidates']] == [0, 0]
+    assert unknown['candidates'][1]['observed_orders']['after'] == {
+        'status': 'partial', 'source': 'worker_events', 'started_tests': [other],
+    }
+    assert {item['reason'] for item in unknown['issues']} == {'execution_order_unverified'}
+
+
+def test_candidate_comparison_observes_plugin_order_even_with_an_identical_request(tmp_path, capsys):
+    from test_project_review_audit import freeze, git, write
+
+    repo = tmp_path / 'fixture'
+    repo.mkdir()
+    git(repo, 'init', '-q')
+    a, b = 'test_order.py::test_a', 'test_order.py::test_b'
+    write(repo, 'ordering.py', 'REVERSE = False\n')
+    write(repo, 'conftest.py', 'from ordering import REVERSE\n'
+          'def pytest_collection_modifyitems(items): items.sort(key=lambda item: item.name, reverse=REVERSE)\n')
+    write(repo, 'test_order.py', 'def test_a(): pass\ndef test_b(): pass\n')
+    freeze(repo)
+    write(repo, 'ordering.py', 'REVERSE = True\n')
+    freeze(repo)
+    assert main(list(map(str, ('compare-candidates', repo, '--before', 'HEAD^', '--candidate', 'base', 'HEAD^',
+                               '--candidate', 'reverse', 'HEAD', '--confirm-run', '--output', tmp_path / 'compare',
+                               '--test', a, '--test', b)))) == 2
+    comparison = json.loads(capsys.readouterr().out)
+    assert comparison['same_requested_order'] is True
+    assert comparison['same_execution_order'] is False and comparison['comparable'] is False
+    assert [row['gate']['exit_code'] for row in comparison['candidates']] == [0, 0]
+    assert [(issue['name'], issue['side']) for issue in comparison['issues']] == [('reverse', 'after')]
+    reports = []
+    for label, order in (('A', (a, b)), ('B', (b, a))):
+        assert main(list(map(str, ('review', repo, '--before', 'HEAD^', '--after', 'HEAD^', '--test', order[0],
+                                   '--test', order[1], '--output', tmp_path / label)))) == 0
+        reports.extend(['--candidate', label, json.loads(capsys.readouterr().out)['report_dir']])
+    assert main(['candidate-history', *reports]) == 0
+    aligned = json.loads(capsys.readouterr().out)
+    assert aligned['same_requested_order'] is False and aligned['same_execution_order'] is True
+
+
+def test_candidate_orders_do_not_infer_go_or_vitest_execution_sequences():
+    from reprolab.project_candidates import _compare_orders
+    from reprolab.project_order import observed_pytest_orders
+
+    for runner in ('go', 'vitest'):
+        orders = observed_pytest_orders({'runner': runner})
+        assert all(item['status'] == 'not_applicable' and item['started_tests'] is None for item in orders.values())
+        issues = []
+        assert _compare_orders([{}, {}], runner, same_baseline=True, same_selection=True, issues=issues) == ('not_applicable', None)
+        assert issues == []
+
+
+
+@pytest.mark.parametrize('dimension', ['clock', 'samples'])
+def test_candidate_history_compares_recorded_scenarios_and_preserves_local_gates(dimension, tmp_path, capsys):
+    from test_project_review_audit import freeze, git, write
+
+    repo = tmp_path / 'fixture'
+    repo.mkdir()
+    git(repo, 'init', '-q')
+    test = 'test_rule.py::test_boundary'
+    sample = tmp_path / 'sample.json'
+    private = 'PRIVATE-SAMPLE-NEVER-IN-CANDIDATE-INDEX'
+    if dimension == 'clock':
+        write(repo, 'test_rule.py',
+              'from datetime import datetime, timezone\nfrom rule import check\n'
+              'def test_boundary(): assert check(datetime.now(timezone.utc).day)\n')
+        good, bad = 'def check(day): return day <= 30\n', 'def check(day): return day < 30\n'
+    else:
+        write(repo, 'test_rule.py',
+              'from pathlib import Path\nfrom json import loads\nfrom rule import check\n'
+              'def test_boundary(reprolab_input):\n'
+              f'    sample = reprolab_input("value", lambda: loads(Path({str(sample)!r}).read_text()))\n'
+              '    assert check(sample["value"]) == sample["value"]\n')
+        good, bad = 'def check(value): return value\n', 'def check(value): return min(value, 100)\n'
+    for version in (good, good + '# Candidate A\n', bad):
+        write(repo, 'rule.py', version)
+        freeze(repo)
+
+    def cli(*args, code=0):
+        assert main(list(map(str, args))) == code
+        return json.loads(capsys.readouterr().out)
+
+    evidence = {}
+    for name, revision in (('A', 'HEAD~1'), ('B', 'HEAD')):
+        for point in ('ordinary', 'boundary'):
+            stem = f'{name}-{point}'
+            day = 29 if dimension == 'clock' and point == 'ordinary' else 30
+            sample.write_text(json.dumps({'value': 100 if point == 'ordinary' else 101, 'marker': private}),
+                              encoding='utf-8')
+            report = cli('review', repo, '--before', 'HEAD~2', '--after', revision, '--test', test,
+                         '--freeze-clock', f'2026-11-{day}T12:00:00+00:00', '--locale', 'C',
+                         '--output', tmp_path / stem, code=int(name == 'B' and point == 'boundary'))
+            evidence[stem] = tmp_path / f'{stem}.zip'
+            cli('pack', report['report_dir'], '--output', evidence[stem])
+
+    def history(*names, code):
+        flags = [flag for name in names for flag in ('--candidate', name, evidence[name])]
+        result = cli('candidate-history', *flags, code=code)
+        assert private not in json.dumps(result) and str(tmp_path) not in json.dumps(result)
+        return result
+
+    mixed = history('A-boundary', 'B-ordinary', code=2)
+    assert not mixed['comparable'] and [r['gate']['exit_code'] for r in mixed['candidates']] == [0, 0]
+    scenario = mixed['scenario_comparison']
+    assert scenario['tests_requiring_aligned_inputs'] == [test]
+    if dimension == 'clock':
+        assert scenario['clock_control'] == 'different'
+        assert mixed['issues'][0]['changed_fields'] == ['instant']
+        assert scenario['recorded_inputs']['between_candidates'] == 'not_recorded'
+    else:
+        assert scenario['clock_control'] == 'matched'
+        assert scenario['recorded_inputs'] == {'within_candidates': 'matched', 'between_candidates': 'different'}
+        assert {issue['side'] for issue in mixed['issues']} == {'before', 'after'}
+    assert history('A-ordinary', 'B-ordinary', code=0)['comparable']
+    assert history('A-boundary', 'B-boundary', code=1)['comparable']
+    independent = history('A-boundary', 'B-ordinary', 'B-boundary', code=1)
+    assert not independent['comparable'] and independent['issues']
+    assert [r['gate']['exit_code'] for r in independent['candidates']] == [0, 0, 1]
+    if dimension == 'clock':
+        direct = cli('compare-candidates', repo, '--before', 'HEAD~2', '--candidate', 'A', 'HEAD~1',
+                     '--candidate', 'B', 'HEAD', '--test', test, '--freeze-clock', '2026-11-30T12:00:00+00:00',
+                     '--locale', 'C', '--confirm-run', '--output', tmp_path / 'direct', code=1)
+        assert direct['comparable'] and direct['scenario_comparison']['clock_control'] == 'matched'
+        assert all(row['clock_evidence'] == 'verified' for row in direct['candidates'])
+
+
+@pytest.mark.parametrize(('case', 'field', 'within', 'between'), [
+    ('none', 'recorded_inputs', 'not_recorded', 'not_recorded'),
+    ('within', 'recorded_inputs', 'different', 'matched'),
+    ('missing', 'recorded_inputs', 'matched', 'unverified'),
+    ('sample_error', 'recorded_inputs', 'unverified', 'unverified'),
+    ('parameter_difference', 'parameters', 'matched', 'different'),
+    ('legacy_parameters', 'parameters', 'unverified', 'unverified'),
+    ('unhashed_parameter', 'parameters', 'unverified', 'unverified'),
+])
+def test_candidate_scenario_handles_known_missing_and_changed_inputs(case, field, within, between):
+    from reprolab.project_candidate_scenarios import compare_candidate_scenarios
+
+    test = 'test_amount.py::test_amount' + ('[same]' if field == 'parameters' else '')
+    first, second = {'value': 'a' * 64}, {'value': 'b' * 64}
+    rows, reports, issues = [], {}, []
+    run = {'status': 'completed', 'worker_record_complete': True}
+    for name in ('A', 'B'):
+        entry = {'test_id': test, 'before': {}, 'after': {}}
+        if case == 'within':
+            entry['before']['input_digests'], entry['after']['input_digests'] = first, second
+        elif case == 'missing' and name == 'A':
+            for side in ('before', 'after'):
+                entry[side]['input_digests'] = first
+        elif case == 'sample_error' and name == 'A':
+            entry['before']['input_error'] = 'provider_error'
+        elif case == 'parameter_difference':
+            for side in ('before', 'after'):
+                entry[side]['parameter_digests'] = first if name == 'A' else second
+        elif case == 'unhashed_parameter':
+            for side in ('before', 'after'):
+                entry[side]['parameter_digests'] = {'value': None}
+        report = {'before': run, 'after': run, 'entries': [entry]}
+        if name == 'A' and case == 'missing':
+            report['clock_control'] = {'instant': '2026-11-30T12:00:00+00:00', 'timezone': None, 'locale': 'C'}
+        rows.append({'name': name, 'report_sha256': name, 'selected_tests': [test]})
+        reports[name] = (report, name)
+    compared = compare_candidate_scenarios(rows, rows, reports, {test}, issues)
+    assert compared[field] == {'within_candidates': within, 'between_candidates': between}
+    assert not any(value in json.dumps([rows, issues]) for value in ('a' * 64, 'b' * 64, 'provider_error'))
+    if case == 'within':
+        assert {issue['scope'] for issue in issues} == {'within_candidate'}
+    if case == 'missing':
+        assert compared['clock_control'] == 'unverified'
+        assert rows[1]['clock_evidence'] == 'not_recorded'
+    if case == 'none':
+        assert not issues
 
 
 def test_git_export_never_silently_merges_case_colliding_paths(tmp_path, capsys):

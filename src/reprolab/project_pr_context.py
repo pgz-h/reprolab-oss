@@ -8,6 +8,33 @@ from .git_source import _git, resolve_commit
 from .recipes import repository_root
 
 
+COMPARISON_LABELS = {
+    'direct': '指定版本对比',
+    'pr_head': 'PR 改动检查（共同基线 → PR head）',
+    'pr_merge': 'PR 合入检查（目标提交 → 已核对的合并结果）',
+}
+
+
+def comparison_type(report):
+    context = report.get('pr_context') or {}
+    return {'head': 'pr_head', 'merge': 'pr_merge'}.get(context.get('mode'), 'direct')
+
+
+class PRComparisonBlocked(ValueError):
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason = reason
+
+
+def _require_commit(root, sha, reason, message):
+    try:
+        if _sha(sha) and resolve_commit(root, sha) == sha:
+            return
+    except ValueError:
+        pass
+    raise PRComparisonBlocked(reason, message)
+
+
 def _sha(value):
     return isinstance(value, str) and bool(re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', value))
 
@@ -30,8 +57,8 @@ def github_pr_context(repository, location, mode, *, merge_commit=None):
     if not (_sha(base) and _sha(head)):
         raise ValueError('PR 事件缺少有效完整 SHA。')
     root = repository_root(repository)
-    if resolve_commit(root, base) != base or resolve_commit(root, head) != head:
-        raise ValueError('本地 Git 中缺少事件对应的实际提交。')
+    for sha in (base, head):
+        _require_commit(root, sha, 'pr_parent_missing', '本地 Git 中缺少事件绑定的目标或 PR head 提交。')
     if mode == 'head':
         if merge_commit is not None:
             raise ValueError('head 模式无需提供合并结果。')
@@ -41,11 +68,10 @@ def github_pr_context(repository, location, mode, *, merge_commit=None):
         before, after = bases[0], head
     else:
         after = merge_commit or pull.get('merge_commit_sha')
-        if not _sha(after) or resolve_commit(root, after) != after:
-            raise ValueError('merge 模式须能在本地读取明确的合并结果 SHA。')
+        _require_commit(root, after, 'pr_merge_missing', '本地 Git 中缺少事件对应的合并结果提交。')
         parents = _git(root, 'rev-list', '--parents', '-n', '1', after).decode().split()
         if parents != [after, base, head]:
-            raise ValueError('指定合并结果的父提交与 PR 目标及 head 不一致。')
+            raise PRComparisonBlocked('pr_merge_parent_mismatch', '指定合并结果的父提交与 PR 目标及 head 不一致。')
         before = base
     return {'mode': mode, 'event_sha256': hashlib.sha256(raw).hexdigest(), 'base': base, 'head': head,
             'before': before, 'after': after}

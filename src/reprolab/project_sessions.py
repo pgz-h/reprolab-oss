@@ -6,7 +6,6 @@ import errno
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import hashlib
-from importlib.util import resolve_name
 import json
 import math
 import os
@@ -21,6 +20,7 @@ import time
 
 from . import __version__
 from ._clock_control import validate_clock
+from ._fixture_bindings import checked_fixture_bindings
 from ._input_samples import ERRORS as INPUT_ERRORS, read_sample_observations
 from .case import parse_test_target, valid_source_mode_hashes
 from .changes import describe_changes
@@ -43,6 +43,7 @@ from .project_test_source import validate_test_source_control
 from .project_order import order_digest, validate_order_control
 from .project_version_order import PAIR_STATE_ENV, validate_version_order
 from .project_collection import collection_diagnosis, normalize_collection_path, require_collection_target
+from .project_recommendations import recommend_project_tests
 from .runtime_environment import resolve_variables, variable_record
 from .workspace import WORKTREE, copy_workspace
 
@@ -52,12 +53,19 @@ NOTICE = ('项目回归结果覆盖本次所选测试。两版在独立副本中
           '各版本的项目配置和 fixture 分别保留。执行前后各一个 pytest 进程；原始源码证据保持完整。')
 
 
-def _read(path):
+def _read(path, *, expected_sha256=None):
     path = Path(path)
     if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_RECORD_BYTES:
         raise ValueError(f'记录不存在、过大或不是普通文件：{path.name}')
     try:
-        data = json.loads(path.read_bytes())
+        if expected_sha256 is None:
+            data = json.loads(path.read_bytes())
+        else:
+            with path.open('rb') as stream:
+                payload = stream.read(MAX_RECORD_BYTES + 1)
+            if len(payload) > MAX_RECORD_BYTES or hashlib.sha256(payload).hexdigest() != expected_sha256:
+                raise ValueError('证据指纹不一致。')
+            data = json.loads(payload)
     except (ValueError, RecursionError):
         raise ValueError(f'记录不是有效 JSON：{path.name}') from None
     if not isinstance(data, dict):
@@ -157,65 +165,6 @@ def _inventory(before, after):
     return changed, files, tests[:10000]
 
 
-def _module_name(path):
-    parts = list(PurePosixPath(path).with_suffix('').parts)
-    if len(parts) > 1 and parts[0] == 'src':
-        parts.pop(0)
-    if parts[-1] == '__init__':
-        parts.pop()
-    return '.'.join(parts)
-
-
-def _test_imports(snapshot, name):
-    path = snapshot / name
-    if path.stat().st_size > 512 * 1024:
-        return set()
-    try:
-        tree = ast.parse(path.read_bytes())
-    except (SyntaxError, ValueError, RecursionError):
-        return set()
-    package = _module_name(name).rpartition('.')[0]
-    imports = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imports.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            module = node.module or ''
-            if node.level:
-                try:
-                    module = resolve_name('.' * node.level + module, package)
-                except ImportError:
-                    continue
-            imports.add(module)
-            imports.update(module + '.' + alias.name for alias in node.names)
-    return imports
-
-
-def _recommend(changed, tests, snapshot):
-    changed_names = {item['path'] for item in changed}
-    modules = {_module_name(name) for name in changed_names if name.endswith('.py')}
-    package_inits = {_module_name(name) for name in changed_names if PurePosixPath(name).name == '__init__.py'}
-    fixtures = [PurePosixPath(name).parent for name in changed_names if PurePosixPath(name).name == 'conftest.py']
-    reasons = {}
-    result = {}
-    for identity in tests:
-        name = parse_test_target(identity)
-        if name not in reasons:
-            if name in changed_names:
-                reasons[name] = '本次修改了这个测试文件'
-            elif any(PurePosixPath(name).is_relative_to(parent) for parent in fixtures):
-                reasons[name] = '该目录的 fixture 或测试配置发生变化'
-            else:
-                imports = _test_imports(snapshot, name) if modules else set()
-                affected = imports & modules
-                affected.update(package for package in package_inits if package
-                                and any(module.startswith(package + '.') for module in imports))
-                reasons[name] = '静态导入关联到改动模块 · ' + '、'.join(sorted(affected)[:3]) if affected else ''
-        if reasons[name]:
-            result[identity] = reasons[name]
-    return result
-
-
 def prepare_project(repository, before_ref, after_ref, output_root, *, python_executable=None, title=None,
                     issue='', collection_path='', snapshot_scope=None, pr_context=None):
     root = repository_root(repository)
@@ -273,7 +222,7 @@ def _prepare_project(root, before, after, output_root, *, python_executable, tit
                  'source_sha256': {'before': before_hash, 'after': after_hash},
                  'source_mode_sha256': {'before': before_mode, 'after': source_mode_fingerprint(new)},
                  'changed_files': changed, 'changes': describe_changes(old, new), 'test_files': files,
-                 'static_tests': tests, 'recommendations': _recommend(changed, tests, new),
+                 'static_tests': tests, 'recommendations': recommend_project_tests(changed, tests, old, new, control=control),
                  'collection_path': collection_path, 'collection': None, 'runs': [],
                  'status': 'prepared', 'notice': NOTICE}
         if refresh_metadata is not None:
@@ -395,7 +344,8 @@ def _pytest_execution_context(raw, reader, complete):
 
 
 def _launch(source, shared_after, selected, folder, label, runtime, timeout, control, *, collecting=False,
-            collection_path='', execution_environment=None, watched_modules=(), fixed_order=None, pair_state=None, baseline_fixtures=None, input_values=None, shared_tests_from=None):
+            collection_path='', execution_environment=None, watched_modules=(), fixed_order=None, pair_state=None, baseline_fixtures=None, input_values=None, shared_tests_from=None,
+            record_fixture_bindings=False):
     log_path, event_path = folder / (label + '.log'), folder / (label + '.events.json')
     started = time.monotonic()
     progress_path = folder / (label + '.progress.jsonl')
@@ -430,6 +380,7 @@ def _launch(source, shared_after, selected, folder, label, runtime, timeout, con
             child_env[PAIR_STATE_ENV] = pair_state
         save_json(options, {'collect_only': collecting, 'selected_tests': selected,
                             'collection_path': collection_path,
+                            'record_fixture_bindings': record_fixture_bindings,
                             'pytest_profile': profile, 'pytest_args': profile_args(profile), 'runtime_environment': variables,
                             'progress_path': str(progress_path.resolve()), 'watched_modules': list(watched_modules),
                             'clock_control': control.clock_control, 'fixed_order': fixed_order, 'fixture_paths': fixture_paths, 'input_values': input_values})
@@ -525,11 +476,13 @@ def collect_project(directory, *, python_executable=None, timeout=120, control=N
         collection_dir.mkdir(parents=True)
         control.notify('project_collect', {'directory': str(folder)})
         result = _launch(snapshot, snapshot, [], collection_dir, 'collection', runtime, timeout, control,
-                         collecting=True, collection_path=scope, execution_environment=execution_environment)
+                         collecting=True, collection_path=scope, execution_environment=execution_environment,
+                         record_fixture_bindings=True)
         if result['cancelled']:
             raise RunCancelled('已取消项目测试发现。')
         raw = result['raw']
         tests, valid, scope_mismatch = _discovery_tests(result, snapshot, scope)
+        bindings = checked_fixture_bindings(raw.get('fixture_bindings'), tests, snapshot) if valid else None
         status = 'collected' if valid and tests else 'collection_failed'
         record = {'schema_version': 1, 'kind': 'project_collection', **_identity(state),
                   'status': status, 'tests': tests if valid else [], 'count': raw.get('collected', 0),
@@ -544,7 +497,10 @@ def collect_project(directory, *, python_executable=None, timeout=120, control=N
                   'log_excerpt': result['log_excerpt'], 'collection_errors': result['collection_errors'],
                   'partial': bool(result['collection_errors']), 'directory': str(folder),
                   'evidence_dir': str(collection_dir), 'created_at': _now(),
-                  'recommendations': _recommend(state['changed_files'], tests if valid else [], snapshot),
+                  **({'fixture_bindings': bindings} if bindings is not None else {}),
+                  'recommendations': recommend_project_tests(state['changed_files'], tests if valid else [],
+                                                              folder / 'inputs/before', snapshot, control=control,
+                                                              fixture_bindings=bindings),
                   'notice': '实际发现会加载可信项目、测试与 conftest，不运行测试主体。' if status == 'collected'
                             else '测试发现未完成，请核对所选环境、项目配置和日志。'}
         if control.clock_control is not None:
@@ -560,7 +516,8 @@ def collect_project(directory, *, python_executable=None, timeout=120, control=N
                      collection_path=scope, status=status)
         state['runtime'] = runtime
         state['collection_record'] = (collection_dir / 'collection.json').relative_to(folder).as_posix()
-        state['recommendations'].update(record['recommendations'])
+        if valid:
+            state['recommendations'] = record['recommendations']
         save_json(folder / 'project.json', state)
         return record
 
@@ -643,12 +600,52 @@ def _collection(state, runtime):
     if not path.resolve().is_relative_to(Path(state['directory'])):
         raise ValueError('测试发现记录路径不正确。')
     record = _read(path)
-    if (_digest(path) != state.get('collection_sha256') or record.get('runtime') != runtime
-            or any(record.get(key) != value for key, value in _identity(state).items())
-            or record.get('collection_path', '') != state.get('collection_path', '')
-            or record.get('status') != 'collected' or not isinstance(record.get('tests'), list)):
+    if _digest(path) != state.get('collection_sha256') or not _matches_collection(record, state, runtime):
         return None
     return record
+
+
+def _matches_collection(record, state, runtime):
+    return (record.get('runtime') == runtime and all(record.get(key) == value for key, value in _identity(state).items())
+            and record.get('collection_path', '') == state.get('collection_path', '')
+            and record.get('status') == 'collected' and isinstance(record.get('tests'), list))
+
+
+def saved_report_collection(report):
+    """Read the discovery record actually bound to this saved report, if available."""
+    prefix = 'evidence/project/'
+    try:
+        root = Path(report['report_dir']).resolve()
+        hashes = report['persistence']['sha256']
+        state_name = prefix + 'project.json'
+        state_path = root / state_name
+        state_digest = hashes[state_name]
+        if not isinstance(state_digest, str) or not state_path.resolve().is_relative_to(root):
+            return None
+        state = _read(state_path, expected_sha256=state_digest)
+        name = state['collection_record']
+        relative = PurePosixPath(name)
+        if (relative.is_absolute() or '..' in relative.parts or name != relative.as_posix()
+                or any(char in name for char in (':', '\\'))):
+            return None
+        path = root / prefix / name
+        digest = hashes[prefix + name]
+        if (not isinstance(digest, str) or digest != state.get('collection_sha256')
+                or not path.resolve().is_relative_to(root / prefix)
+                or any(report.get(key) != value for key, value in _identity(state).items())):
+            return None
+        record = _read(path, expected_sha256=digest)
+        if (not _matches_collection(record, state, report['runtime'])
+                or record.get('clock_control') != report.get('clock_control')
+                or ('runtime_environment' in record
+                    and record['runtime_environment'] != report.get('runtime_environment'))):
+            return None
+        tests = record['tests']
+        if any(not isinstance(test, str) for test in tests) or not set(report['selected_tests']) <= set(tests):
+            return None
+        return record
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError):
+        return None
 
 
 def _outcome(events):
@@ -992,10 +989,15 @@ def run_project(directory, output_root, *, selected_ids=None, python_executable=
             report['clock_control'] = execution['clock_control'] = control.clock_control
         if control.network_isolation is not None:
             report['network_isolation'] = execution['network_isolation'] = control.network_isolation
+        from .project_comparison import comparison_scope, comparison_view
+
+        _, phase_decisions = comparison_view(report, comparison_scope(report))
+        if phase_decisions:
+            report['phase_decisions'] = phase_decisions
         save_json(report_dir / 'execution.json', execution)
         save_json(report_dir / 'operation.json', {'status': status, 'run_id': report_dir.name, 'phase': 'saved'})
         from .project_report import write_project_report
-        write_project_report(report)
+        write_project_report(report, collection=collection)
         save_json(report_dir / 'catalog.json', {key: report[key] for key in
                   ('kind', 'title', 'status', 'created_at', 'project_id', 'run_id')})
         report['persistence'] = _manifest(report_dir)
@@ -1210,6 +1212,12 @@ def check_project_report(directory, *, control=None):
         if (status != report.get('status') or counts != report.get('counts')
                 or entries != report.get('entries')):
             raise ValueError('报告结论或逐项结果与原始执行证据不一致。')
+        if 'phase_decisions' in report:
+            from .project_comparison import comparison_scope, comparison_view
+
+            _, decisions = comparison_view(report, comparison_scope(report))
+            if report['phase_decisions'] != decisions:
+                raise ValueError('pytest 阶段比较与保存的执行证据不一致。')
     except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
         issues.append(str(exc))
     return {'status': 'inconsistent' if issues else 'consistent', 'report_dir': str(folder),

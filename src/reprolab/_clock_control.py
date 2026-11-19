@@ -30,6 +30,10 @@ def validate_clock(value):
         raise ValueError('固定时钟记录无效。')
 
 
+def compare_clock_controls(left, right):
+    return None if left is None and right is None else left == right
+
+
 def freeze_worker_clock(settings):
     validate_clock(settings)
     zone = settings['timezone']

@@ -84,7 +84,8 @@ def test_use_pasted_projects_environment_to_run_first_comparison(window, tmp_pat
     wait_project(bench)
     markdown = QApplication.clipboard().text()
     assert 'ReproLab comparison' in markdown and '| New failure | 1 |' in markdown
-    assert str(repo) not in markdown and 'test_regression' not in markdown
+    assert 'tests/test_component.py::test_regression' in markdown
+    assert str(repo) not in markdown
 
 
 def test_discovery_failure_exposes_recovery_and_keeps_the_snapshot(window, tmp_path):

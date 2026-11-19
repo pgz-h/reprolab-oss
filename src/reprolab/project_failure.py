@@ -44,7 +44,7 @@ def repair_eligibility(entry, report):
         return False, '这是导入／缺少依赖问题；先通过项目环境入口核对依赖和解释器。'
     if any(p.get('phase') in ('setup', 'teardown') and p.get('outcome') == 'failed'
            for p in phases if isinstance(p, dict)):
-        return False, 'fixture 准备／清理失败，尚未得到完整测试主体故障；先处理对应阶段。'
+        return False, 'fixture 准备／清理失败；严格修复案例需要成功准备、主体失败和成功清理的完整记录。'
     if outcome.get('status') == 'skipped' or any(
             p.get('xfail') or p.get('outcome') == 'skipped' for p in phases if isinstance(p, dict)):
         return False, '测试被跳过或标记 xfail；需核对条件后重新完整运行，不能直接验收。'

@@ -116,6 +116,100 @@ def test_gate_allows_only_complete_existing_failures(demo, tmp_path, capsys):
         assert result['counts'] == {'baseline_failure': 1, 'inconclusive': 1}
 
 
+@pytest.mark.parametrize(('partial', 'truncated', 'expected'), [
+    (True, False, 'partial'), (False, True, 'truncated'), (True, True, 'partial_truncated'),
+])
+def test_run_scope_distinguishes_incomplete_discovery_and_empty_or_missing_hints(partial, truncated, expected):
+    from reprolab.project_run_scope import pytest_run_scope
+
+    identity = 'test_total.py::test_total'
+    report = {
+        'selected_tests': [identity], 'before': {'status': 'cancelled', 'progress': {
+            'status': 'recorded', 'started': 1, 'completed': 0, 'session_finished': False, 'tail_ignored': True,
+        }}, 'after': {'status': 'not_run'},
+    }
+    record = {'tests': [identity], 'count': 3, 'partial': partial, 'truncated': truncated}
+    scope = pytest_run_scope(report, collection=record)
+    assert scope['discovery'] == {'status': expected, 'count': 1, 'accuracy': 'at_least'}
+    assert scope['recommendations']['status'] == 'unknown'
+    assert scope['recommendations']['omitted_count'] is None
+    assert scope['execution'] == {
+        'before': {'status': 'cancelled', 'accuracy': 'at_least', 'started': 1, 'finished': 0, 'not_started': None},
+        'after': {'status': 'not_run', 'accuracy': 'exact', 'started': 0, 'finished': 0, 'not_started': 1},
+    }
+    empty = pytest_run_scope(report, collection={**record, 'recommendations': {}})
+    assert empty['recommendations'] == {'status': 'recorded', 'count': 0, 'selected_count': 0, 'omitted_count': 0}
+    unknown = pytest_run_scope({'selected_tests': [identity], 'before': {'status': 'completed'}})
+    assert unknown['discovery']['count'] is None and unknown['execution']['before']['finished'] is None
+
+
+def test_cancelled_run_keeps_selection_and_records_candidate_never_started(demo, tmp_path, capsys):
+    from reprolab.project_sessions import pack_project_report, run_project
+    from reprolab.runner import RunControl
+
+    selected = [demo['selected_tests'][0]]
+    control = RunControl(progress=lambda phase, _payload: control.cancel() if phase == 'project_after' else None)
+    run = run_project(demo['project_directory'], tmp_path / 'cancelled', selected_ids=selected,
+                      confirmed=True, control=control)
+    assert run['status'] == 'cancelled'
+    evidence = tmp_path / 'cancelled.zip'
+    pack_project_report(run['report_dir'], evidence)
+    assert main(['summary', str(evidence), '--gate', 'no-new-failures', '--format', 'json']) == 2
+    summary = json.loads(capsys.readouterr().out)
+    assert summary['verdict'] == 'cancelled'
+    scope = summary['run_scope']
+    assert scope['discovery']['status'] == 'complete' and scope['selected_count'] == 1
+    assert scope['execution']['before']['finished'] == 1
+    assert scope['execution']['after'] == {'status': 'not_run', 'accuracy': 'exact', 'started': 0,
+                                           'finished': 0, 'not_started': 1}
+
+
+@pytest.mark.parametrize(('condition', 'reason'), [
+    ('timeout', 'execution_unverified'), ('cancelled', 'execution_unverified'),
+    ('partial', 'execution_unverified'), ('different_input', 'pytest_input_changed'),
+    ('same_snapshot', 'same_snapshot_divergence'), ('scope', 'pytest_import_origin'),
+    ('missing_shared', 'fixed_inputs_unverified'), ('missing_phase', None),
+])
+def test_call_failure_with_failed_cleanup_needs_comparable_complete_evidence(condition, reason):
+    from reprolab.project_comparison import comparison_view
+
+    identity = 'test_total.py::test_total'
+    before = {'status': 'passed', 'phases': [
+        {'phase': phase, 'outcome': 'passed', 'xfail': False} for phase in ('setup', 'call', 'teardown')
+    ]}
+    after = {'status': 'inconclusive', 'phases': [
+        {'phase': 'setup', 'outcome': 'passed', 'xfail': False},
+        {'phase': 'call', 'outcome': 'failed', 'xfail': False, 'exception': {'type': 'AssertionError'}},
+        {'phase': 'teardown', 'outcome': 'failed', 'xfail': False, 'exception': {'type': 'RuntimeError'}},
+    ]}
+    entry = {'test_id': identity, 'status': 'inconclusive', 'before': before, 'after': after}
+    run = {'status': 'completed', 'worker_record_complete': True, 'exit_code': 1, 'execution_order': [identity]}
+    report = {'runner': 'pytest', 'status': 'attention', 'entries': [entry], 'counts': {'inconclusive': 1},
+              'before': dict(run, exit_code=0), 'after': dict(run), 'shared_tests': {'test_total.py': 'a' * 64},
+              'source_sha256': {'before': 'b' * 64, 'after': 'c' * 64},
+              'source_mode_sha256': {'before': 'a' * 64, 'after': 'a' * 64}}
+    scope = None
+    if condition == 'timeout':
+        report['after']['status'] = 'timed_out'
+    elif condition == 'cancelled':
+        report['status'] = 'cancelled'
+    elif condition == 'partial':
+        report['after']['worker_record_complete'] = False
+    elif condition == 'different_input':
+        before['input_digests'], after['input_digests'] = {'input': 'b' * 64}, {'input': 'c' * 64}
+    elif condition == 'same_snapshot':
+        report['source_sha256']['after'] = report['source_sha256']['before']
+    elif condition == 'scope':
+        scope = {'reason': 'pytest_import_origin'}
+    elif condition == 'missing_shared':
+        report.pop('shared_tests')
+    elif condition == 'missing_phase':
+        after['phases'].pop()
+    evaluated, decisions = comparison_view(report, scope)
+    assert evaluated is report
+    assert decisions == ({identity: {'status': 'blocked', 'reason': reason}} if reason else {})
+
+
 def test_required_targets_and_receipt_use_saved_zip_without_running_tests(demo, tmp_path, capsys, monkeypatch):
     from reprolab import project_sessions
 

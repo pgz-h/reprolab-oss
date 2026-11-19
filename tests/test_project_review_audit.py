@@ -98,6 +98,143 @@ def test_same_red_failure_type_change_blocks_permissive_gate(repo, cli, tmp_path
     assert summary['failure_changes'][0]['after'] == [{'phase': 'call', 'type': 'TypeError'}]
 
 
+@pytest.mark.parametrize(('change', 'basis', 'exit_code'), [
+    ('different_assertion', 'site_changed', 2),
+    ('same_assertion', 'site_matched', 0),
+    ('moved_lines', 'site_matched', 0),
+    ('independent_regression', 'site_changed', 1),
+])
+def test_double_red_assertion_identity_survives_export(repo, cli, tmp_path, capsys, change, basis, exit_code):
+    message = 'PRIVATE_RECEIPT_ASSERTION_TEXT'
+    target = 'test_receipt.py::test_private_receipt'
+    predicate = (
+        'def check_receipt(total, currency):\n'
+        '    assert (\n'
+        f'        total == 10\n    ), "{message}"\n'
+        f'    assert currency == "USD", "{message}"\n'
+    )
+    write(repo, 'receipt.py', 'TOTAL, CURRENCY, READY = 9, "USD", True\n' + predicate)
+    write(repo, 'test_receipt.py',
+          'from receipt import TOTAL, CURRENCY, READY, check_receipt\n'
+          'def test_private_receipt(): check_receipt(TOTAL, CURRENCY)\n'
+          'def test_ready(): assert READY\n')
+    freeze(repo)
+    different = basis == 'site_changed'
+    ready = change != 'independent_regression'
+    constants = f'TOTAL, CURRENCY, READY = {10 if different else 9}, {"EUR" if different else "USD"!r}, {ready}\n'
+    moved = '# A comment above the function.\n\n' if change == 'moved_lines' else ''
+    write(repo, 'receipt.py', constants + moved + predicate + '# Edited candidate.\n')
+    report = review(cli, repo, tmp_path / 'runs', code=2 if ready else 1)
+    red = next(row for row in report['entries'] if row['test_id'] == target)
+    assert red['status'] == 'baseline_failure'
+    assert [red[side]['status'] for side in ('before', 'after')] == ['failed', 'failed']
+    assert {red[side]['exception']['type'] for side in ('before', 'after')} == {'AssertionError'}
+    assert red['before']['exception']['message'] == red['after']['exception']['message']
+    evidence = bundle(cli, report, tmp_path / 'report.zip')
+    Path(report['report_dir']).rename(tmp_path / 'detached-report')
+    gate = ('--gate', 'no-new-failures')
+    summary = cli('summary', evidence, '--format', 'json', '--include-test-ids', *gate, code=exit_code)
+    assert summary['assertion_comparison'] == {
+        'counts': {basis: 1}, 'items': [{'test_id': target, 'basis': basis}],
+    }
+    assert summary['gate']['reason'] == {
+        0: 'existing_failures_allowed', 1: 'new_failures', 2: 'pytest_assertion_site_changed',
+    }[exit_code]
+    assert summary['counts']['baseline_failure'] == 1
+    assert summary['counts'].get('regression_detected', 0) == int(not ready)
+    assert (report.get('comparison_scope', {}).get('reason') == 'pytest_assertion_site_changed') == different
+    sites = [red[side]['phases'][1]['assertion_site_sha256'] for side in ('before', 'after')]
+    assert all(sites) and (sites[0] != sites[1]) == different
+    public = cli('summary', evidence, '--format', 'json', '--public-summary', *gate, code=exit_code)
+    assert public['assertion_comparison'] == {'counts': {basis: 1}}
+    assert main(list(map(str, ('summary', evidence, '--public-summary', *gate)))) == exit_code
+    markdown = capsys.readouterr().out
+    for private in (str(tmp_path), 'receipt.py', target, message, 'EUR', 'USD', *sites):
+        assert private not in json.dumps(public)
+        assert private not in markdown
+
+
+@pytest.mark.parametrize(('message', 'basis', 'exit_code'), [
+    ('different observation', 'legacy_fingerprint_changed', 2),
+    ('same observation', 'legacy_fingerprint_matched', 0),
+])
+def test_legacy_zip_reports_message_basis_without_an_assertion_site(repo, cli, tmp_path, message, basis, exit_code):
+    from reprolab.project_sessions import _manifest
+
+    write(repo, 'test_total.py',
+          'from totals import total, notice\ndef test_total(): assert total == 10, notice\n')
+    write(repo, 'totals.py', 'total, notice = 9, "same observation"\n')
+    freeze(repo)
+    write(repo, 'totals.py', f'total, notice = 9, {message!r}\n')
+    report = review(cli, repo, tmp_path / 'runs', code=2)
+    target = 'test_total.py::test_total'
+    directory = Path(report['report_dir'])
+    report_path = directory / 'report.json'
+    saved = json.loads(report_path.read_text(encoding='utf-8'))
+    # Strip the optional field from each saved representation, as in pre-change evidence.
+    for side in ('before', 'after'):
+        event_path = directory / f'{side}.events.json'
+        raw = json.loads(event_path.read_text(encoding='utf-8'))
+        for phase in (raw['events'][target][1], saved[side]['tests'][target]['phases'][1],
+                      saved['entries'][0][side]['phases'][1]):
+            assert phase.pop('assertion_site_sha256')
+            assert phase.pop('assertion_occurrence')
+        event_path.write_text(json.dumps(raw), encoding='utf-8')
+        journal = directory / f'{side}.progress.jsonl'
+        records = [json.loads(line) for line in journal.read_text(encoding='utf-8').splitlines()]
+        for record in records:
+            if record.get('event') == 'phase_result':
+                record['result'].pop('assertion_site_sha256', None)
+                record['result'].pop('assertion_occurrence', None)
+        journal.write_text(''.join(json.dumps(record) + '\n' for record in records), encoding='utf-8')
+    saved['persistence'] = _manifest(directory)
+    report_path.write_text(json.dumps(saved), encoding='utf-8')
+    evidence = bundle(cli, report, tmp_path / 'legacy.zip')
+    summary = cli('summary', evidence, '--format', 'json', '--gate', 'no-new-failures', code=exit_code)
+    assert summary['counts'] == {'baseline_failure': 1}
+    assert summary['assertion_comparison'] == {'counts': {basis: 1}}
+    assert summary['gate']['reason'] == ('pytest_legacy_assertion_unverified' if exit_code
+                                         else 'existing_failures_allowed')
+
+
+@pytest.mark.parametrize(('switch', 'edit', 'regression', 'basis', 'code'), [
+    (True, '', False, 'site_changed', 2),
+    (False, '\n# move both assertions\n', False, 'site_matched', 0),
+    (False, '    value = int(value)\n', False, 'site_ambiguous', 2),
+    (True, '', True, 'site_changed', 1),
+])
+def test_repeated_assertion_occurrences_are_checked_from_zip(repo, cli, tmp_path, switch, edit, regression, basis, code):
+    helper = (
+        'def check(values):\n'
+        '    value = values[0]\n'
+        '    assert value == 1\n'
+        '    value = values[1]\n'
+        '    assert value == 1\n'
+    )
+    write(repo, 'test_values.py', 'from values import values, check, ready\ndef test_values(): check(values)\n'
+          'def test_ready(): assert ready\n')
+    write(repo, 'values.py', 'values = (0, 1)\nready = True\n' + helper)
+    freeze(repo)
+    prefix = 'values = (1, 0)\n' if switch else 'values = (0, 1)\n'
+    if edit.startswith('    '):
+        helper = helper.replace('    value = values[0]\n', '    value = values[0]\n' + edit)
+    else:
+        helper = edit + helper
+    write(repo, 'values.py', prefix + f'ready = {not regression}\n' + helper)
+    report = review(cli, repo, tmp_path / 'runs', code=1 if regression else 2)
+    repeated = next(row for row in report['entries'] if row['test_id'] == 'test_values.py::test_values')
+    before, after = (repeated[side]['phases'][1] for side in ('before', 'after'))
+    assert before['assertion_site_sha256'] == after['assertion_site_sha256']
+    assert before['exception'] == after['exception']
+    assert before['assertion_occurrence']['index'] == 1
+    assert after['assertion_occurrence']['index'] == (2 if switch else 1)
+    evidence = bundle(cli, report, tmp_path / 'evidence.zip')
+    summary = cli('summary', evidence, '--gate', 'no-new-failures', '--format', 'json', code=code)
+    assert summary['counts']['baseline_failure'] == 1
+    assert summary['counts'].get('regression_detected', 0) == int(regression)
+    assert summary['assertion_comparison'] == {'counts': {basis: 1}}
+
+
 def test_promoted_plan_gates_scope_and_keeps_passing_after_merge(repo, cli, tmp_path):
     from reprolab.acceptance_plan import AcceptancePlan, read_acceptance_plan, save_acceptance_plan
 
@@ -568,6 +705,269 @@ def test_recommendation_uses_qualified_imports_and_actual_discovery(repo, cli, t
     assert 'left.calc' in discovery['recommendations']['check_math.py::test_related']
 
 
+def test_indirect_recommendation_finds_receipt_regression_without_selecting_catalog(repo, cli, tmp_path):
+    from reprolab.acceptance_plan import AcceptancePlan, save_acceptance_plan
+
+    direct = 'test_discount.py::test_floor'
+    indirect = 'test_receipt.py::test_decimals'
+    catalog = 'test_catalog.py::test_slug'
+    write(repo, 'money.py', 'def discount(): return -3\ndef display(): return "5.00"\n')
+    write(repo, 'receipt.py', 'from money import display\ndef render(): return display()\n')
+    write(repo, 'test_discount.py', 'from money import discount\ndef test_floor(): assert discount() == 0\n')
+    write(repo, 'test_receipt.py', 'from receipt import render\ndef test_decimals(): assert render() == "5.00"\n')
+    write(repo, 'test_catalog.py', 'def test_slug(): assert "SKU".lower() == "sku"\n')
+    freeze(repo)
+    write(repo, 'money.py', 'def discount(): return 0\ndef display(): return "5"\n')
+    session = cli('prepare', repo, '--before', 'HEAD', '--working-tree', '--output', tmp_path / 'sessions')
+    collection = cli('collect', session['directory'])
+    assert collection['tests'] == [catalog, direct, indirect]
+    assert collection['recommendations'] == session['recommendations'] == {
+        direct: '直接静态导入关联到改动模块 · money',
+        indirect: '间接静态导入推断 · test_receipt.py:1 → receipt.py:1 → money.py',
+    }
+    selection = tmp_path / 'recommended.txt'
+    selection.write_text('\n'.join(collection['recommendations']) + '\n', encoding='utf-8')
+    report = cli('run', session['directory'], '--selection-file', selection, '--output', tmp_path / 'runs', code=1)
+    assert report['selected_tests'] == [direct, indirect]
+    assert report['counts'] == {'improved': 1, 'regression_detected': 1}
+    archive = bundle(cli, report, tmp_path / 'evidence.zip')
+    assert cli('summary', archive, '--gate', 'no-new-failures', '--format', 'json', code=1)['gate']['reason'] == 'new_failures'
+
+    plan = tmp_path / 'plan.json'
+    save_acceptance_plan(AcceptancePlan('pytest', 'no-new-failures', (direct,)), plan)
+    planned = cli('run', session['directory'], '--acceptance-plan', plan, '--verify-plan', '--output', tmp_path / 'planned')
+    assert planned['selected_tests'] == [direct]
+    assert planned['acceptance']['gate']['exit_code'] == 0
+
+
+def test_static_recommendations_resolve_relative_packages_cycles_and_ambiguous_names(tmp_path):
+    from reprolab.project_recommendations import recommend_project_tests
+
+    snapshot = tmp_path / 'candidate'
+    files = {
+        'src/store/__init__.py': 'from .bridge import render\n',
+        'src/store/bridge.py': 'from .helper import render\n',
+        'src/store/helper.py': 'from . import bridge\nfrom .money import render\n',
+        'src/store/money.py': 'def render(): return "5"\n',
+        'src/shop/money.py': 'def render(): return "5.00"\n',
+        'src/ns/receipt.py': 'from .money import render\n',
+        'src/ns/money.py': 'def render(): return "5"\n',
+        'test_receipt.py': 'from store import render\n',
+        'test_unrelated.py': 'from shop.money import render\n',
+        'test_ns.py': 'import ns.receipt\n',
+        'test_dynamic.py': 'from importlib import import_module\nrender = import_module("store.money").render\n',
+        'test_ambiguous.py': 'from shared import render\n',
+        'test_package.py': 'import other.detail\n',
+        'tests/scoped/conftest.py': '',
+        'tests/scoped/test_fixture.py': 'def test_value(): pass\n',
+        'tests/scoped/test_changed.py': 'def test_value(): pass\n',
+        'shared.py': 'def render(): return "5"\n',
+        'src/shared.py': 'def render(): return "5.00"\n',
+        'other/__init__.py': '',
+        'other/detail.py': '',
+    }
+    for path, content in files.items():
+        write(snapshot, path, content)
+    paths = ('src/store/money.py', 'src/ns/money.py', 'shared.py', 'other/__init__.py',
+             'tests/scoped/conftest.py', 'tests/scoped/test_changed.py')
+    changes = [{'path': path, 'kind': 'modified'} for path in paths]
+    tests = [path + '::test_value' for path in files if Path(path).name.startswith('test_')]
+    reasons = recommend_project_tests(changes, tests, snapshot, snapshot)
+    assert reasons == {
+        'test_receipt.py::test_value': (
+            '间接静态导入推断 · test_receipt.py:1 → src/store/__init__.py:1 → src/store/bridge.py:1'
+            ' → src/store/helper.py:2 → src/store/money.py'),
+        'test_ns.py::test_value': '间接静态导入推断 · test_ns.py:1 → src/ns/receipt.py:1 → src/ns/money.py',
+        'test_package.py::test_value': '直接静态导入关联到改动模块 · other',
+        'tests/scoped/test_fixture.py::test_value': '该目录的 fixture 或测试配置发生变化',
+        'tests/scoped/test_changed.py::test_value': '本次修改了这个测试文件',
+    }
+
+
+def test_fixture_recommendation_uses_only_the_collected_binding_and_never_runs_it_at_collection(repo, cli, tmp_path):
+    receipt = 'tests/test_customer.py::test_receipt'
+    catalog = 'tests/test_customer.py::test_catalog'
+    discount = 'test_discount.py::test_floor'
+    marker = tmp_path / 'fixture-ran'
+    write(repo, 'money.py', 'def display(): return "5.00"\nFLOOR = -3\n')
+    write(repo, 'tests/conftest.py',
+          'import pytest\nfrom pathlib import Path\nfrom money import display\n'
+          '@pytest.fixture(scope="session")\n'
+          f'def rendered():\n    Path({str(marker)!r}).touch()\n    return display()\n'
+          '@pytest.fixture\ndef receipt_text(rendered): return rendered\n'
+          '@pytest.fixture\ndef catalog_item():\n    display = str\n    return display("SKU")\n')
+    write(repo, 'tests/test_customer.py',
+          'def test_receipt(receipt_text): assert receipt_text == "5.00"\n'
+          'def test_catalog(catalog_item): assert catalog_item == "SKU"\n')
+    write(repo, 'test_discount.py', 'from money import FLOOR\ndef test_floor(): assert FLOOR == 0\n')
+    freeze(repo)
+    write(repo, 'money.py', 'def display(): return "5"\nFLOOR = 0\n')
+    session = cli('prepare', repo, '--before', 'HEAD', '--working-tree', '--output', tmp_path / 'sessions')
+    assert set(session['recommendations']) == {discount}
+    collection = cli('collect', session['directory'])
+    assert not marker.exists()
+    assert set(collection['tests']) == {receipt, catalog, discount}
+    assert set(collection['recommendations']) == {receipt, discount}
+    assert collection['recommendations'][receipt].endswith(
+        'rendered（tests/conftest.py:4） → tests/conftest.py:3 → money.py')
+    bindings = collection['fixture_bindings']
+    assert bindings['status'] == 'recorded'
+    assert {bindings['definitions'][index]['name'] for index in bindings['tests'][receipt]} == {'receipt_text', 'rendered'}
+    assert [bindings['definitions'][index]['name'] for index in bindings['tests'][catalog]] == ['catalog_item']
+    selection = tmp_path / 'recommended.txt'
+    selection.write_text('\n'.join(collection['recommendations']) + '\n', encoding='utf-8')
+    report = cli('run', session['directory'], '--selection-file', selection, '--output', tmp_path / 'runs', code=1)
+    assert marker.is_file()
+    assert report['selected_tests'] == [discount, receipt]
+    archive = bundle(cli, report, tmp_path / 'recommendation.zip')
+    # Import and summarize independently of the source report directory.
+    Path(report['report_dir']).rename(tmp_path / 'moved-report')
+    imported = cli('unpack', archive, tmp_path / 'imported')
+    state = Path(imported['report_dir']) / 'evidence/project/project.json'
+    saved = json.loads(state.read_bytes())
+    assert json.loads((state.parent / saved['collection_record']).read_bytes())['fixture_bindings'] == bindings
+    public = cli('summary', archive, '--public-summary', '--gate', 'no-new-failures', '--format', 'json', code=1)
+    assert public['counts'] == {'improved': 1, 'regression_detected': 1}
+    assert 'receipt_text' not in json.dumps(public) and 'conftest.py' not in json.dumps(public)
+    assert public['run_scope']['recommendations'] == {
+        'status': 'recorded', 'count': 2, 'selected_count': 2, 'omitted_count': 0,
+    }
+    narrow = cli('run', session['directory'], '--test', discount, '--output', tmp_path / 'narrow')
+    assert narrow['selected_tests'] == [discount]
+    narrow_zip = bundle(cli, narrow, tmp_path / 'narrow.zip')
+    summary = cli('summary', narrow_zip, '--gate', 'no-new-failures', '--format', 'json', '--include-test-ids')
+    scope = summary['run_scope']
+    assert scope['discovery'] == {'status': 'complete', 'count': 3, 'accuracy': 'exact'}
+    assert scope['recommendations']['omitted_tests'] == [{
+        'test_id': receipt, 'reason': collection['recommendations'][receipt], 'outcome': 'not_observed',
+    }]
+    assert all(side['started'] == side['finished'] == 1 for side in scope['execution'].values())
+    assert '未纳入 1 项（本轮结果未知）' in Path(narrow['report_dir'], 'report.html').read_text(encoding='utf-8')
+
+
+def test_fixture_recommendations_follow_overrides_autouse_and_parameter_binding(repo, cli, tmp_path):
+    write(repo, 'money.py', 'PRICE = 1\n')
+    write(repo, 'formatting.py', 'from money import PRICE\n')
+    write(repo, 'conftest.py',
+          'import pytest\nfrom money import PRICE\n'
+          '@pytest.fixture(scope="session", name="price")\n'
+          'def original(request): return PRICE\n')
+    write(repo, 'tests/override/conftest.py', 'import pytest\n@pytest.fixture\ndef price(): return 1\n')
+    write(repo, 'tests/override/test_override.py', 'def test_override(price): pass\n')
+    write(repo, 'tests/delegated/conftest.py', 'import pytest\n@pytest.fixture\ndef price(price): return price\n')
+    write(repo, 'tests/delegated/test_delegate.py', 'def test_delegate(price): pass\n')
+    write(repo, 'tests/automatic/conftest.py',
+          'import pytest\n@pytest.fixture(autouse=True, scope="module")\n'
+          'def setup():\n    from formatting import PRICE\n    return PRICE\n')
+    write(repo, 'tests/automatic/test_auto.py', 'def test_auto(): pass\n')
+    write(repo, 'tests/test_values.py',
+          'import pytest\n'
+          '@pytest.mark.parametrize("price", [1], ids=["manual"])\n'
+          'def test_direct(price): pass\n'
+          '@pytest.mark.parametrize("price", [1], ids=["bound"], indirect=True)\n'
+          'def test_indirect(price): pass\n'
+          '@pytest.mark.usefixtures("price")\ndef test_mark(): pass\n'
+          'def test_dynamic(request): request.getfixturevalue("price")\n')
+    freeze(repo)
+    write(repo, 'money.py', 'PRICE = 2\n')
+    session = cli('prepare', repo, '--before', 'HEAD', '--working-tree', '--output', tmp_path / 'sessions')
+    collection = cli('collect', session['directory'])
+    hints = collection['recommendations']
+    automatic = 'tests/automatic/test_auto.py::test_auto'
+    delegated = 'tests/delegated/test_delegate.py::test_delegate'
+    overridden = 'tests/override/test_override.py::test_override'
+    assert set(hints) == {automatic, delegated, 'tests/test_values.py::test_indirect[bound]', 'tests/test_values.py::test_mark'}
+    assert hints[automatic].endswith('tests/automatic/conftest.py:4 → formatting.py:1 → money.py')
+    bindings = collection['fixture_bindings']
+
+    def definitions(test):
+        return {(bindings['definitions'][index]['path'], bindings['definitions'][index]['scope'])
+                for index in bindings['tests'][test]}
+
+    assert definitions(automatic) == {('tests/automatic/conftest.py', 'module')}
+    assert definitions(overridden) == {('tests/override/conftest.py', 'function')}
+    assert definitions(delegated) == {('tests/delegated/conftest.py', 'function'), ('conftest.py', 'session')}
+
+
+def test_removed_dependency_can_be_traced_in_the_baseline_snapshot(tmp_path):
+    from reprolab.project_recommendations import recommend_project_tests
+
+    before, after = tmp_path / 'before', tmp_path / 'after'
+    for side in (before, after):
+        write(side, 'test_receipt.py', 'from receipt import render\n')
+        write(side, 'receipt.py', 'try:\n    from old_money import render\nexcept ImportError:\n    pass\n')
+    write(before, 'old_money.py', 'def render(): pass\n')
+    recommendation = recommend_project_tests([{'path': 'old_money.py', 'kind': 'removed'}],
+                                             ['test_receipt.py::test_value'], before, after)
+    assert recommendation == {
+        'test_receipt.py::test_value': '间接静态导入推断 · test_receipt.py:1 → receipt.py:2 → old_money.py（基线快照）',
+    }
+
+
+@pytest.mark.parametrize(('case', 'code', 'call_outcome', 'cleanup_failed'), [
+    ('skipped', 2, 'not_observed', 0), ('cleanup_only', 2, 'passed', 1),
+    ('both_fail', 1, 'failed', 1), ('clean_control', 1, 'failed', 0),
+    ('xfail', 2, 'xfail_marked', 1), ('changed_parameter', 2, 'failed', 1),
+])
+def test_pytest_call_failure_and_lifecycle_are_independently_checked_in_zip(
+        repo, cli, tmp_path, case, code, call_outcome, cleanup_failed):
+    from reprolab.acceptance_plan import AcceptancePlan, save_acceptance_plan
+
+    identity = 'test_receipt.py::test_total' + ('[same]' if case == 'changed_parameter' else '')
+    write(repo, 'checkout.py', 'TOTAL = 10\nMAINTENANCE = False\nCLEAN = True\n')
+    markers = {
+        'skipped': '@pytest.mark.skipif(MAINTENANCE, reason="maintenance")\n',
+        'xfail': '@pytest.mark.xfail(MAINTENANCE, reason="expected")\n',
+        'changed_parameter': '@pytest.mark.parametrize("check", [TOTAL], ids=["same"])\n',
+    }
+    args = 'cleanup, check' if case == 'changed_parameter' else 'cleanup'
+    write(repo, 'test_receipt.py',
+          'import pytest\nfrom checkout import TOTAL, MAINTENANCE, CLEAN\n'
+          '@pytest.fixture\ndef cleanup():\n    yield\n    if not CLEAN: raise RuntimeError("PRIVATE CLEANUP VALUE")\n'
+          + markers.get(case, '') + f'def test_total({args}): assert TOTAL == 10\n')
+    freeze(repo)
+    write(repo, 'checkout.py', f'TOTAL = {10 if case == "cleanup_only" else 12}\n'
+          f'MAINTENANCE = True\nCLEAN = {not cleanup_failed}\n')
+    report = review(cli, repo, tmp_path / 'run', '--test', identity, code=code)
+    source = Path(report['report_dir'])
+    evidence = bundle(cli, report, tmp_path / 'phase.zip')
+    summary = cli('summary', evidence, '--gate', 'no-new-failures', '--format', 'json', '--include-test-ids', code=code)
+    assert summary['pytest_phases']['calls']['before'] == {'passed': 1}
+    assert summary['pytest_phases']['calls']['after'] == {call_outcome: 1}
+    issues = summary['pytest_phases']['lifecycle_issues']['after']
+    if case == 'xfail':
+        assert issues == {'teardown_skipped': 1}
+    else:
+        assert issues.get('teardown_failed', 0) == cleanup_failed
+    assert summary['counts'] == ({'regression_detected': 1} if code == 1 else {'inconclusive': 1})
+    if case == 'both_fail':
+        assert report['counts'] == summary['observed_counts'] == {'inconclusive': 1}
+        assert report['comparison_counts'] == {'regression_detected': 1}
+        stored = json.loads((source / 'report.json').read_bytes())
+        assert stored['phase_decisions'][identity]['status'] == 'confirmed'
+        assert summary['pytest_phases']['retained_call_regressions'] == 1
+        assert '主体新增失败，同项清理失败' in (source / 'report.html').read_text(encoding='utf-8')
+        plan_path = tmp_path / 'plan.json'
+        save_acceptance_plan(AcceptancePlan('pytest', 'no-new-failures', (), required_passes=(identity,)), plan_path)
+        planned = cli('summary', evidence, '--acceptance-plan', plan_path, '--format', 'json', code=1)
+        assert planned['comparison_gate']['exit_code'] == 1
+        assert planned['required_passes'][0]['status'] == 'blocked'
+        stored['phase_decisions'][identity]['status'] = 'blocked'
+        (source / 'report.json').write_text(json.dumps(stored), encoding='utf-8')
+        assert cli('check', source, code=2)['status'] == 'inconsistent'
+    if case == 'changed_parameter':
+        decision = summary['pytest_phases']['details'][0]['comparison']
+        assert decision == {'status': 'blocked', 'reason': 'pytest_parameter_changed'}
+    if case == 'cleanup_only':
+        plan_path = tmp_path / 'plan.json'
+        save_acceptance_plan(AcceptancePlan('pytest', 'no-new-failures', (), required_passes=(identity,)), plan_path)
+        planned = cli('summary', evidence, '--acceptance-plan', plan_path, '--format', 'json', code=2)
+        assert planned['required_passes'][0]['status'] == 'blocked'
+    public = cli('summary', evidence, '--gate', 'no-new-failures', '--public-summary', '--format', 'json', code=code)
+    assert 'details' not in public['pytest_phases']
+    assert not any(text in json.dumps(public) for text in (identity, 'PRIVATE CLEANUP VALUE', 'RuntimeError'))
+
+
 def test_projects_restore_lost_run_cache_and_find_moved_reports(repo, cli, tmp_path):
     import shutil
 
@@ -685,7 +1085,8 @@ def test_public_summary_omits_private_field_names_and_full_evidence(tmp_path, re
     summary = cli(*args, '--format', 'json', code=1)
     assert summary['kind'] == 'project_review_public_summary'
     assert set(summary) == {'kind', 'schema_version', 'runner', 'verdict', 'counts',
-                            'selected_count', 'report_sha256', 'gate'}
+                            'selected_count', 'report_sha256', 'gate', 'comparison_type', 'run_scope', 'pytest_phases'}
+    assert summary['comparison_type'] == 'direct'
     assert 'private' not in markdown.read_text()
     assert 'private' not in json.dumps(summary)
     check = cli('check-summary', source, markdown, '--public-summary', '--require-improvement', test)

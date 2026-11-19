@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 
 MAX_STREAM_BYTES = 128 * 1024 * 1024
 MAX_LINE_BYTES = 64 * 1024
@@ -10,6 +11,18 @@ OBSERVATION_LABELS = {'passed': '通过', 'failed': '失败', 'skipped': '跳过
                       'not_run': '尚无阶段记录', 'inconclusive': '阶段未完整结束'}
 PHASE_LABELS = {'collection': '收集测试', 'setup': '准备', 'call': '测试主体',
                 'teardown': '清理', 'between': '切换测试', 'finished': '执行结束'}
+
+def _sha256(value):
+    return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) is not None
+
+
+def _valid_assertion_occurrence(value):
+    if (not isinstance(value, dict) or value.keys() != {'index', 'count', 'scope_sha256'}
+            or any(type(value[key]) is not int for key in ('index', 'count'))
+            or not 1 <= value['index'] <= value['count']):
+        return False
+    return value['scope_sha256'] is None if value['count'] == 1 else _sha256(value['scope_sha256'])
+
 
 
 def selection_digest(selected):
@@ -114,6 +127,20 @@ class ProgressReader:
                 if error is not None and (not isinstance(error, dict)
                         or any(not isinstance(error.get(key), str) for key in ('type', 'message'))):
                     raise ValueError('异常记录无效。')
+                if 'assertion_site_sha256' in observation:
+                    site = observation['assertion_site_sha256']
+                    if (phase != 'call' or observation['outcome'] != 'failed' or observation['xfail']
+                            or not error or error['type'] != 'AssertionError'
+                            or (site is not None and not _sha256(site))):
+                        raise ValueError('断言位置指纹无效。')
+                if 'assertion_occurrence' in observation and (
+                        not observation.get('assertion_site_sha256')
+                        or not _valid_assertion_occurrence(observation['assertion_occurrence'])):
+                    raise ValueError('重复断言的位置记录无效。')
+                if 'assertion_location_ambiguous' in observation and (
+                        observation['assertion_location_ambiguous'] is not True
+                        or 'assertion_site_sha256' not in observation or observation['assertion_site_sha256'] is not None):
+                    raise ValueError('断言位置歧义记录无效。')
                 self.events.setdefault(identity, []).append(observation)
                 self.current_phase = 'between'
                 if phase == 'teardown':

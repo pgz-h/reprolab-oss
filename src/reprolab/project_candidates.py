@@ -1,7 +1,39 @@
 """Collect independent candidates and their ancestry over one verified baseline."""
 from .project_history import _checked_report, _match_reference
+from .project_candidate_scenarios import compare_candidate_scenarios
+from .project_order import observed_pytest_orders
 from .project_review_summary import _review_summary, review_summary
 from .replay_verification import _conditions, open_replay_evidence
+
+
+def _compare_orders(rows, runner, *, same_baseline, same_selection, issues):
+    if not (same_baseline and same_selection):
+        return 'not_comparable', None
+    if len(rows) < 2:
+        return 'insufficient_candidates', None
+    if runner != 'pytest':
+        return 'not_applicable', None
+    reference = None
+    changed = incomplete = False
+    for row in rows:
+        for side, observed in row['observed_orders'].items():
+            if observed['status'] != 'complete':
+                incomplete = True
+                issues.append({'name': row['name'], 'side': side, 'reason': 'execution_order_unverified'})
+                continue
+            if reference is None:
+                reference = {'test_ids': observed['started_tests'], 'name': row['name'],
+                             'side': side, 'basis': observed['source']}
+            elif observed['started_tests'] != reference['test_ids']:
+                changed = True
+                issues.append({'name': row['name'], 'side': side, 'reason': 'observed_execution_order_changed',
+                               'reference': {'name': reference['name'], 'side': reference['side']}})
+    if not (changed or incomplete):
+        return 'matched', None
+    rerun = reference if reference is not None else {
+        'test_ids': rows[0]['selected_tests'], 'name': rows[0]['name'], 'basis': 'requested_order',
+    }
+    return ('different' if changed else 'unknown'), rerun
 
 
 def compare_candidates(candidates, *, policy, control, plan=None, _allow_single=False):
@@ -39,6 +71,7 @@ def compare_candidates(candidates, *, policy, control, plan=None, _allow_single=
                            'comparison_baseline': 'matched' if comparable else 'blocked',
                            'candidate': report.get('source_sha256', {}).get('after'),
                            'selected_tests': report['selected_tests'], 'gate': summary['gate'], 'conditions': same_conditions,
+                           'observed_orders': observed_pytest_orders(report),
                            'outcomes': [{'test_id': item['test_id'], 'status': item['status'],
                                          'before': item['before']['status'], 'after': item['after']['status']}
                                         for item in report['entries']]})
@@ -56,6 +89,10 @@ def compare_candidates(candidates, *, policy, control, plan=None, _allow_single=
     shared = (set.intersection(*(set(row['selected_tests']) for row in eligible)) if eligible else set())
     root_tests = set(output[0]['selected_tests'])
     same_scope = all(set(row['selected_tests']) == root_tests for row in output)
+    same_request = all(row['selected_tests'] == output[0]['selected_tests'] for row in output)
+    order_status, rerun = _compare_orders(output, anchor['runner'], same_baseline=len(eligible) == len(output),
+                                          same_selection=same_scope, issues=issues)
+    scenario = compare_candidate_scenarios(output, eligible, reports, shared, issues) if anchor['runner'] == 'pytest' else None
     # Tests stored from different candidate files have separate observations. They
     # are not treated as evidence of the same assertion.
     def check_fingerprint(row, target):
@@ -67,13 +104,17 @@ def compare_candidates(candidates, *, policy, control, plan=None, _allow_single=
     same_checks = {target for target in shared if None not in (
         values := {check_fingerprint(row, target) for row in eligible}) and len(values) == 1}
     states = {row['gate']['status'] for row in eligible}
-    status = ('failed' if 'failed' in states else 'blocked'
-              if issues or 'blocked' in states or not same_scope or same_checks != shared else 'passed')
+    comparable = not issues and same_scope and same_checks == shared and order_status in ('matched', 'not_applicable')
+    status = 'failed' if 'failed' in states else 'blocked' if not comparable or 'blocked' in states else 'passed'
     code = {'passed': 0, 'failed': 1, 'blocked': 2}[status]
     return {'kind': 'project_candidate_history', 'schema_version': 1, 'status': status, 'exit_code': code,
             'baseline': anchor, 'shared_tests': sorted(shared), 'same_test_content': sorted(same_checks),
-            'same_selection': same_scope, 'candidates': output, 'issues': issues,
-            'notice': '候选来源和运行分开核对，共同测试不表示外部环境或未记录的辅助输入相同。'}, code
+            'same_selection': same_scope, 'same_requested_order': same_request, 'comparable': comparable,
+            'same_execution_order': {'matched': True, 'different': False}.get(order_status),
+            'execution_order_status': order_status, **({'order_rerun': rerun} if rerun else {}),
+            **({'scenario_comparison': scenario} if scenario is not None else {}),
+            'candidates': output, 'issues': issues,
+            'notice': '候选门禁按各自记录判定。未记录的外部值保持未知。请按问题清单对齐条件与输入后复跑相关测试。'}, code
 
 
 def run_candidates(repository, before, candidates, output, *, selected, plan, python_executable, timeout, confirmed, control):
@@ -94,7 +135,8 @@ def run_candidates(repository, before, candidates, output, *, selected, plan, py
     resolved = [(name, resolve_commit(root, version)) for name, version in candidates]
     targets = validate_selection(selected if selected is not None else execution_selection(plan, 'pytest') if plan else [])
     if not confirmed:
-        return {'status': 'ready', 'baseline': before, 'candidates': resolved, 'tests': targets}, 0
+        return {'status': 'ready', 'baseline': before, 'candidates': resolved, 'tests': targets,
+                **({'clock_control': control.clock_control} if control.clock_control is not None else {})}, 0
     output = Path(output).expanduser().absolute()
     if output.exists() or output.is_symlink() or output.resolve().is_relative_to(root):
         raise ValueError('请选择仓库之外的新候选比较目录。')
@@ -119,10 +161,13 @@ def run_candidates(repository, before, candidates, output, *, selected, plan, py
                                               control=control, plan=plan, _allow_single=True)
         else:
             result, code = {'kind': 'project_candidate_history', 'schema_version': 1, 'status': 'blocked',
+                            'comparable': False, 'execution_order_status': 'insufficient_candidates',
                             'candidates': [], 'issues': []}, 2
         result['references'] = [{'name': name, 'report': Path(path).relative_to(stage).as_posix()}
                                 for name, path in reports]
         result['issues'].extend(issues)
+        if issues:
+            result['comparable'] = False
         if issues and code == 0:
             result['status'], code = 'blocked', 2
         result['exit_code'] = code

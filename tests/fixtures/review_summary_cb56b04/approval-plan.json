@@ -1,0 +1,9 @@
+{
+  "kind": "project_acceptance_plan",
+  "schema_version": 1,
+  "runner": "pytest",
+  "policy": "no-new-failures",
+  "required_tests": [],
+  "require_receipt": false,
+  "min_stability_rounds": null
+}

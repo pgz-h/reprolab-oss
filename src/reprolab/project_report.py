@@ -18,11 +18,14 @@ from .project_archive import archive_preflight_text
 from .project_input_control import input_changes
 from .project_comparison import (
     DIVERGENT_OUTCOME_LABELS, comparison_blocked, comparison_scope, comparison_scope_message,
-    comparison_verdict, pytest_order_difference,
+    comparison_verdict, comparison_view, pytest_order_difference,
 )
 from .pytest_profile import describe_pytest_rules
 from .project_diagnostics import VITEST_OFFLINE_CACHE_MISSING, group_project_failures, vitest_offline_cache_misses
 from .project_progress import OBSERVATION_LABELS
+from .project_pr_context import COMPARISON_LABELS, comparison_type
+from .project_pytest_phases import phase_observations, phase_overview_text, recorded_phases
+from .project_run_scope import pytest_run_scope, run_scope_lines
 
 
 _ENTRY_LABELS = {
@@ -114,6 +117,10 @@ def _outcome(value):
     if outcome.get("reason"):
         content += f'<p class="muted">{_e(outcome["reason"])}</p>'
     if phases:
+        observed = recorded_phases(outcome)
+        labels = {**_OUTCOME_LABELS, 'not_observed': '无观察', 'xfail_marked': '有 xfail 标记'}
+        content = ('<p class="muted">主体（call）' + _e(labels[observed['call']]) + ' · 清理（teardown）'
+                   + _e(labels[observed['teardown']]) + '</p>') + content
         phase_html = []
         for raw in phases:
             phase = _mapping(raw)
@@ -200,12 +207,13 @@ def _matrix(entries, memberships=None, *, target_label="测试 node ID", labels=
         search = " ".join((entry["test_id"], *(labels.get(key, key) for key in sorted(statuses)),
                            _json(entry.get("before")), _json(entry.get("after"))))
         missing = '<span class="missing">逐项结论未记录，暂列受阻</span>' if entry.get("missing_entry") else ""
+        phase_note = '<p class="muted">主体新增失败，同项清理失败。</p>' if entry.get('observed_status') == 'inconclusive' else ''
         rows.append(
             f'<tr class="test-row" data-status="{status}" data-statuses="{_e(" ".join(sorted(statuses)))}" '
             f'data-groups="{_e(" ".join((memberships or {}).get(entry["test_id"], [])))}" data-search="{_e(search)}">'
             f'<th scope="row"><code class="node-id">{_e(entry["test_id"])}</code>{missing}</th>'
             f'<td><span class="classification {status}">{_e(labels[status])}</span>'
-            + (f'<p>{_e(entry["reason"])}</p>' if entry.get("reason") else '') + _case_comparison(entry, labels) + '</td>'
+            + phase_note + (f'<p>{_e(entry["reason"])}</p>' if entry.get("reason") else '') + _case_comparison(entry, labels) + '</td>'
             f'<td>{_outcome(entry.get("before"))}</td><td>{_outcome(entry.get("after"))}</td></tr>'
         )
     empty = '<p class="empty">没有可展示的所选测试记录。</p>' if not entries else ""
@@ -569,11 +577,13 @@ _CSS = """
 """
 
 
-def write_project_report(report: dict) -> str:
+def write_project_report(report: dict, *, collection=None) -> str:
     """Write only ``report_dir/report.html`` and return its absolute path."""
     if not isinstance(report, dict) or not report.get("report_dir"):
         raise ValueError("项目报告必须包含 report_dir。")
-    entries = _entries(report)
+    finding = comparison_scope(report)
+    compared, decisions = comparison_view(report, finding)
+    entries = _entries(compared)
     runner = report.get("runner")
     is_vitest = runner == "vitest"
     cache_misses = vitest_offline_cache_misses(report)
@@ -586,13 +596,12 @@ def write_project_report(report: dict) -> str:
                             + '</option>' for group in diagnostics['groups'])
     counts = Counter(entry.get("status") if entry.get("status") in _ENTRY_LABELS else "inconclusive"
                      for entry in entries)
-    finding = comparison_scope(report)
     labels = _ENTRY_LABELS
     if finding and finding['divergent_outcomes']:
         labels = {**labels, **DIVERGENT_OUTCOME_LABELS}
-    status = comparison_verdict(report, finding)
+    status = comparison_verdict(compared, finding)
     heading, style, explanation = _GLOBAL.get(status, _GLOBAL["attention"])
-    if comparison_blocked(report, finding):
+    if comparison_blocked(compared, finding):
         heading = {'same_snapshot_divergence': '同快照结果分歧', 'excluded_changes_only': '本次改动未纳入快照',
                    'pytest_import_origin': '实际导入来源需核对',
                    'pytest_test_source_control': '基线测试文件对照',
@@ -603,6 +612,10 @@ def write_project_report(report: dict) -> str:
                    'pytest_fixture_control': '基线夹具对照结果',
                    'pytest_discovery_scope': '测试保护范围需核对',
                    'failure_shape_changed': '故障表现变化',
+                   'pytest_assertion_site_changed': '失败断言需复核',
+                   'pytest_assertion_site_ambiguous': '重复断言需复核',
+                   'pytest_legacy_assertion_site_unverified': '旧断言位置需复核',
+                   'pytest_legacy_assertion_unverified': '旧证据中的失败需复核',
                    'pytest_version_order': '版本先后对照结果',
                    'pytest_order_control': '固定顺序对照结果'}[finding['reason']]
         explanation = _e(comparison_scope_message(finding))
@@ -611,16 +624,10 @@ def write_project_report(report: dict) -> str:
     title = report.get("title") or "项目回归报告"
     selected = _items(report.get("selected_tests"))
     selected_count = len(selected) if "selected_tests" in report else len(entries)
+    discovery_record = collection
     collection = _mapping(report.get("collection"))
-    collected = collection.get("count")
-    if collected is None and isinstance(collection.get("tests"), list):
-        collected = len(collection["tests"])
-    discovery = f"实际收集 {_value(collected)} 项" if collected is not None else "实际收集总数未记录"
-    if collection.get("collection_path"):
-        discovery += " · 发现范围 " + collection["collection_path"]
-    if collection.get("truncated"):
-        discovery += "（发现列表已截断）"
     case_summary = ''
+    omitted_notes = ''
     if is_vitest:
         scope = f'本次选择 <strong>{selected_count}</strong> 个测试文件。'
         if 'case_counts' in report:
@@ -636,7 +643,21 @@ def write_project_report(report: dict) -> str:
     elif runner == 'go':
         scope = f'本次选择 <strong>{selected_count}</strong> 个顶层 Go 测试 · 包目录 {_e(report["go_package"])}。'
     else:
-        scope = f'本次选择 <strong>{selected_count}</strong> 个测试 · {_e(discovery)} · 表中展示 <strong>{len(entries)}</strong> 项。结论仅覆盖这些所选测试。'
+        run_scope = pytest_run_scope(report, collection=discovery_record, include_omitted=True)
+        phase_text = phase_overview_text(phase_observations(report, decisions))
+        scope = '<br>'.join(map(_e, [*run_scope_lines(run_scope), *phase_text]))
+        recommendations = run_scope['recommendations']
+        if omitted := recommendations.get('omitted_tests'):
+            items = ''.join(f'<li><code>{_e(row["test_id"])}</code> · {_e(row["reason"])}</li>' for row in omitted)
+            remaining = recommendations['omitted_count'] - len(omitted)
+            extra = f'<p>另有 {remaining} 项，见保存的发现记录。</p>' if remaining else ''
+            omitted_notes = ('<details><summary>查看未纳入的推荐测试</summary>'
+                             f'<ul class="scope-list">{items}</ul>{extra}</details>')
+    purpose = comparison_type(report)
+    comparison = ''
+    if purpose != 'direct':
+        comparison = (f'<p class="scope">{COMPARISON_LABELS[purpose]} · '
+                      f'<code>{_e(report["before_commit"])}</code> → <code>{_e(report["after_commit"])}</code></p>')
     stats = "".join(f'<div class="stat {key}"><b>{counts[key]}</b><span>{label}</span></div>'
                     for key, label in labels.items())
     filter_counts = Counter(status for entry in entries for status in _entry_statuses(entry))
@@ -667,7 +688,7 @@ def write_project_report(report: dict) -> str:
 <main><p class="eyebrow">ONE PROJECT · TWO SNAPSHOTS · SELECTED TESTS</p><h1>{_e(title)}</h1>
 <p class="subtitle">项目 {_e(_value(report.get("project_id")))} · 运行 {_e(_value(report.get("run_id")))} · {_e(_value(report.get("created_at")))}</p>
 <section class="hero {style}" aria-label="本次项目回归结论"><h2>{heading}</h2><p>{explanation}</p>
-<p class="scope">{scope}</p>{acceptance_note}{_archive_preflight(report)}{notice}{issue}{collection_error}</section>
+{comparison}<p class="scope">{scope}</p>{omitted_notes}{acceptance_note}{_archive_preflight(report)}{notice}{issue}{collection_error}</section>
 <div class="stats" aria-label="逐项结果数量">{stats}</div>
 {case_summary}{_diagnostic_overview(diagnostics)}
 <section class="card section" id="tests"><div class="section-head"><div><p class="eyebrow">TEST MATRIX</p><h2>逐项比较前后结果</h2></div><span class="tag">同一份目标测试</span></div>

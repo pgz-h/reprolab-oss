@@ -1,6 +1,6 @@
 """Local before/after regression verification."""
 
-__version__ = "0.19.0a23"
+__version__ = "0.19.0a24"
 
 from .runner import run_case
 

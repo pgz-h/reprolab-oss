@@ -41,7 +41,7 @@ jobs:
           tests/test_project_conditions.py tests/test_recheck_shortcut.py
           tests/test_environment_groups.py tests/test_project_diagnostics.py
           tests/test_project_progress.py tests/test_project_config.py tests/test_execution_settings.py
-          tests/test_vitest_project.py tests/test_project_review_summary.py tests/test_pytest_replay_environment.py
+          tests/test_vitest_project.py tests/test_project_review_summary.py tests/test_historical_review_summary.py tests/test_pytest_replay_environment.py
           tests/test_acceptance_plan.py tests/test_project_version_order.py tests/test_project_review_audit.py tests/test_project_audit_continuation.py
           tests/test_replay_verification.py tests/test_replay_stability.py tests/test_vitest_recheck.py
           tests/test_processing_history.py tests/test_release_preparation.py tests/test_desktop_store.py

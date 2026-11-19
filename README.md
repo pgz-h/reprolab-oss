@@ -1,6 +1,6 @@
 # ReproLab
 
-**0.19.0a23 Alpha** · [下载 Python 安装包和 macOS Apple 芯片版](https://github.com/pgz-h/reprolab-oss/releases/tag/v0.19.0a23)。Windows x64 便携附件待构建。
+**0.19.0a24 Alpha** · [已发布版本与下载](https://github.com/pgz-h/reprolab-oss/releases)
 
 **用实际测试核对一次修复，或比较一次项目改动，并留下可重放的证据。**
 

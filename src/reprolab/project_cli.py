@@ -324,6 +324,11 @@ def _parser():
     _review_summary_options(summary_check)
     summary_check.add_argument('--facts-file', type=Path, help='同时核对用相同选项导出的项目摘要 JSON')
 
+    plans = commands.add_parser('compare-plans', help='在同一证据上分别核对目标版本的计划和候选计划')
+    plans.add_argument('report', type=Path, help='项目报告目录、report.json 或证据 ZIP')
+    plans.add_argument('--plan-path', required=True, help='两个固定版本中的同一计划相对路径')
+    plans.add_argument('--selection-path', help='可选的 pytest 选择清单相对路径')
+    plans.add_argument('--format', choices=('markdown', 'json'), default='markdown')
 
     github_attest = commands.add_parser('check-github-attestation', help='离线核对证据 ZIP 与可信 GitHub 工作流')
     github_attest.add_argument('archive', type=Path)
@@ -382,11 +387,12 @@ def _parser():
     multi.add_argument('repository', type=Path)
     multi.add_argument('--before', required=True)
     multi.add_argument('--candidate', nargs=2, action='append', metavar=('NAME', 'REF'), required=True)
-    multi.add_argument('--test', action='append')
+    _selection_options(multi)
     multi.add_argument('--plan', type=Path)
     multi.add_argument('--confirm-run', action='store_true')
     multi.add_argument('--output', type=Path, required=True)
     _runtime_options(multi)
+    _clock_options(multi)
 
     candidates = commands.add_parser('candidate-history', help='并排核对同一基线上的候选证据及复查边')
     candidates.add_argument('--candidate', action='append', nargs=2, metavar=('NAME', 'REPORT'), required=True)
@@ -753,7 +759,10 @@ def _dispatch(args, *, network_isolation=None):
         plan = read_acceptance_plan(args.plan) if args.plan else None
         if args.command == 'candidate-history':
             return compare_candidates(args.candidate, policy=args.gate, control=control, plan=plan)
-        return run_candidates(args.repository, args.before, args.candidate, args.output, selected=args.test,
+        from .project_selections import read_selection
+
+        selected = read_selection(args.selection_file) if args.selection_file else args.test
+        return run_candidates(args.repository, args.before, args.candidate, args.output, selected=selected,
                               plan=plan, python_executable=args.python, timeout=args.timeout,
                               confirmed=args.confirm_run, control=control)
     if args.command == 'verify-wheels':
@@ -811,12 +820,17 @@ def _dispatch(args, *, network_isolation=None):
 
         return promote_plan(args.report, args.plan, args.output, receipt=args.require_receipt,
                             stability=args.require_stability, input_control=args.input_control, control=control)
+    if args.command == 'compare-plans':
+        from .project_plan_comparison import compare_frozen_plans, render_plan_comparison
+
+        result = compare_frozen_plans(args.report, args.plan_path, selection_path=args.selection_path, control=control)
+        return (render_plan_comparison(result) if args.format == 'markdown' else result), result['gate']['exit_code']
     if args.command in ('summary', 'check-summary'):
         from .acceptance_plan import read_acceptance_plan
-        from .project_review_summary import check_review_markdown, render_review_markdown, review_summary
+        from .project_review_summary import check_review_summary, render_review_markdown, review_summary
 
         plan = read_acceptance_plan(args.acceptance_plan) if args.acceptance_plan else None
-        result = review_summary(args.report, include_test_ids=args.include_test_ids, policy=args.gate,
+        options = dict(include_test_ids=args.include_test_ids, policy=args.gate,
                                 required_improvements=args.require_improvement,
                                 required_vitest_cases=args.require_vitest_case,
                                 receipt=args.require_receipt, stability=args.require_stability,
@@ -828,8 +842,9 @@ def _dispatch(args, *, network_isolation=None):
                                 max_report_age=args.max_report_age_hours, report_as_of=args.report_as_of,
                                 approval=(args.require_approval, args.approval_key, args.expect_reviewer))
         if args.command == 'check-summary':
-            checked = check_review_markdown(result, args.markdown, facts=args.facts_file)
+            checked = check_review_summary(args.report, args.markdown, facts=args.facts_file, **options)
             return checked, 0 if checked['status'] == 'consistent' else 2
+        result = review_summary(args.report, **options)
         code = result.get('gate', {}).get('exit_code', 0)
         return (render_review_markdown(result) if args.format == 'markdown' else result), code
     if args.command == 'vitest':
@@ -1221,12 +1236,18 @@ def _source_locations(directories):
 
 
 def _report_with_scope(report):
-    from .project_comparison import comparison_scope, comparison_verdict
+    from .project_comparison import comparison_scope, comparison_verdict, comparison_view
 
     scope = comparison_scope(report)
+    compared, decisions = comparison_view(report, scope)
+    if not (scope or decisions):
+        return report
+    result = {**report, 'comparison_verdict': comparison_verdict(compared, scope)}
     if scope:
-        return {**report, 'comparison_scope': scope, 'comparison_verdict': comparison_verdict(report, scope)}
-    return report
+        result['comparison_scope'] = scope
+    if decisions:
+        result.update(phase_decisions=decisions, comparison_counts=compared['counts'])
+    return result
 
 
 def _run_exit_code(report):
@@ -1273,6 +1294,8 @@ def main(argv=None, *, _network_isolation=None) -> int:
         # argparse uses SystemExit for --help; keep main callable by the root CLI.
         return int(exc.code or 0)
     except (Exception, KeyboardInterrupt) as exc:
+        from .project_pr_context import PRComparisonBlocked
+
         command = getattr(args, "command", None)
         cancelled = isinstance(exc, KeyboardInterrupt)
         error = {
@@ -1283,6 +1306,8 @@ def main(argv=None, *, _network_isolation=None) -> int:
                 "message": "用户中断了当前命令。" if cancelled else str(exc),
             },
         }
+        if isinstance(exc, PRComparisonBlocked):
+            error.update(status='blocked', reason=exc.reason, exit_code=2)
         if command == "review" and hasattr(args, "directory"):
             error["project_directory"] = args.directory
         _emit(error, stream=sys.stderr)
