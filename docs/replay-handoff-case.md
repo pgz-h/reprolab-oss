@@ -1,5 +1,7 @@
 # 真实 PR 验收与证据交接
 
+[English walkthrough](replay-handoff-case.en.md)
+
 [async-lru PR #799](https://github.com/aio-libs/async-lru/pull/799) 修复缓存方法的协程识别和弱引用回归。ReproLab 运行了 PR 增加的三个上游测试。基线三项失败，候选三项通过。测试范围限于以下三个用例。
 
 | 测试 | 基线 | 候选 |
@@ -9,6 +11,16 @@
 | `test_alru_cache_method_weakref` | 失败 | 通过 |
 
 基线是 `c2ba8001e4edef3b196ac3f547021723f8e64914`。候选是 `639c403a266d99d223c649cb00fddaf40f371c85` 加一份本地 ReproLab 插件声明。两版运行候选中同一份上游测试及同一份插件声明。
+
+## 不安装软件也能核对本次记录
+
+这个[公开结果文件](cases/async-lru-799-outcomes.json)来自一次 v0.19.0a24 实跑。文件记录三行脱敏结果、原报告的判定和 SHA-256。它适合快速检查“这三项确实都记录为失败转通过”这句话。取得完整源码后，可在仓库根目录直接用 Python 标准库读取：
+
+```sh
+python3 -I src/reprolab/project_projection_format.py docs/cases/async-lru-799-outcomes.json
+```
+
+预期输出含 `"counts": {"improved": 3}`（显示时会换行）以及 `"source_verified": false`。独立读者可以重算这三行，但这个小文件没有源码、日志或完整证据包。以下步骤用于实际运行上游测试。每次运行生成自己的报告指纹。
 
 ## 发送方复跑
 
@@ -56,7 +68,19 @@ reprolab project replay ./handoff.zip --python /path/to/python --confirm-run \
 reprolab project check-receipt ./handoff.zip ./receipt
 ```
 
-预期回传材料状态为 `consistent`，重新计算的重放核对为 `verified`，且有三项一致。
+读回执时，先看材料核对的 `status`，再看 `replay_verification.status`。前者为 `consistent` 表示回执与随附证据吻合。后者为 `verified` 才表示所选结果及要求核对的失败材料也匹配。
+
+用公开版 v0.19.0a24 在同一台 macOS arm64 上复跑上述三个测试，原运行和重放都得到三项改善。其中两项的失败记录也匹配。协程识别测试的基线断言消息包含函数及对象在进程内的地址，第二次运行保存的地址不同。因此这一次 `check-receipt` 返回 `1`，材料状态为 `consistent`，重放状态为 `different`。这份结果支持两次都观察到相同的三项失败转通过；严格回执仍保留一项文本差异。
+
+接收方可在工作目录中离线查看逐项记录：
+
+```sh
+reprolab project verify-replay ./handoff.zip ./receipt/replay-evidence.zip --include-test-ids --format markdown
+```
+
+本版的 `verify-replay --explain` 可以从同一对证据包离线解释 pytest 失败文本的差异。追加 `--format markdown` 查看汇总。JSON 的 `entries[].failure_text_difference` 指明差异位于基线还是候选。若同一条对象引用在消息中出现两次，诊断还会核对重放时两处引用的对应关系。普通十六进制金额、错误代码或字符串变化仍会被报告为文本差异。这个诊断只描述记录到的文本形态；严格重放退出码、历史回执和原始日志保持原有语义。
+
+在 JSON 中查找 `reason: recorded_failure_changed` 可定位发生差异的测试。需要判断业务影响时，核对两份报告中该测试基线一侧的原始异常。失败消息也可能含真实的业务输入，只凭两个指纹无法判断差异是否来自地址。
 
 开发版也可一次验收三个明确目标和接收方回执。任一目标未改善、出现新增失败或回执不能通过复核时，CI 会收到非零退出码。已有多轮证据时可加 `--require-stability PATH --min-stability-rounds 3` 离线复核。
 

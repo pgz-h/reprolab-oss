@@ -49,7 +49,7 @@ def requested_selection(state):
     return validate_selection(request.get('selected_tests'), allow_empty=True)
 
 
-def read_selection_values(path):
+def read_selection_values(path, *, require_unique=False):
     path = Path(path).expanduser()
     if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_SELECTION_BYTES:
         raise ValueError('选择清单须为不超过 8 MiB 的普通 UTF-8 文件。')
@@ -60,7 +60,12 @@ def read_selection_values(path):
             raise ValueError('选择清单超过大小限制。')
         text = raw.decode('utf-8-sig')
         if path.suffix.lower() != '.txt' and text.lstrip().startswith(('[', '{')):
-            value = json.loads(text)
+            if require_unique:
+                from .acceptance_plan import _unique_fields
+
+                value = json.loads(text, object_pairs_hook=_unique_fields)
+            else:
+                value = json.loads(text)
             values = value.get('selected_tests') if isinstance(value, dict) else value
         else:
             values = [line for line in text.splitlines() if line.strip()]
@@ -71,8 +76,12 @@ def read_selection_values(path):
     return values
 
 
-def read_selection(path, *, allow_empty=False):
-    return validate_selection(read_selection_values(path), allow_empty=allow_empty)
+def read_selection(path, *, allow_empty=False, require_unique=False):
+    values = read_selection_values(path, require_unique=require_unique)
+    selected = validate_selection(values, allow_empty=allow_empty)
+    if require_unique and len(selected) != len(values):
+        raise ValueError('审阅清单含重复测试 ID。')
+    return selected
 
 
 def write_selection(path, selected, *, title='', allow_empty=False):

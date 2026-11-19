@@ -17,7 +17,7 @@ from .project_input_control import input_changes, protected_input_check
 from .project_history import _checked_report, _match_reference, report_reference
 from .project_pr_context import comparison_type
 from .project_pytest_phases import PHASE_BLOCKERS, phase_observations
-from .project_run_scope import public_run_scope, pytest_run_scope
+from .project_run_scope import changed_test_scope_text, public_run_scope, pytest_run_scope
 from .project_sessions import saved_report_collection
 from .replay_verification import open_replay_evidence
 from .workspace import WORKTREE
@@ -682,6 +682,8 @@ def _run_scope_markdown(scope):
     if path := discovery.get('path'):
         line += ' · ' + _code(_label(path))
     lines = [line]
+    if changed := changed_test_scope_text(scope, 'en'):
+        lines.append('- ' + changed)
     if recommendations['status'] == 'recorded':
         lines.append(f'- Recommendations · {recommendations["count"]} recorded, '
                      f'{recommendations["selected_count"]} selected, {recommendations["omitted_count"]} omitted'

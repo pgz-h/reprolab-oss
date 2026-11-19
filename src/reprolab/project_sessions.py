@@ -42,8 +42,9 @@ from .project_snapshot_scope import normalize_source_scope
 from .project_test_source import validate_test_source_control
 from .project_order import order_digest, validate_order_control
 from .project_version_order import PAIR_STATE_ENV, validate_version_order
-from .project_collection import collection_diagnosis, normalize_collection_path, require_collection_target
+from .project_collection import collection_diagnosis, declared_version_file, normalize_collection_path, require_collection_target
 from .project_recommendations import recommend_project_tests
+from .project_test_changes import changed_test_definitions
 from .runtime_environment import resolve_variables, variable_record
 from .workspace import WORKTREE, copy_workspace
 
@@ -498,6 +499,8 @@ def collect_project(directory, *, python_executable=None, timeout=120, control=N
                   'partial': bool(result['collection_errors']), 'directory': str(folder),
                   'evidence_dir': str(collection_dir), 'created_at': _now(),
                   **({'fixture_bindings': bindings} if bindings is not None else {}),
+                  'changed_test_definitions': changed_test_definitions(state['changed_files'], tests if valid else [],
+                                                                       folder / 'inputs/before', snapshot, control=control),
                   'recommendations': recommend_project_tests(state['changed_files'], tests if valid else [],
                                                               folder / 'inputs/before', snapshot, control=control,
                                                               fixture_bindings=bindings),
@@ -506,6 +509,10 @@ def collect_project(directory, *, python_executable=None, timeout=120, control=N
         if control.clock_control is not None:
             record['clock_control'] = control.clock_control
         record['diagnosis'] = collection_diagnosis(record)
+        generated = declared_version_file(snapshot, record['diagnosis'].get('missing_modules'))
+        if generated is not None:
+            record['generated_version_file'] = generated
+            record['diagnosis'] = collection_diagnosis(record)
         record['notice'] = record['diagnosis']['summary'] + ' 实际发现会加载可信项目、测试与 conftest，不运行测试主体。'
         if requested is not None and status == 'collected':
             record['selection_review'] = reconcile_selection(requested, record['tests'],

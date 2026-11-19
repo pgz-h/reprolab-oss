@@ -26,12 +26,12 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     checks = []
 
-    def cli(*arguments, expected_code=0):
+    def cli(*arguments, expected_code=0, json_output=True):
         command = [sys.executable, '-I', '-m', 'reprolab', *map(str, arguments)]
         result = subprocess.run(command, cwd=output, capture_output=True, text=True, timeout=90)
         if result.returncode != expected_code:
             raise RuntimeError(f'CLI failed: {arguments[0]} / exit {result.returncode}\n{result.stderr}\n{result.stdout}')
-        return json.loads(result.stdout)
+        return json.loads(result.stdout) if json_output else result.stdout
 
     if any((installed.parent / name).exists() for name in ('demo_case', 'demo_recheck', 'history_cases', 'project_demo.py')):
         raise RuntimeError('Installed wheel contains source-only examples.')
@@ -59,6 +59,26 @@ def main():
     git('commit', '-qm', 'candidate')
 
     fix = 'test_answer.py::test_answer'
+    suggested = cli('project', 'suggest', repo, '--before', baseline, '--after', 'HEAD',
+                    '--python', sys.executable, '--output', output / 'suggested review', '--format', 'json')
+    if (suggested['status'] != 'ready' or not suggested['selection_file'] or not suggested['run_command']
+            or fix not in [row['test_id'] for row in suggested['recommendations']]):
+        raise RuntimeError('The installed CLI could not prepare an explicit suggestion from actual discovery.')
+    config = repo / '.ci'
+    config.mkdir()
+    reviewed_plan = config / "reviewer's approved plan.json"
+    created_plan = cli('project', 'plan-from-selection', suggested['directory'],
+                       '--selection-file', suggested['selection_file'], '--require-improvement', fix,
+                       '--output', reviewed_plan)
+    suggested_run = cli('project', 'run', suggested['directory'], '--acceptance-plan', reviewed_plan,
+                        '--verify-plan', '--output', output / 'suggested review/reports')
+    if (suggested_run['project_id'] != suggested['project_id']
+            or suggested_run['source_sha256'] != suggested['source_sha256'] or fix not in suggested_run['selected_tests']
+            or suggested_run['acceptance']['acceptance_plan_sha256'] != created_plan['acceptance_plan_sha256']
+            or suggested_run['acceptance']['gate']['status'] != 'passed'
+            or (config / 'reports').exists()):
+        raise RuntimeError('The installed CLI did not validate the reviewed plan on its original frozen session.')
+    checks.append('project: discover, save reviewed selection as a plan, and verify the plan on the same session')
     selected = [fix, 'test_answer.py::test_answer_is_int']
     selection = output / 'regression-tests.txt'
     selection.write_text('\n'.join(selected) + '\n', encoding='utf-8')
@@ -92,6 +112,19 @@ def main():
     if cli('project', 'check', imported['report_dir'])['status'] != 'consistent':
         raise RuntimeError('Imported project evidence is inconsistent.')
     repo.rename(output / 'sender-project-moved')
+    for language in ('en', 'zh'):
+        options = ('--brief', '--language', language)
+        brief = cli('project', 'summary', bundle, *options, json_output=False)
+        heading = 'Gate Passed (strict)' if language == 'en' else '门禁 通过（严格）'
+        if heading not in brief or acceptance['report_sha256'] not in brief or fix in brief or str(repo) in brief:
+            raise RuntimeError('The installed CLI could not produce a decision brief from the receiver ZIP.')
+        received = output / f'brief.{language}.md'
+        received.write_text(brief, encoding='utf-8')
+        checked = cli('project', 'check-summary', bundle, received, *options)
+        if (checked['status'] != 'consistent' or checked['gate']['exit_code'] != 0
+                or checked['coverage'] != 'rendered_aggregate_markdown'):
+            raise RuntimeError('The installed CLI could not independently check the received brief.')
+    checks.append('project: English and Chinese decision brief handoff from the received ZIP')
     preflight = cli('project', 'replay', bundle, '--check-environment')
     if preflight['status'] != 'ready' or preflight['source_archive'] != str(bundle):
         raise RuntimeError('The installed CLI could not preflight the evidence ZIP.')

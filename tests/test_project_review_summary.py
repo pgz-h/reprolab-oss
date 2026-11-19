@@ -91,6 +91,134 @@ def test_default_markdown_and_explicit_detail_modes(demo, capsys):
     ]
 
 
+@pytest.mark.parametrize(('selection', 'status', 'message'), [
+    (None, 1, 'New failure 1'),
+    (('test_discount_cannot_make_total_negative',), 0, 'Improved 1'),
+    (('test_optional_payment_service',), 2, 'Blocked 1'),
+])
+def test_brief_reads_checked_zip_offline(demo, tmp_path, capsys, monkeypatch, selection, status, message):
+    import hashlib
+    from reprolab import project_sessions
+
+    if selection:
+        selected = ['tests/test_cart.py::' + name for name in selection]
+        report = project_sessions.run_project(demo['project_directory'], tmp_path / 'runs',
+                                              selected_ids=selected, confirmed=True)
+    else:
+        report = demo
+    bundle = tmp_path / "actual evidence's.zip"
+    project_sessions.pack_project_report(report['report_dir'], bundle)
+    if status == 0:
+        other = tmp_path / 'evidence.zip'
+        project_sessions.pack_project_report(demo['report_dir'], other)
+        monkeypatch.chdir(tmp_path)
+
+
+    def unexpected_execution(*args, **kwargs):
+        pytest.fail('the brief must only read saved evidence')
+
+    monkeypatch.setattr(project_sessions, 'run_project', unexpected_execution)
+    monkeypatch.setattr(project_sessions, 'replay_project_report', unexpected_execution)
+    assert main(['summary', str(bundle), '--brief']) == status
+    streams = capsys.readouterr()
+    markdown = streams.out
+    assert not streams.err
+    assert f'Gate {("Passed", "Failed", "Blocked")[status]}' in markdown
+    assert message in markdown
+    assert 'reprolab project unpack --help' in markdown
+    assert 'same ZIP you just checked' in markdown
+    assert 'evidence.zip' not in markdown and bundle.name not in markdown
+    assert hashlib.sha256(Path(report['report_dir'], 'report.json').read_bytes()).hexdigest() in markdown
+    assert 'test_cart.py' not in markdown and str(tmp_path) not in markdown
+    if selection:
+        assert '8 discovered outside the selection' in markdown
+
+    if status == 0:
+        assert main(['summary', bundle.name, '--brief']) == 0
+        assert capsys.readouterr().out == markdown
+        assert main(['summary', other.name, '--brief']) == 1
+        distinct = capsys.readouterr().out
+        assert 'New failure 1' in distinct and distinct != markdown
+        for source in (report['report_dir'], Path(report['report_dir'], 'report.json')):
+            assert main(['summary', str(source), '--brief']) == 0
+            trace = capsys.readouterr().out
+            assert 'same report directory' in trace and 'project unpack' not in trace
+
+        from reprolab.acceptance_plan import AcceptancePlan, save_acceptance_plan
+
+        plan = tmp_path / 'plan.json'
+        save_acceptance_plan(AcceptancePlan('pytest', 'strict', (), approved_selection=tuple(demo['selected_tests'])), plan)
+        assert main(['summary', str(bundle), '--brief', '--language', 'zh', '--acceptance-plan', str(plan)]) == 2
+        assert '已批准范围缺少 8 项' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(('language', 'changes'), [
+    ('en', [('decision brief', 'updated brief'), ('9 selected tests', '8 selected tests'),
+            ('Gate Failed', 'Gate Passed'), ('New failure 1', 'New failure 0')]),
+    ('zh', [('决策摘要', '更新摘要'), ('选择 9 项测试', '选择 8 项测试'),
+            ('门禁 失败', '门禁 通过'), ('新增失败 1', '新增失败 0')]),
+])
+def test_brief_handoff_checks_text_and_gate_independently(demo, tmp_path, capsys, language, changes):
+    from reprolab.project_sessions import pack_project_report, run_project
+
+    archive = tmp_path / 'actual evidence.zip'
+    wrong = tmp_path / 'evidence.zip'
+    pack_project_report(demo['report_dir'], archive)
+    other = run_project(demo['project_directory'], tmp_path / 'other', confirmed=True)
+    pack_project_report(other['report_dir'], wrong)
+    assert other['counts'] == demo['counts']
+    options = ['--brief', '--language', language]
+    assert main(['summary', str(archive), *options]) == 1
+    original = capsys.readouterr().out
+    markup = tmp_path / 'brief.md'
+
+    def check(source, *arguments, code):
+        assert main(['check-summary', str(source), str(markup), *arguments]) == code
+        result = json.loads(capsys.readouterr().out)
+        assert result['coverage'] == 'rendered_aggregate_markdown'
+        assert result['gate']['exit_code'] == 1
+        return result
+
+    markup.write_bytes(original.replace('\n', '\r\n').encode())
+    matched = check(archive, *options, code=0)
+    assert matched['language'] == language and matched['status'] == 'consistent'
+    assert check(demo['report_dir'], *options, code=0)['status'] == 'consistent'
+    assert check(wrong, *options, code=2)['status'] == 'different'
+    assert check(archive, '--brief', '--language', 'zh' if language == 'en' else 'en',
+                 code=2)['status'] == 'different'
+    for value, replacement in [*changes, (matched['report_sha256'], '0' * 64)]:
+        assert value in original
+        markup.write_text(original.replace(value, replacement, 1), encoding='utf-8')
+        assert check(archive, *options, code=2)['status'] == 'different'
+
+
+def test_brief_match_only_establishes_displayed_aggregates(demo, tmp_path, capsys):
+    from reprolab.acceptance_plan import AcceptancePlan, save_acceptance_plan
+
+    plans = (tmp_path / 'sender-plan.json', tmp_path / 'recipient-plan.json')
+    for path, selected in zip(plans, (demo['selected_tests'][:1], demo['selected_tests'][1:2])):
+        save_acceptance_plan(AcceptancePlan('pytest', 'strict', (), approved_selection=tuple(selected)), path)
+    assert plans[0].read_bytes() != plans[1].read_bytes()
+    assert main(['summary', demo['report_dir'], '--brief', '--acceptance-plan', str(plans[0])]) == 1
+    markdown = tmp_path / 'brief.md'
+    markdown.write_text(capsys.readouterr().out, encoding='utf-8')
+    assert main(['check-summary', demo['report_dir'], str(markdown), '--brief',
+                 '--acceptance-plan', str(plans[1])]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result['status'] == 'consistent' and result['gate']['exit_code'] == 1
+    assert result['coverage'] == 'rendered_aggregate_markdown'
+    assert 'acceptance_plan_sha256' not in result
+
+
+def test_brief_rejects_invalid_evidence_with_no_decision(tmp_path, capsys):
+    bundle = tmp_path / 'invalid.zip'
+    bundle.write_bytes(b'this is not evidence')
+    assert main(['summary', str(bundle), '--brief']) == 2
+    streams = capsys.readouterr()
+    assert not streams.out
+    assert json.loads(streams.err)['status'] == 'error'
+
+
 def test_gate_allows_only_complete_existing_failures(demo, tmp_path, capsys):
     from reprolab.project_sessions import run_project
 

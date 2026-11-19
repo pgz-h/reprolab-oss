@@ -24,20 +24,43 @@ from reprolab.runner import RunControl
 from reprolab.workspace import WORKTREE
 
 
-def test_imported_pytest_zip_requires_review_when_double_red_assertion_changes(window, tmp_path, monkeypatch):
+def test_imported_pytest_zip_requires_review_when_double_red_assertion_changes(window, tmp_path, monkeypatch, capsys):
     repo = make_project(tmp_path / 'project')
     (repo / 'tests/test_calc.py').write_text(
         'from calc import answer\ndef test_answer(expected):\n'
         '    assert answer() == expected\n    assert answer() < expected\n', encoding='utf-8')
     state = prepare_project(repo, 'HEAD', WORKTREE, tmp_path / 'sessions')
     original = run_project(state['directory'], tmp_path / 'original', confirmed=True)
-    evidence = tmp_path / 'evidence.zip'
+    evidence = tmp_path / 'received evidence.zip'
     pack_project_report(original['report_dir'], evidence)
 
-    bench = start_workbench(window)
-    assert bench.import_bundle(evidence)
+    monkeypatch.setattr(QFileDialog, 'getOpenFileName', lambda *args: (str(evidence), 'ZIP (*.zip)'))
+    window.home_page.import_evidence_button.click()
+    bench = window.project_workbench
     wait_idle(bench)
+    assert window.tabs.currentWidget() is bench
     assert '记录的断言位置不同' in bench.result_summary.text()
+    assert bench.import_brief_panel.isVisible()
+    assert '门禁 受阻' in bench.import_brief_label.text()
+    assert '已有失败 1' in bench.import_brief_label.text()
+    assert '局限' in bench.import_brief_label.text()
+    assert 'test_calc.py' not in bench.import_brief_label.text()
+    from reprolab.project_cli import main
+
+    bench.copy_brief_button.click()
+    wait_idle(bench)
+    copied = tmp_path / 'brief.zh.md'
+    copied.write_text(QApplication.clipboard().text(), encoding='utf-8')
+    assert main(['check-summary', str(evidence), str(copied), '--brief', '--language', 'zh']) == 0
+    checked = json.loads(capsys.readouterr().out)
+    assert checked['status'] == 'consistent' and checked['gate']['exit_code'] == 2
+    bench.import_brief_command.click()
+    clipboard = QApplication.clipboard().text()
+    assert str(evidence) in clipboard and '--brief' in clipboard and '--language' in clipboard
+    opened = []
+    monkeypatch.setattr(bench, '_open_local', opened.append)
+    bench.import_brief_report.click()
+    assert opened == [Path(bench.report['report_dir'], 'report.html')]
     seen = []
 
     def respond(dialog):

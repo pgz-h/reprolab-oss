@@ -1,6 +1,7 @@
 include README.en.md CHANGELOG.md SECURITY.md CONTRIBUTING.md INSTALL.md
 prune tests
 prune docs
+include docs/native-languages.md
 prune .github
 prune packaging
 recursive-include packaging/licenses *

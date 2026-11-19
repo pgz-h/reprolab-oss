@@ -207,3 +207,62 @@ def test_sender_checks_returned_files_without_rerunning_tests(tmp_path, capsys, 
     damaged = cli('check-receipt', bundle, returned, code=2)
     assert damaged['status'] == 'inconsistent' and damaged['replay_verification'] is None
     assert [(issue['part'], issue['reason']) for issue in damaged['issues']] == [('evidence', 'invalid')]
+
+
+def test_explained_replay_distinguishes_repr_tokens_and_preserves_receipt(tmp_path, capsys, monkeypatch):
+    repo = make_project(tmp_path / 'project')
+    (repo / 'pyproject.toml').write_text('[tool.reprolab.pytest]\npass_env = ["LABEL"]\n')
+    (repo / 'tests/test_calc.py').write_text(
+        'import os\n'
+        'def test_repr(): raise ValueError(f"private text {object()!r}")\n'
+        'def test_amount(): raise ValueError("private sum " + os.environ["LABEL"])\n'
+    )
+    monkeypatch.setenv('LABEL', '0x1000')
+    state = prepare_project(repo, 'HEAD', WORKTREE, tmp_path / 'sessions')
+    run = run_project(state['directory'], tmp_path / 'reports', confirmed=True)
+    source = tmp_path / 'source.zip'
+    pack_project_report(run['report_dir'], source)
+    monkeypatch.setenv('LABEL', '0x1001')
+    receipt = tmp_path / 'receipt'
+    assert main(['replay', str(source), '--confirm-run', '--output', str(tmp_path / 'again'),
+                 '--receipt-dir', str(receipt)]) == 1
+    capsys.readouterr()
+    args = ['verify-replay', str(source), str(receipt / 'replay-evidence.zip')]
+    assert main(args) == 1
+    strict = json.loads(capsys.readouterr().out)
+    assert strict == json.loads((receipt / 'replay-check.json').read_bytes())
+    assert main([*args, '--explain']) == 1
+    explained = json.loads(capsys.readouterr().out)
+    # Even if the allocator happens to reuse an address, the amount difference always remains.
+    assert explained['failure_text_differences']['exception_text_changed'] == 2
+    for row in explained['entries']:
+        for side, basis in row.pop('failure_text_difference', {}).items():
+            assert side in ('before', 'after')
+            assert basis == ('repr_address_text_only' if row['test_id'].endswith('test_repr')
+                             else 'exception_text_changed')
+    explained.pop('failure_text_differences')
+    assert explained == strict
+    assert main([*args, '--explain', '--format', 'markdown']) == 1
+    text = capsys.readouterr().out
+    assert 'Recorded exception text differs beyond object addresses' in text
+    assert 'private sum' not in text and 'private text' not in text and '0x1001' not in text
+    assert main(['check-receipt', str(source), str(receipt)]) == 1
+    assert json.loads(capsys.readouterr().out)['status'] == 'consistent'
+
+
+def test_explained_address_pattern_preserves_aliases_and_literals():
+    from reprolab.replay_explanation import _classify
+
+    def failure(message):
+        return [('call', 'AssertionError', message)]
+
+    original = '<function f.<locals>.g at 0xdead> <function f.<locals>.g at 0xdead>'
+    for message, expected in [
+        (original.replace('0xdead', '0xbeef'), 'repr_address_text_only'),
+        (original.replace('0xdead', '0xbeef', 1), 'exception_text_changed'),
+        (original.replace('function f', 'function h'), 'exception_text_changed'),
+        (original + ' 0xbeef', 'exception_text_changed'),
+    ]:
+        assert _classify(failure(original), failure(message)) == expected
+    assert _classify(failure('customer at 0x123>'), failure('customer at 0x124>')) == 'exception_text_changed'
+    assert _classify(failure('x'), [('setup', 'AssertionError', 'x')]) == 'phase_or_type_changed'

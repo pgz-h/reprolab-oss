@@ -12,6 +12,7 @@ from itertools import islice
 import json
 from os.path import expanduser
 from pathlib import Path, PurePosixPath
+import shlex
 import stat
 import sys
 import tokenize
@@ -59,6 +60,7 @@ from .project_comparison import (
 from .project_pr_context import COMPARISON_LABELS, comparison_type
 from .project_pytest_phases import phase_observations, phase_overview_text, phase_pair_text
 from .project_run_scope import pytest_run_scope, run_scope_lines
+from .project_suggest import changed_definition_reason
 from .pytest_profile import describe_pytest_rules
 from .project_diagnostics import (
     VITEST_OFFLINE_CACHE_MISSING, entry_action, entry_guidance, group_project_failures,
@@ -566,6 +568,7 @@ class ProjectWorkbench(QWidget):
         self._selection_intent = None
         self._report_reference = None
         self._opened_evidence = None
+        self._import_brief = None
         self._replay_details = None
         self._saved_replay_receipt = None
         self._stability_result = None
@@ -647,6 +650,10 @@ class ProjectWorkbench(QWidget):
         self.acceptance_button = _button('修复验收…', self.open_project_acceptance)
         self.acceptance_button.setObjectName('projectAcceptance')
         self.acceptance_button.setToolTip('从当前报告核对指定测试、回归门槛、回执和多轮重放。')
+        self.copy_brief_button = _button('复制精简摘要',
+                                         lambda: self.copy_review_summary(self._displayed_result_report(), brief=True))
+        self.copy_brief_button.setToolTip('复制中文 Markdown，可和原证据 ZIP 一起交给接收方离线核对。')
+        catalog_row.addWidget(self.copy_brief_button)
         catalog_row.addWidget(self.acceptance_button, alignment=Qt.AlignmentFlag.AlignRight)
         catalog_row.addWidget(self.project_menu_button, alignment=Qt.AlignmentFlag.AlignRight)
         outer.insertLayout(0, catalog_row)
@@ -810,6 +817,18 @@ class ProjectWorkbench(QWidget):
         self._build_go_tab()
         self._build_vitest_tab()
 
+        self.import_brief_label = _label()
+        self.import_brief_label.setObjectName('projectImportBrief')
+        self.import_brief_command = _button('复制精简命令', self._copy_import_brief_command)
+        self.import_brief_report = _button('查看完整报告', self._open_import_brief_report)
+        self.import_brief_panel = QWidget()
+        brief_layout = QVBoxLayout(self.import_brief_panel)
+        brief_layout.setContentsMargins(0, 0, 0, 0)
+        brief_layout.addWidget(self.import_brief_label)
+        brief_layout.addWidget(_row(self.import_brief_report, self.import_brief_command), alignment=Qt.AlignmentFlag.AlignLeft)
+        outer.insertWidget(1, self.import_brief_panel)
+        self.import_brief_panel.hide()
+
         self.evidence_message = _CompactLabel()
         self.preview_replay_button = _button('预览重放…', self._preview_opened_evidence, True)
         self.preview_replay_button.setToolTip('查看保存的版本、测试范围和本机运行环境。')
@@ -822,7 +841,7 @@ class ProjectWorkbench(QWidget):
                                      self.save_replay_receipt_button, self.open_replay_receipt_button,
                                      self.stability_result_button)
         self.evidence_actions.layout().setStretch(0, 1)
-        outer.insertWidget(1, self.evidence_actions)
+        outer.insertWidget(2, self.evidence_actions)
 
         self.status_label = _CompactLabel()
         self.cancel_button = _button('取消当前操作', self.cancel_operation)
@@ -1528,7 +1547,7 @@ class ProjectWorkbench(QWidget):
         self.select_visible_button = _button('选中可见', self.select_visible_tests)
         self.only_visible_button = _button('仅选可见', self.select_only_visible_tests)
         self.select_recommended_button = _button('只选推荐', self.select_recommended_tests)
-        self.select_recommended_button.setToolTip('按静态源码与已收集的 fixture 绑定勾选推荐项，可继续手动调整。')
+        self.select_recommended_button.setToolTip('按已记录的测试定义、源码关联或 fixture 绑定勾选推荐项；未推荐项仍可手动选择。')
         self.clear_tests_button = _button('清空', self.clear_selected_tests)
         self.test_scope = QComboBox()
         self.test_scope.addItem('全部文件与目录', '')
@@ -3204,14 +3223,17 @@ class ProjectWorkbench(QWidget):
         return self._start(action, shown, '正在实际发现测试（会执行可信项目的测试收集代码）…', operation='collect')
 
     def _recommendation(self, test_id):
-        mapping = (self.collection or {}).get('recommendations')
+        collection = self.collection or {}
+        definition = changed_definition_reason(collection, test_id)
+        mapping = collection.get('recommendations')
         if not isinstance(mapping, dict):
             mapping = (self.state or {}).get('recommendations')
         if isinstance(mapping, dict):
             for candidate in (test_id, test_id.split('[', 1)[0], test_id.split('::', 1)[0]):
                 if mapping.get(candidate):
-                    return str(mapping[candidate])
-        return ''
+                    reason = str(mapping[candidate])
+                    return f'{definition} · {reason}' if definition else reason
+        return definition
 
     def _show_collection(self, collection):
         had_tests = self.tests_tree.topLevelItemCount() > 0
@@ -3261,7 +3283,7 @@ class ProjectWorkbench(QWidget):
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(0, Qt.CheckState.Checked if test_id in selected else Qt.CheckState.Unchecked)
             item.setToolTip(0, test_id)
-            item.setToolTip(1, reason or '没有静态推荐；仍可选择运行。')
+            item.setToolTip(1, reason or '没有推荐理由；仍可手动选择。')
             self.tests_tree.addTopLevelItem(item)
         self.tests_tree.setUpdatesEnabled(True)
         self._changing_checks = False
@@ -3441,7 +3463,7 @@ class ProjectWorkbench(QWidget):
                     for index in range(self.tests_tree.topLevelItemCount())
                     if self.tests_tree.topLevelItem(index).data(1, _ROLE)}
         if self._check_ids(selected) and not selected:
-            self.status_label.setText('没有静态推荐测试。可搜索并手动选择，或选中全部可见测试。')
+            self.status_label.setText('没有推荐测试。可搜索并手动选择，或选中全部可见测试。')
 
     def clear_selected_tests(self):
         self._check_ids(set())
@@ -4013,7 +4035,7 @@ class ProjectWorkbench(QWidget):
         return self._start(action, shown, '正在核对报告并导出 CI 配置…',
                            operation='acceptance_config', runtime_values={})
 
-    def copy_review_summary(self, report=None):
+    def copy_review_summary(self, report=None, *, brief=False):
         if self.busy or self._closing:
             return False
         report = self.report if report is None else report
@@ -4027,14 +4049,21 @@ class ProjectWorkbench(QWidget):
         operation = f'{runner}_summary' if runner in _COMPARISON_RUNNERS else 'summary'
 
         def action(control):
+            if brief:
+                from .project_brief import brief_summary, render_brief
+
+                result = brief_summary(reference['report_dir'], expected_report=reference, control=control)
+                return render_brief(result, 'zh')
             result = review_summary(reference['report_dir'], expected_report=reference, control=control)
             return render_review_markdown(result)
 
         def shown(markdown):
             QApplication.clipboard().setText(markdown)
-            self.status_label.setText('已复制已校验的 PR 摘要，可粘贴到审查记录。')
+            self.status_label.setText('已复制精简摘要，可与原证据 ZIP 一并交接。' if brief else
+                                      '已复制已校验的 PR 摘要，可粘贴到审查记录。')
 
-        started = self._start(action, shown, '正在核对报告并生成 PR 摘要…', operation=operation, runtime_values={})
+        message = '正在核对报告并生成精简摘要…' if brief else '正在核对报告并生成 PR 摘要…'
+        started = self._start(action, shown, message, operation=operation, runtime_values={})
         if started and runner in _COMPARISON_RUNNERS:
             (self.go_error_label if runner == 'go' else self.vitest_error_label).hide()
         return started
@@ -4767,7 +4796,7 @@ class ProjectWorkbench(QWidget):
                         str(self.report_root), '项目证据 (*.zip series.json)')
         if not path:
             return False
-        bundle = Path(path).expanduser()
+        bundle = Path(path).expanduser().absolute()
         root = Path(self.store.settings.get('imports') or
                     (self.project_root.parent / 'project-imports')).expanduser()
         destination = root / ('project-import-' + uuid.uuid4().hex[:12])
@@ -4785,16 +4814,54 @@ class ProjectWorkbench(QWidget):
                 raise ValueError('导入结果缺少项目报告目录。')
             report = _read_report(directory)
             control.check()
-            return {'imported': imported, 'report': report, 'comparison': self._saved_comparison_recheck(report, control)}
+            brief = None
+            if bundle.name != 'series.json':
+                from .project_brief import brief_lines
+                from .project_review_summary import review_summary
+
+                try:
+                    summary = review_summary(directory, policy='strict', expected_report=report_reference(report),
+                                             control=control.child(progress=control.progress))
+                except (OSError, ValueError):
+                    control.check()
+                else:
+                    brief = '\n'.join(brief_lines(summary, 'zh'))
+            return {'imported': imported, 'report': report, 'brief': brief,
+                    'comparison': self._saved_comparison_recheck(report, control)}
+
         def shown(result):
             report = result['report']
             self._show_saved_project_report(report, comparison=result['comparison'])
+            self._import_brief = (report_reference(report), bundle, result['brief']) if result['brief'] else None
             self._mark_opened_evidence(imported=True)
             notice = result['imported'].get('notice') or '项目证据已校验并导入。'
             self.status_label.setText(f'已导入 {result["imported"]["report_count"]} 份项目报告。' + str(notice)
                                       + '\n' + str(result['report']['report_dir']))
             self.evidenceImported.emit()
         return self._start(action, shown, '正在校验并导入项目报告证据，只读取材料…')
+
+    def _displayed_import_brief(self):
+        report = self._displayed_result_report()
+        if report and self._import_brief and report_reference(report) == self._import_brief[0]:
+            return self._import_brief
+        return None
+
+    def _copy_import_brief_command(self):
+        if brief := self._displayed_import_brief():
+            launcher = [sys.executable, '--cli'] if getattr(sys, 'frozen', False) else ['reprolab']
+            arguments = [*launcher, 'project', 'summary', str(brief[1]), '--brief', '--language', 'zh']
+            if sys.platform == 'win32':
+                command = '& ' + ' '.join("'" + argument.replace("'", "''") + "'" for argument in arguments)
+            else:
+                command = shlex.join(arguments)
+            QApplication.clipboard().setText(command)
+            self.status_label.setText('已复制离线核对命令。')
+
+    def _open_import_brief_report(self):
+        if brief := self._displayed_import_brief():
+            directory = Path(brief[0]['report_dir'])
+            html = directory / 'report.html'
+            self._open_local(html if html.is_file() else directory / 'report.json')
 
     def _displayed_result_report(self):
         page = self.tabs.currentWidget()
@@ -4829,8 +4896,15 @@ class ProjectWorkbench(QWidget):
         from .replay_stability import stability_summary
 
         current = self._displayed_result_report()
+        brief = self._displayed_import_brief()
+        self.import_brief_panel.setVisible(brief is not None)
+        if brief:
+            self.import_brief_label.setText(brief[2])
+            self.import_brief_report.setToolTip('report.json · SHA-256 ' + brief[0]['report_sha256'])
         self.acceptance_button.setVisible(current is not None)
         self.acceptance_button.setEnabled(current is not None and not self.busy and not self._closing)
+        self.copy_brief_button.setVisible(current is not None)
+        self.copy_brief_button.setEnabled(self.acceptance_button.isEnabled())
         preview = self._matches_opened_evidence(current)
         replay = self._displayed_replay_details()
         stability = self._displayed_stability_result(current)

@@ -1,12 +1,44 @@
 # ReproLab
 
-**0.19.0a24 Alpha** · [已发布版本与下载](https://github.com/pgz-h/reprolab-oss/releases)
+**0.19.0a25 Alpha** · [已发布版本与下载](https://github.com/pgz-h/reprolab-oss/releases)
 
 **用实际测试核对一次修复，或比较一次项目改动，并留下可重放的证据。**
 
 ReproLab 冻结改动前后的源码，在两版上运行同一份选定测试，并保存可校验、可重放的报告、日志与快照。项目对比区分新增失败、原有失败、改善和受阻。严格修复验收先核对旧版是否出现声明的故障，再检查新版是否通过。AI 可以辅助准备和解读，结论来自实际执行，范围限于所选测试。
 
 [English](README.en.md) · [文档导航](docs/README.md) · [第一次使用](docs/first-run.md) · [安装](INSTALL.md) · [项目工作台](docs/project-workbench.md) · [CLI 与 CI](docs/cli-contract.md) · [更新记录](CHANGELOG.md)
+
+Rust、C 和 C++ 项目可用 Cargo 与 CMake/CTest 入口。见[支持范围与真实 zlib 复跑](docs/native-languages.md)。
+
+## 给自己的 PR 选测试
+
+在有 pytest 测试的可信 Git 仓库中，先把当前工作区改动与 `HEAD` 对比，预览测试清单：
+
+```sh
+reprolab project suggest . --before HEAD --working-tree --output ../reprolab-review
+```
+
+使用独立测试环境时加 `--python /path/to/env/bin/python`。预览会指出测试定义改在哪里、哪些测试可能间接受影响，并给出使用本次快照的实际运行命令。先审阅清单，测试主体在下一步运行。已有报告的读者可直接看下节。[两个真实 PR 的复跑方法与结果](docs/suggest-upstream.md)
+
+## 第一次评审：这盏绿灯足以合入吗？
+
+一个收据测试在改动前后都失败了，另一个测试两次都通过。旧报告按“允许原有失败”放行。作为接收者，你可以先用[公开发行版的 CLI](https://github.com/pgz-h/reprolab-oss/releases/tag/v0.19.0a24) 核对这个合成案例，无需准备测试环境或配置模型。
+
+下载[示例证据包 evidence.zip](https://raw.githubusercontent.com/pgz-h/reprolab-oss/e682f9de5d3ba923d273d7a776c74fa6640bd39d/tests/fixtures/review_summary_cb56b04/evidence.zip)，在下载目录运行：
+
+```sh
+reprolab project summary evidence.zip --gate no-new-failures --include-test-ids
+```
+
+**预期显示 `CI gate · Blocked`，退出码为 `2`。** 两版的收据测试都抛出断言错误，但异常消息指纹发生了变化。现有证据不足以将它认作同一个旧故障。报告中可按测试 ID 找到这项观察；读取 ZIP 不会运行其中的项目。
+
+若要核对当时发出的绿灯，把[原摘要 public.md](https://raw.githubusercontent.com/pgz-h/reprolab-oss/e682f9de5d3ba923d273d7a776c74fa6640bd39d/tests/fixtures/review_summary_cb56b04/public.md) 和[配套记录 public.json](https://raw.githubusercontent.com/pgz-h/reprolab-oss/e682f9de5d3ba923d273d7a776c74fa6640bd39d/tests/fixtures/review_summary_cb56b04/public.json) 下载到同一目录：
+
+```sh
+reprolab project check-summary evidence.zip public.md --public-summary --gate no-new-failures --facts-file public.json
+```
+
+这一步退出码为 `0`：历史材料核对一致。`historical_gate.exit_code` 是当时的 `0`，`gate.exit_code` 是今天用 v0.19.0a24 重算的 `2`。想从真实上游改动开始，可按 [async-lru PR #799 复跑指南](docs/replay-handoff-case.md) 核对三个上游回归测试。
 
 ## 检查自己的项目
 

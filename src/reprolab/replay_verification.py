@@ -258,10 +258,15 @@ def checked_replay_pair(source, replay, *, control=None):
             yield _checked_report(original, control=control), _checked_report(rerun, control=control)
 
 
-def verify_replay(source, replay, *, control=None):
+def verify_replay(source, replay, *, control=None, explain=False):
     """Check both reports and compare recorded outcomes without executing code."""
     with checked_replay_pair(source, replay, control=control) as (original, rerun):
-        return compare_replay_reports(original, rerun)
+        result = compare_replay_reports(original, rerun)
+        if explain:
+            from .replay_explanation import explain_pytest_failures
+
+            explain_pytest_failures(result, original, rerun)
+        return result
 
 
 def verify_new_replay(source, replay, *, control=None):

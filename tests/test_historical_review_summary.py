@@ -35,6 +35,26 @@ def checked(capsys, evidence):
     return run
 
 
+def test_brief_on_historical_zip_reports_current_gate_and_saved_scope(evidence, capsys, tmp_path):
+    from reprolab.project_brief import brief_summary, render_brief
+
+    assert main(['summary', evidence, '--brief', '--gate', 'no-new-failures']) == 2
+    markdown = capsys.readouterr().out
+    assert 'Gate Blocked' in markdown and 'older failure evidence needs review' in markdown
+    assert '2 selected tests' in markdown and 'PR merge acceptance' in markdown
+    assert 'test_receipts.py' not in markdown
+    received = tmp_path / 'brief.md'
+    command = ['check-summary', evidence, str(received), '--brief', '--gate', 'no-new-failures']
+    result = brief_summary(evidence, policy='no-new-failures')
+    for text in (markdown, render_brief(result, handoff=False)):
+        received.write_text(text, encoding='utf-8')
+        assert main(command) == 0
+        checked = json.loads(capsys.readouterr().out)
+        assert checked['status'] == 'consistent' and checked['gate']['exit_code'] == 2
+    assert main([*command, '--facts-file', str(FIXTURE / 'private.json')]) == 2
+    assert json.loads(capsys.readouterr().err)['error']['type'] == 'argument_error'
+
+
 @pytest.mark.parametrize(('name', 'mode'), MODES)
 def test_historical_pair_matches_and_current_gate_still_blocks(evidence, checked, tmp_path, capsys, name, mode):
     saved = (FIXTURE / f'{name}.md').read_bytes()

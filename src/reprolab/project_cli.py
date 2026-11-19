@@ -127,7 +127,8 @@ def _parser():
         demo.add_argument('--review-handoff', action='store_true', help='另存证据 ZIP、验收计划和供接收方核对的摘要')
     prepare = commands.add_parser("prepare", help="冻结两个版本或当前工作区，创建项目会话")
     review = commands.add_parser("review", help="一次冻结、发现并运行 pytest 项目对比")
-    for command in (prepare, review):
+    suggest = commands.add_parser("suggest", help="冻结版本并实际收集，保存可审阅的推荐选测清单")
+    for command in (prepare, review, suggest):
         command.add_argument("repository", type=Path, help="本地 Git 仓库目录")
         command.add_argument("--before", help="基线 Git 提交或引用")
         revisions = command.add_mutually_exclusive_group(required=True)
@@ -145,9 +146,14 @@ def _parser():
     review.add_argument('--audit-discovery', action='store_true', help='核对两版原生发现清单，即使已显式选择测试')
     _selection_options(review)
     _acceptance_run_options(review)
-    for command in (prepare, review):
+    for command in (prepare, review, suggest):
         command.add_argument('--source-path', action='append', default=[], help='只冻结指定的仓库文件或目录，可重复')
 
+    suggest.add_argument('--output', type=Path, required=True, help='仓库外的会话与报告保存根目录')
+    suggest.add_argument('--format', choices=('text', 'json'), default='text')
+    suggest.add_argument('--language', choices=('zh', 'en'), default='zh', help='人读预览语言，默认 zh')
+    suggest.epilog = '会加载可信项目的 pytest 收集代码。审阅清单后，明确执行 run。'
+    _runtime_options(suggest)
     _runtime_options(review)
     _clock_options(review)
     review.epilog = "省略测试选择时仅运行完整发现清单（最多 2000 项）。仅对可信项目发起执行。"
@@ -253,6 +259,16 @@ def _parser():
     _selection_options(selection_check, allow_plan=True)
     selection_check.epilog = '省略清单时核对会话的继承选择；缺失项返回退出码 2。核对匹配不代表测试通过。'
 
+    from_selection = commands.add_parser('plan-from-selection', help='从明确审阅的已发现 pytest 范围保存验收计划')
+    from_selection.add_argument('directory', type=Path, help='已保存完整发现记录的项目会话')
+    from_selection.add_argument('--selection-file', type=Path, required=True, help='审阅后的精确测试 ID 清单')
+    from_selection.add_argument('--require-improvement', action='append', default=[], metavar='TEST_ID',
+                                help='须从失败转为通过的已选测试，可重复指定不同测试')
+    from_selection.add_argument('--gate', choices=('strict', 'no-new-failures'), default='strict',
+                                help='回归门槛，默认 strict')
+    from_selection.add_argument('--output', type=Path, required=True, help='新 JSON 路径，可放仓库配置目录；须在 Git 元数据、会话和报告证据之外')
+    from_selection.epilog = '只核对保存的发现记录和冻结基线；不运行项目。'
+
     collect = commands.add_parser("collect", help="在固定快照中实际收集测试和参数化 node ID")
     collect.add_argument("directory", type=Path, help="项目会话目录")
     discovery_scope = collect.add_mutually_exclusive_group()
@@ -317,10 +333,14 @@ def _parser():
     summary = commands.add_parser('summary', help='从已校验的报告生成 PR 摘要，可选 CI 门槛')
     summary.add_argument('report', type=Path, help='项目报告目录、report.json 或证据 ZIP')
     summary.add_argument('--format', choices=('markdown', 'json'), default='markdown')
+    summary.add_argument('--brief', action='store_true', help='生成受众可读的短决策摘要，默认使用严格门禁')
+    summary.add_argument('--language', choices=('en', 'zh'), help='精简摘要语言，默认 en')
     _review_summary_options(summary)
     summary_check = commands.add_parser('check-summary', help='离线核对收到的 Markdown 是否与报告及验收条件相符')
     summary_check.add_argument('report', type=Path, help='项目报告目录、report.json 或证据 ZIP')
     summary_check.add_argument('markdown', type=Path, help='待核对的 PR 摘要文件')
+    summary_check.add_argument('--brief', action='store_true', help='独立复核精简决策摘要')
+    summary_check.add_argument('--language', choices=('en', 'zh'), help='收到的精简摘要语言，默认 en')
     _review_summary_options(summary_check)
     summary_check.add_argument('--facts-file', type=Path, help='同时核对用相同选项导出的项目摘要 JSON')
 
@@ -399,6 +419,24 @@ def _parser():
     candidates.add_argument('--plan', type=Path)
     candidates.add_argument('--gate', choices=('strict', 'no-new-failures'), default='strict')
 
+    native = commands.add_parser('native', help='比较固定 Git 两版的 Cargo 或 CMake/CTest 测试')
+    native.add_argument('repository', type=Path)
+    native.add_argument('--runner', required=True, choices=('cargo', 'cmake'))
+    native.add_argument('--before', required=True)
+    native.add_argument('--after', required=True)
+    native.add_argument('--test', action='append', help='完整测试名，可重复；省略时使用发现范围')
+    native.add_argument('--shared-test-source', action='append', default=[], metavar='PATH',
+                        help='声明定义所选测试的仓库相对文件，核对两版内容与权限')
+    native.add_argument('--timeout', type=_timeout, default=120, help='每版构建、发现和执行的总秒数')
+    native.add_argument('--cargo', type=Path, help='显式指定 Cargo 可执行文件')
+    native.add_argument('--confirm-run', action='store_true', help='确认运行可信项目的构建和测试')
+    native.add_argument('--output', required=True, type=Path)
+    native_check = commands.add_parser('check-native', help='离线核对原生证据目录或 ZIP 并重算比较')
+    native_check.add_argument('directory', type=Path)
+    native_pack = commands.add_parser('pack-native', help='导出原生两版比较证据 ZIP')
+    native_pack.add_argument('directory', type=Path)
+    native_pack.add_argument('--output', required=True, type=Path)
+
     wheels = commands.add_parser('verify-wheels', help='安装两份 wheel 并运行同一固定下游测试')
     wheels.add_argument('repository', type=Path)
     wheels.add_argument('--ref', default='HEAD')
@@ -409,8 +447,18 @@ def _parser():
     wheels.add_argument('--confirm-run', action='store_true')
     wheels.add_argument('--output', required=True, type=Path)
     _runtime_options(wheels)
+    wheel_pack = commands.add_parser('pack-wheels', help='将已核验的 wheel 比较目录导出为便携 ZIP')
+    wheel_pack.add_argument('directory', type=Path)
+    wheel_pack.add_argument('--output', type=Path, required=True)
     wheel_check = commands.add_parser('check-wheels', help='离线核对安装制品、下游源码和测试记录')
     wheel_check.add_argument('directory', type=Path)
+    for command in (wheels, wheel_check):
+        command.add_argument('--gate', choices=('legacy', 'regression', 'no-new-failures'),
+                             help='可选逐项门禁；默认沿用旧汇总')
+        command.add_argument('--format', choices=('json', 'markdown'), help='输出逐项比较的 JSON 或 Markdown')
+        command.add_argument('--require-improvement', action='append', default=[], metavar='TEST_ID',
+                             help='须从失败变为通过的完整 pytest ID，参数化目标须包含参数 ID')
+        command.add_argument('--include-test-ids', action='store_true', help='在逐项输出中显示原始参数 ID')
 
     behavior = commands.add_parser('capture-behavior', help='冻结 Git 两版并保存实际 JSON 行为或 Python API')
     behavior.add_argument('repository', type=Path)
@@ -475,6 +523,8 @@ def _parser():
     verify_replay.add_argument('result', type=Path, help='另一次运行的报告目录、report.json 或证据 ZIP')
     verify_replay.add_argument('--format', choices=('json', 'markdown'), default='json',
                                help='默认输出完整 JSON，可选用于 PR 或 CI 的 Markdown 回执')
+    verify_replay.add_argument('--explain', action='store_true',
+                               help='解释 pytest 已记录的失败文本差异，保留严格重放判定')
     verify_replay.add_argument('--include-test-ids', action='store_true',
                                help='在 Markdown 回执中附上最多 20 个逐项结果')
 
@@ -598,7 +648,7 @@ def _parser():
     return parser
 
 
-def _prepare(args, output):
+def _prepare(args, output, *, prepare=None, **options):
     from .project_sessions import prepare_project
     from .workspace import WORKTREE
 
@@ -613,9 +663,9 @@ def _prepare(args, output):
         before, after = context['before'], context['after']
     elif not before or args.pr_mode or args.merge_commit:
         raise _UsageError('普通项目比较需要 --before；PR 选项需与 --github-event 一起使用。')
-    return prepare_project(
+    return (prepare or prepare_project)(
         args.repository, before, after, output, python_executable=args.python, title=args.title,
-        issue=args.issue, collection_path=args.path, snapshot_scope=args.source_path, pr_context=context,
+        issue=args.issue, collection_path=args.path, snapshot_scope=args.source_path, pr_context=context, **options,
     )
 
 
@@ -765,16 +815,53 @@ def _dispatch(args, *, network_isolation=None):
         return run_candidates(args.repository, args.before, args.candidate, args.output, selected=selected,
                               plan=plan, python_executable=args.python, timeout=args.timeout,
                               confirmed=args.confirm_run, control=control)
-    if args.command == 'verify-wheels':
-        from .project_wheels import run_wheels
+    if args.command == 'native':
+        from .native_project import run_native
 
-        return run_wheels(args.repository, args.ref, args.before_wheel, args.after_wheel, args.output,
-                          module=args.module, selected=args.test, python_executable=args.python,
-                          timeout=args.timeout, confirmed=args.confirm_run, control=control)
-    if args.command == 'check-wheels':
-        from .project_wheels import check_wheels
+        return run_native(args.repository, args.before, args.after, args.output, runner=args.runner,
+                          selected=args.test, shared_sources=args.shared_test_source, timeout=args.timeout,
+                          cargo=args.cargo, confirmed=args.confirm_run, control=control)
+    if args.command == 'check-native':
+        from .native_project import check_native
 
-        return check_wheels(args.directory, control=control), 0
+        return check_native(args.directory, control=control), 0
+    if args.command == 'pack-native':
+        from .native_project import pack_native
+
+        return pack_native(args.directory, args.output, control=control), 0
+    if args.command == 'pack-wheels':
+        from .wheel_archive import pack_wheel_evidence
+
+        return pack_wheel_evidence(args.directory, args.output, control=control), 0
+    if args.command in ('verify-wheels', 'check-wheels'):
+        from .project_wheels import check_wheels, review_wheels, run_wheels
+        from .wheel_results import render_wheel_markdown, wheel_requirements
+
+        if args.require_improvement and args.gate == 'legacy':
+            raise _UsageError('必验改善目标须使用逐项门禁。')
+        required = wheel_requirements(args.require_improvement)
+        detail = args.gate is not None or args.format or required or args.include_test_ids
+        policy = args.gate or ('regression' if args.require_improvement else 'legacy')
+        if args.command == 'verify-wheels':
+            record, code = run_wheels(args.repository, args.ref, args.before_wheel, args.after_wheel, args.output,
+                                      module=args.module, selected=args.test, python_executable=args.python,
+                                      timeout=args.timeout, confirmed=args.confirm_run, control=control)
+            if not detail or not args.confirm_run:
+                return record, code
+            result = review_wheels(record['directory'], policy=policy, required=required,
+                                   include_ids=args.include_test_ids, control=control)
+        else:
+            from .wheel_archive import open_wheel_evidence
+
+            with open_wheel_evidence(args.directory, control=control) as directory:
+                if not detail:
+                    return check_wheels(directory, control=control), 0
+                result = review_wheels(directory, policy=policy, required=required,
+                                       include_ids=args.include_test_ids, control=control)
+        gate_code = result['comparison']['gate']['exit_code']
+        if args.command == 'check-wheels' and args.gate is None and not args.require_improvement:
+            gate_code = 0
+        return (render_wheel_markdown(result) if args.format == 'markdown' else result), gate_code
     if args.command == 'capture-behavior':
         from .project_behavior import capture_behavior
 
@@ -841,6 +928,25 @@ def _dispatch(args, *, network_isolation=None):
                                 waiver_file=args.failure_waivers, waiver_as_of=args.waiver_date,
                                 max_report_age=args.max_report_age_hours, report_as_of=args.report_as_of,
                                 approval=(args.require_approval, args.approval_key, args.expect_reviewer))
+        if args.language and not args.brief:
+            raise _UsageError('--language 只适用于 --brief。')
+        if args.brief:
+            from .project_brief import brief_summary, check_brief, render_brief
+
+            if args.include_test_ids:
+                raise _UsageError('--brief 不附测试身份。')
+            options.pop('public')
+            language = args.language or 'en'
+            if args.command == 'check-summary':
+                if args.facts_file is not None:
+                    raise _UsageError('--facts-file 用于完整摘要；精简摘要只核对 Markdown。')
+                checked = check_brief(args.report, args.markdown, language=language, **options)
+                return checked, 0 if checked['status'] == 'consistent' else 2
+            if args.format != 'markdown':
+                raise _UsageError('--brief 只输出精简 Markdown。')
+            result = brief_summary(args.report, **options)
+            from_zip = args.report.suffix.casefold() == '.zip' and args.report.expanduser().is_file()
+            return render_brief(result, language, from_zip=from_zip), result['gate']['exit_code']
         if args.command == 'check-summary':
             checked = check_review_summary(args.report, args.markdown, facts=args.facts_file, **options)
             return checked, 0 if checked['status'] == 'consistent' else 2
@@ -896,6 +1002,12 @@ def _dispatch(args, *, network_isolation=None):
         except PlanSelectionBlocked as exc:
             return exc.review, 2
         return _execution_result(result, args, plan, control)
+    if args.command == 'suggest':
+        from .project_suggest import render_suggestion, suggest_project
+
+        result = _prepare(args, args.output, prepare=suggest_project, timeout=args.timeout, control=control)
+        code = 0 if result['status'] in ('ready', 'no_recommendations') else 2
+        return (result if args.format == 'json' else render_suggestion(result, args.language)), code
     if args.command == "prepare":
         return _prepare(args, args.output), 0
     if args.command == 'mutation-check':
@@ -958,6 +1070,15 @@ def _dispatch(args, *, network_isolation=None):
             result['report'] = _report_with_scope(result['report'])
             return result, _run_exit_code(result['report'])
         return result, 2
+    if args.command == 'plan-from-selection':
+        from .acceptance_plan import PlanSelectionBlocked
+        from .project_plan_creation import plan_from_selection
+
+        try:
+            return plan_from_selection(args.directory, args.selection_file, args.output,
+                                       required_tests=args.require_improvement, policy=args.gate, control=control), 0
+        except PlanSelectionBlocked as exc:
+            return exc.review, 2
     if args.command == "collect":
         result = project_sessions.collect_project(
             args.directory, python_executable=args.python, timeout=args.timeout, control=control,
@@ -1044,12 +1165,17 @@ def _dispatch(args, *, network_isolation=None):
 
         if args.include_test_ids and args.format != 'markdown':
             raise _UsageError('--include-test-ids 需要与 --format markdown 一起使用。')
-        result = verify_replay(args.source, args.result, control=control)
+        result = verify_replay(args.source, args.result, control=control, explain=args.explain)
         code = replay_verification_exit_code(result)
         if args.format == 'markdown':
             from .project_review_summary import render_replay_markdown
 
-            return render_replay_markdown(result, include_test_ids=args.include_test_ids), code
+            markdown = render_replay_markdown(result, include_test_ids=args.include_test_ids)
+            if args.explain:
+                from .replay_explanation import explanation_markdown
+
+                markdown += '\n' + explanation_markdown(result)
+            return markdown, code
         return result, code
     if args.command == 'check-receipt':
         from .replay_receipt import check_replay_receipt

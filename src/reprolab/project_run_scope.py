@@ -38,12 +38,40 @@ def _execution(version, selected):
             'not_started': len(selected) - started if accuracy == 'exact' else None}
 
 
+def _changed_test_scope(collection, selected):
+    definitions = collection.get('changed_test_definitions')
+    if not isinstance(definitions, dict) or not definitions.keys() <= set(collection['tests']):
+        return None
+    added = 0
+    for identity, row in definitions.items():
+        if (not isinstance(row, dict) or row.get('status') not in ('added', 'modified')
+                or row.get('path') != identity.partition('::')[0]
+                or type(row.get('line')) is not int or row['line'] < 1):
+            return None
+        added += row['status'] == 'added'
+    return {'added': added, 'modified': len(definitions) - added,
+            'selected': len(definitions.keys() & selected), 'omitted': len(definitions.keys() - selected)}
+
+
+def changed_test_scope_text(scope, language):
+    counts = scope.get('changed_test_ids')
+    if not counts or not (counts['added'] or counts['modified']):
+        return ''
+    if language == 'zh':
+        return (f'发现的测试 ID 中，关联到新增定义 {counts["added"]} 项、修改定义 {counts["modified"]} 项；'
+                f'纳入 {counts["selected"]} 项，未纳入 {counts["omitted"]} 项')
+    return (f'Discovered test IDs linked to added definitions: {counts["added"]}; '
+            f'modified definitions: {counts["modified"]}. Selected {counts["selected"]}, omitted {counts["omitted"]}.')
+
+
 def pytest_run_scope(report, *, collection=None, include_omitted=False):
     """Use the saved recommendations as observed hints, without recomputing them."""
     selected = set(report.get('selected_tests', ()))
     discovery = {'status': 'unknown', 'count': None, 'accuracy': 'unknown'}
     suggested = {'status': 'unknown', 'count': None, 'selected_count': None, 'omitted_count': None}
+    definition_scope = None
     if collection is not None:
+        definition_scope = _changed_test_scope(collection, selected)
         tests = set(collection['tests'])
         partial, truncated = collection.get('partial'), collection.get('truncated')
         if partial is True:
@@ -69,6 +97,7 @@ def pytest_run_scope(report, *, collection=None, include_omitted=False):
                     for identity in sorted(omitted)[:OMITTED_LIMIT]
                 ]
     return {
+        **({'changed_test_ids': definition_scope} if definition_scope is not None else {}),
         'discovery': discovery, 'recommendations': suggested, 'selected_count': len(selected),
         'execution': {side: _execution(report.get(side) or {}, selected) for side in ('before', 'after')},
     }
@@ -76,6 +105,7 @@ def pytest_run_scope(report, *, collection=None, include_omitted=False):
 
 def public_run_scope(scope):
     return {
+        **({'changed_test_ids': scope['changed_test_ids']} if 'changed_test_ids' in scope else {}),
         'discovery': {key: scope['discovery'][key] for key in ('status', 'count', 'accuracy')},
         'recommendations': {key: scope['recommendations'][key]
                             for key in ('status', 'count', 'selected_count', 'omitted_count')},
@@ -111,4 +141,7 @@ def run_scope_lines(scope):
         if run['not_started']:
             text += f'，{run["not_started"]} 项未开始'
         records.append(text)
-    return [coverage, ' · '.join(records)]
+    lines = [coverage, ' · '.join(records)]
+    if changed := changed_test_scope_text(scope, 'zh'):
+        lines.append(changed)
+    return lines

@@ -1,7 +1,5 @@
 # CLI、报告与 CI 接入
 
-教学案例只随完整源码提供。安装包用于检查你自己的项目或接收已有证据。源码侧示例命令请在仓库根目录使用 `PYTHONPATH=src python -m reprolab`。
-
 分段交付、固定时钟、系统网络隔离、PR 事件、服务和制品的入口见 [审核工作流](audit-workflows.md)。
 
 CLI 与桌面共用执行和证据核心；不需要安装桌面依赖或配置模型。当前 Alpha 的字段仍可能扩展。消费者应检查 kind 和 schema_version，保留原 JSON，允许未知的附加字段；遇到未知状态或不支持的 schema，停止给出通过结论。
@@ -19,6 +17,96 @@ CLI 与桌面共用执行和证据核心；不需要安装桌面依赖或配置�
 发现有收集错误或超过 10000 项截断时，`project collect` 返回 2，JSON 保留 `partial`／`truncated`、可用 `tests` 和诊断。`status: collected` 只表示存在可用项，不代表清单完整。`project run` 不会隐式运行这份不完整范围；用户可修复后重新发现，或用 `--test`／`--selection-file` 明确选择可用项。报告保留发现限制，结论只覆盖实际选择。
 
 发现记录新增 `worker_status`、`exit_code`、`timed_out`、`worker_record_complete` 和 `diagnosis`，不改变原 schema 或移除已有字段；旧记录缺少这些字段时只能给出保守诊断。
+
+## 先审阅推荐，再明确执行
+
+先确认项目可信并准备好它的 pytest 环境。把下列三个路径换成本机实际路径。输出路径放在仓库之外，路径中可以有空格。
+
+```sh
+repo="$HOME/work/My Project"
+python="$HOME/envs/My Project/bin/python"
+output="$HOME/work/ReproLab Review"
+reprolab project suggest "$repo" --before HEAD --working-tree --python "$python" --output "$output"
+```
+
+`suggest` 冻结基线与候选，并在候选快照实际收集。pytest 会加载项目、测试文件及配置中的插件，测试主体等到后续明确执行时才运行。也可用 `--after COMMIT`、`--path tests/subdir` 或 `--source-path PATH` 限定这次对照。输出默认为中文人读预览，`--language en` 改为英文。语言选项只影响预览文字，测试 ID、依赖路径、清单内容和退出码相同。`--format json` 返回原始结构化记录。
+
+- 完整发现且有可用推荐时，打开“待审阅清单”，按需要保留、删除或增加已发现的完整测试 ID，再复制预览最后的 `run` 命令。清单按原收集顺序保存。预览优先显示发生变化的测试定义及候选源码位置，随后显示其余推荐。文件级、间接导入和 fixture 关联仍计入推荐。未推荐项可从“可用测试 ID”文件中手动选入。
+- 完整发现但无推荐时退出 `0`，状态为 `no_recommendations`。部分发现、截断、受阻或推荐超过单次 2000 项时退出 `2`。这些情况没有待审阅推荐清单或可直接运行的命令。可从已保存的可用 ID 中明确指定本次范围。若调整的是 Python 环境，可用 `project collect` 复查原会话；若改了源码或项目配置，请重新 `project suggest` 冻结新会话。新建会话直接运行时也须给出 `--test`、`--selection-file` 或验收计划。
+- 要手动执行，把预览中“已冻结会话”的实际路径赋给 `session`，把示例 ID 换成该会话中明确选中的 ID。例如 `reprolab project run "$session" --test 'tests/test_cart.py::test_total' --output "$output/reports"`。重用同一会话和清单可多次保存新报告。每次使用原固定源码，Python 环境沿用会话的解释器路径。若更改环境导致实际发现需要核对，仍按所选完整 ID 检查。
+- `suggestion.json` 保存两版指纹、当次发现记录和其 SHA-256、推荐原因以及清单位置。测试定义变化取自当次收集记录的 `changed_test_definitions`，位置指向候选快照。推荐受发现范围、静态关联与已记录 fixture 绑定限制。旧会话可继续按原流程运行和检查，旧报告缺少新字段时仍可查看原结果。
+
+## 执行前从审阅清单保存验收计划
+
+从 `project suggest` 取得会话路径，审阅并编辑它给出的清单。把会话、清单、测试 ID 和保存路径换成本轮实际值，计划的父目录须已存在。可明确保存到仓库配置目录，例如 `.ci/acceptance-plan.json`。此时复制的运行命令仍使用原冻结会话，并把报告写到仓库外。
+
+```sh
+reprolab project plan-from-selection "$session" --selection-file "$selection" \
+  --require-improvement 'tests/test_cart.py::test_total' \
+  --output "$output/reviewed plan.json"
+```
+
+预设门禁为 `strict`，也可用 `--gate no-new-failures`。省略 `--require-improvement` 时，计划仍保存完整审阅范围和门禁。可重复提供不同的必验目标，每个都须是审阅范围内实际发现的完整 ID。空清单、重复 ID、缺失 ID 和不完整或无法核验的发现受阻。命令只读取固定源码及已保存发现，不调用 pytest、模型或执行项目，也不会覆盖已有文件、写入 Git 元数据或改写冻结会话与报告证据目录。
+
+计划使用现有第 3 版格式，绑定基线源码及文件权限的 SHA-256，保存有序的 `approved_selection` 和显式 `required_tests`。这是维护者选定的验收条件。执行后的报告另行证明各项是否通过，签名批准须另行完成。生成成功返回 `0` 并输出 `acceptance_plan_sha256` 和可复制的 `run_command`。
+
+```sh
+reprolab project run "$session" --acceptance-plan "$output/reviewed plan.json" \
+  --verify-plan --output "$output/reports"
+reprolab project summary "$received_zip" --acceptance-plan "$output/reviewed plan.json" \
+  --expect-plan-sha256 "$trusted_plan_fingerprint"
+```
+
+第一条按计划清单执行并核对报告。第二条用收到的原证据 ZIP 和可信渠道取得的计划、指纹离线重算，报告目录也可代替 ZIP。缺少已审阅项或必验目标时，即使已选项全绿，计划仍会受阻。换了冻结基线的会话须重新审阅。已有格式的验收计划继续由原入口读取。
+
+## 对比安装后的下游 wheel
+
+用 `verify-wheels` 在可信的固定下游项目上实际安装、导入并测试两份 wheel。省略 `--confirm-run` 时仅给出执行预览。首次比较与已有证据重算可以使用同一套逐项门禁。
+
+```sh
+reprolab project verify-wheels "$downstream" --ref HEAD \
+  --before-wheel "$baseline_wheel" --after-wheel "$candidate_wheel" \
+  --module my_package --test 'tests/test_example.py::test_behavior' \
+  --confirm-run --output "$evidence" --gate regression --format markdown
+
+reprolab project check-wheels "$evidence" --gate no-new-failures --format json
+```
+
+将示例中的测试目标换为实际的 pytest 选择器。也可用 `pack-wheels "$evidence" --output "$evidence_zip"` 打包，再离线对证据 ZIP 使用 `check-wheels "$evidence_zip"`。核对会重验下游快照、wheel 和绑定的运行文件，随后对比各版 JUnit。新运行还记录每项 pytest 阶段及完整 node ID。旧目录或旧 ZIP 可按 pytest JUnit 规则重建身份，不能唯一重建的项或未记录的阶段保持不确定。完整参数后缀参与对齐。重复、缺失、额外案例、跳过、收集或安装不完整等原因不从总数猜测。
+
+- 直接调用 `verify-wheels` 仍返回原聚合及其门禁。直接调用 `check-wheels` 仍只按材料核对退出。两者默认输出原 JSON。
+- 显式使用 `--gate regression` 时，有确认新增失败返回 `1`。仅有通过和改善返回 `0`。已有失败、未观察或不确定项使门禁返回 `2`。已有明确新增失败时仍保留 `1`，并同时展示范围问题。
+- `--gate no-new-failures` 允许已核对的既有失败。需要相同测试 ID、已记录的失败位置与类型，以及精确匹配的失败记录。两版都红仍可出现在逐项结果中；位置、异常或文本变化与证据不足均受阻。
+- `--require-improvement TEST_ID` 可重复指定不同的必验目标；参数化用例须包含完整参数后缀。目标未观察时受阻，已观察但没有由失败变为通过时失败。提供此选项时默认逐项 `regression` 门禁。
+- 逐项输出的顶层 `status` 保留旧聚合。`integrity` 表示材料核对结果，业务判定见 `comparison.gate`。使用显式门禁时，`check-wheels` 也按该业务门禁退出。仅改用 `--format markdown` 或 `--format json` 时，核对仍按材料一致性退出。
+- 逐项 JSON 和 Markdown 保留相对测试地址并对参数后缀使用指纹。`--include-test-ids` 可显示原始参数 ID。逐项输出省略日志、异常文本、主机名和本机路径；交接原证据前应审阅 ZIP 内的原始内容。
+
+## 原生测试试点 / Native test pilot
+
+固定 Git 两版后，`project native` 可构建并执行 Cargo 或 CMake/CTest。默认预览只解析 Git 版本，实际构建和运行须显式提供 `--confirm-run`。把源码和记录视为可信输入。每版在独立临时副本构建，证据保留两版源码、运行阶段和各自测试结果。
+
+```sh
+reprolab project native "$repo" --runner cargo --before "$base" --after "$candidate" \
+  --shared-test-source src/tests.rs --test 'tests::my_case' \
+  --confirm-run --output "$evidence"
+
+reprolab project native "$repo" --runner cmake --before "$base" --after "$candidate" \
+  --shared-test-source tests/checkout.c --test checkout \
+  --confirm-run --output "$evidence"
+```
+
+Use the actual test identities and repo-relative definition files. The Cargo pilot requires one root package with a tracked Cargo.lock and supports standard library unit tests through libtest. Cargo dependency resolution uses locked offline mode. The CMake pilot uses local CMake and CTest 3.29 or newer with a Debug build. Supply `--cargo /path/to/cargo` if Cargo is outside PATH. Repo build scripts and tests still execute trusted code.
+
+`--shared-test-source` 明确声明定义本轮测试的文件，可重复提供。工具核对这些文件的两版内容和权限，再用完全一致的测试名对齐。这是对已声明范围的核对。请把相关测试源码和定义配置一并列入；测试内联于已修改文件时，可先拆出独立的测试模块。CTest 还核对同名测试的实际命令、参数和属性。没有已核对的共享声明，或同名 CTest 的配置改变或缺证据时，两版各自结果依然可见，该项不作为共享测试。同名测试不足以证明共享定义。改名、单侧缺项、跳过、构建／发现受阻或空集均不能得到通过。单侧未观察不代表测试已删除，需结合该侧的发现与运行状态判断。显式选择外的范围没有本轮结论。
+
+The gate compares exact IDs on both sides with identical declared definition files. CTest also requires matching recorded commands, arguments and properties. Changes outside those files can still affect the tests; this is a check of the declared scope. The report keeps each native result alongside the shared comparison. A missing observation can also mean that a side could not build or discover tests. Exit codes are 0 for a passing selected comparison, 1 for a confirmed regression, and 2 for a blocked comparison. A confirmed regression still counts when another case is ignored or inconclusive.
+
+```sh
+reprolab project pack-native "$evidence" --output "$evidence_zip"
+reprolab project check-native "$evidence_zip"
+```
+
+`check-native` 也接受证据目录。核对散列、原始运行记录及重算结果，全程不重跑构建或测试。核对命令的 `0` 表示材料一致，业务门禁见 `comparison.gate.exit_code`。证据 ZIP 含冻结源码与原始日志，交接前请审阅。
 
 ## 在 CI 中比较两个提交
 
@@ -48,6 +136,30 @@ Vitest 可用 `project vitest … --all-files --output DIRECTORY` 从同一次�
 - `--gate strict` 沿用项目比较的判定。全部所选项通过或改善返回 `0`，出现新增失败返回 `1`，原有失败或其余需要处理的情况返回 `2`。
 - `--gate no-new-failures` 在两版完成且所选结果可比较时允许原有失败。新增失败返回 `1`。跳过、受阻、取消和不完整执行仍需要处理，返回 `2`。只含文件级结果的旧 Vitest 报告无法用该规则豁免原有失败。Go 比较以选定的顶层函数为单位。
 - 门槛结果会写入摘要，原报告结论保持原样。两版均失败表示该测试在基线和候选都失败，仍可审阅完整报告中的两次故障。若同一次比较包含新增失败和受阻项，门槛返回 `1`，摘要同时保留两类结果。
+
+### 精简摘要交接 / Decision brief handoff
+
+把命令中的文件名换成实际收到的 ZIP。分享时将 Markdown 与原 ZIP 一并交接。桌面可从结果页「复制精简摘要」，粘贴为 UTF-8 Markdown。桌面复制的是中文，使用严格门禁。
+
+```sh
+reprolab project summary 'received.zip' --brief --language zh > brief.zh.md
+reprolab project check-summary 'received.zip' brief.zh.md --brief --language zh
+```
+
+Use the actual received ZIP path. Share the Markdown with the original ZIP. Both commands read saved evidence offline. The CLI defaults to English and a strict gate.
+
+```sh
+reprolab project summary 'received.zip' --brief > brief.md
+reprolab project check-summary 'received.zip' brief.md --brief
+```
+
+生成命令按门禁退出，`0` 通过、`1` 失败、`2` 受阻或证据不可用。核对命令按材料一致性退出，`0` 表示全文匹配，`2` 表示不同或无法核对。核对输出的 `gate.exit_code` 是按接收方所给条件重算的门禁，材料一致时也可以是 `1` 或 `2`。选择与发送方相同的语言和门禁选项。若使用验收计划或其他材料，双方应从独立可信来源取得对应文件并明确传入。
+
+Generation exits with the gate decision, while verification exits with the text check. A matching brief returns `0`, and `gate.exit_code` may separately report a failure or a block. Use the sender’s language and gate options. Supply the same evaluation inputs independently when a plan or other materials were used.
+
+全文比对接受 CRLF 换行。短摘要核对覆盖展示的汇总和报告指纹。逐项结果、未展示的计划内容与发布者身份须分别核对。省略 `--brief` 使用现有完整 Markdown/JSON 摘要和历史核对；完整摘要可另附 `--facts-file`。要看原记录，按 `reprolab project unpack --help` 导入刚核对的 ZIP，然后查看其中的 `report.html` 或 `report.json`。
+
+The check covers the displayed aggregates and report fingerprint, with CRLF accepted. Check unshown plan details, individual results and publisher identity separately. Omit `--brief` to verify a full or historical summary. Use `reprolab project unpack --help` to inspect the original ZIP.
 
 Pytest 在两版均因测试主体的 `AssertionError` 失败时，会尽量比较记录的断言。位置指纹取自最内层 traceback 对应的项目相对文件、函数限定名和断言表达式的语法结构。行号用于查找表达式，指纹排除行号、绝对路径、断言消息及运行时值。指纹不同需要复核，返回 `2`，两版均失败的观察仍计入 `baseline_failure`。指纹相同支持继续沿用原有失败策略，证明范围限于所记录的断言表达式和位置标识。
 

@@ -2,7 +2,7 @@
 
 教学案例只随完整源码提供。安装包用于检查你自己的项目或接收已有证据。源码侧示例命令请在仓库根目录使用 `PYTHONPATH=src python -m reprolab`。
 
-[0.19.0a23 下载页](https://github.com/pgz-h/reprolab-oss/releases/tag/v0.19.0a23) 提供 Python 包和 macOS arm64 ZIP。Windows x64 便携附件待构建。
+[0.19.0a25 下载页](https://github.com/pgz-h/reprolab-oss/releases/tag/v0.19.0a25) 提供 Python 包和 macOS arm64 ZIP。Windows x64 的可下载附件以发行页为准。
 
 ReproLab 仍处于 Alpha 阶段。源码安装需要 Python 3.11 或以上。macOS arm64 使用下方安装流程，Windows x64 的源码试用和构建步骤见[Windows 指南](docs/windows.md)。两端当前验证范围见[平台说明](docs/platforms.md)。
 

@@ -1,12 +1,44 @@
 # ReproLab
 
-**0.19.0a24 Alpha** · [Published releases and downloads](https://github.com/pgz-h/reprolab-oss/releases)
+**0.19.0a25 Alpha** · [Published releases and downloads](https://github.com/pgz-h/reprolab-oss/releases)
 
 **Check a fix or project change with real tests, and keep replayable evidence.**
 
 ReproLab freezes the source before and after a change, runs the same selected tests on both versions, and saves verifiable reports, logs, and snapshots for replay. Project comparison shows regressions, existing failures, improvements, and blocked results. Strict fix verification checks for the declared failure on the old version and a pass on the new version. AI can help prepare or interpret checks. Verdicts come from execution and apply to the selected tests.
 
 [中文](README.md) · [Documentation index](docs/README.md) · [Installation](INSTALL.md) · [Project Workbench](docs/project-workbench.md) · [Changelog](CHANGELOG.md)
+
+The CLI also compares Rust library tests and C/C++ projects registered with CTest. See [native runners and the pinned zlib walkthrough](docs/native-languages.md).
+
+## Choose tests for your own PR
+
+Inside a trusted Git project with pytest tests, preview the suggested checks for your working-tree changes:
+
+```sh
+reprolab project suggest . --before HEAD --working-tree --output ../reprolab-review --language en
+```
+
+Use `--python /path/to/env/bin/python` for the project's test environment. Review the saved list, then use the printed command to run it against the frozen revisions. The preview points out added or edited test definitions while retaining broader regression checks. [Try the two upstream PR walkthroughs](docs/suggest-upstream.md).
+
+## First review: would you merge on this green check?
+
+A receipt test failed on both revisions. A second test passed on both. The original report allowed existing failures and gave the change a green check. Explore this synthetic example with the [released CLI](https://github.com/pgz-h/reprolab-oss/releases/tag/v0.19.0a24). You only need the evidence ZIP; the CLI reads it without running the project or contacting a model.
+
+Download [evidence.zip](https://raw.githubusercontent.com/pgz-h/reprolab-oss/e682f9de5d3ba923d273d7a776c74fa6640bd39d/tests/fixtures/review_summary_cb56b04/evidence.zip) and run this command from the download directory:
+
+```sh
+reprolab project summary evidence.zip --gate no-new-failures --include-test-ids
+```
+
+**Expect a blocked CI gate and exit code `2`.** Look for the receipt test under the assertion failures. Its exception message fingerprint changed between revisions, so the recorded evidence cannot establish that the same old fault persisted.
+
+To check what the original reviewer saw, save [public.md](https://raw.githubusercontent.com/pgz-h/reprolab-oss/e682f9de5d3ba923d273d7a776c74fa6640bd39d/tests/fixtures/review_summary_cb56b04/public.md) and [public.json](https://raw.githubusercontent.com/pgz-h/reprolab-oss/e682f9de5d3ba923d273d7a776c74fa6640bd39d/tests/fixtures/review_summary_cb56b04/public.json) next to the ZIP:
+
+```sh
+reprolab project check-summary evidence.zip public.md --public-summary --gate no-new-failures --facts-file public.json
+```
+
+This command exits with `0` because the historical documents match. The output preserves the original decision (`historical_gate.exit_code` is `0`) and the v0.19.0a24 assessment (`gate.exit_code` is `2`). For an upstream example with reproducible revisions and three regression tests, follow the [async-lru PR #799 walkthrough](docs/replay-handoff-case.en.md).
 
 ## Check your project
 

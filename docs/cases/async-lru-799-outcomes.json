@@ -1,0 +1,28 @@
+{
+  "kind": "reprolab_outcome_projection",
+  "schema_version": 1,
+  "source_report_sha256": "f24aef46e6bf69ad63a6ce7955be4dc05d134dcfa5ecf2212e1c365eb6bec4d2",
+  "runner": "pytest",
+  "original_verdict": "regression_passed",
+  "replayable": false,
+  "rows": [
+    {
+      "id": "t0001",
+      "before": "failed",
+      "after": "passed",
+      "classification": "improved"
+    },
+    {
+      "id": "t0002",
+      "before": "failed",
+      "after": "passed",
+      "classification": "improved"
+    },
+    {
+      "id": "t0003",
+      "before": "failed",
+      "after": "passed",
+      "classification": "improved"
+    }
+  ]
+}
