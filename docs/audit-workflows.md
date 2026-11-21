@@ -61,6 +61,16 @@ reprolab project summary REPORT --acceptance-plan plan.json \
 
 `project verify-wheels DOWNSTREAM --ref REF --before-wheel A.whl --after-wheel B.whl --module NAME --test ID --confirm-run --output EVIDENCE` 在同一个实际下游 Git 快照上分别离线安装两份 wheel，确认从相应临时安装目录加载指定模块，再运行同一组测试。所选 Python 要有 pip、pytest 及必要的其他依赖。用 `check-wheels EVIDENCE` 核对两份实际安装输入和 JUnit 结果。
 
+发布接收方可用 `project check-wheels EVIDENCE.zip --review-plan PLAN.json --verify-git-repository REPO --format markdown`。由维护者独立固定两份 wheel、下游提交、导入模块、有序选测和门禁，并用本地 Git 校验冻结源码及权限。参见[接收方验收 wheel 发布证据](cli-contract.md#接收方验收-wheel-发布证据)。
+
+需要把默认安装纳入发布门禁时，先用 `project verify-wheel-install CANDIDATE.whl --wheelhouse DIRECTORY --python PYTHON --confirm-run --output REPORT` 在空目标环境中解析并安装候选及其依赖。接收方通过计划中的 `required_install_environment` 锁定目标环境，用 `--install-check REPORT/wheel-install-check.json` 核对同一候选的通过结果。参见[检查候选 wheel 的干净安装](cli-contract.md#检查候选-wheel-的干净安装)。
+
+需要独立锁定功能测试运行环境时，在计划中加入 `required_test_environment`，从两版的实际 pytest 记录核对。需要固定安装依赖输入时，用 `project fingerprint-wheelhouse DIRECTORY` 核对独立可信的本地依赖目录，再把输出指纹填入 `required_install_wheelhouse_sha256`。参见[发布验收计划](cli-contract.md#接收方验收-wheel-发布证据)和[固定 wheelhouse](cli-contract.md#固定安装检查使用的-wheelhouse)。
+
+需要在空 Python 环境中验证候选公开行为时，发送端用 `verify-wheels --test-wheelhouse DIRECTORY` 解析两端声明依赖和 pytest。维护者从批准的功能依赖目录生成指纹，并在接收计划中设置 `required_test_wheelhouse_sha256`。该锁定独立于单制品干净安装所用的 wheelhouse。参见[隔离功能测试](cli-contract.md#隔离功能测试)。
+
+发送方可用 `verify-wheels --review-plan PLAN.json` 在执行前核对并固定该计划的实际制品和功能输入。接收方继续独立核对 ZIP、计划和本地 Git。参见[发送端命令](cli-contract.md#按维护者计划生成-wheel-功能证据)和[保留摘要与退出码的 CI 步骤](cli-contract.md#在-ci-中保留-wheel-验收摘要和退出码)。
+
 ## 候选、行为与反例
 
 - `project compare-candidates REPO --before BASE --candidate LABEL_A SHA_A --candidate LABEL_B SHA_B --test ID --confirm-run --output EVIDENCE` 分别跑候选，也可用 `--selection-file` 或 `--plan` 指定范围。已有独立报告或 ZIP 时用 `candidate-history --candidate LABEL_A REPORT_A --candidate LABEL_B REPORT_B`。两者使用相同的候选可比性判断，保留各候选的局部门禁、父引用、范围与条件。`same_selection` 核对成员，`same_requested_order` 核对请求列表顺序。pytest 的 `observed_orders` 按基线和候选分别列出已记录的启动序列及出处。进度日志与可核验的旧工作进程事件都可作为顺序证据。完整序列须跨候选、跨两版一致才支持可比通过。顺序不同或证据不足时保留局部结果并返回 `2`，同基线上已有独立失败时返回 `1` 并保留不可比原因。

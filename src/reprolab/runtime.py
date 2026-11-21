@@ -3,11 +3,31 @@ import importlib.metadata
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
 
 BASE_ENVIRONMENT_KEYS = ("PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL")
+PYTHON_ENVIRONMENT_FIELDS = ('python_version', 'implementation', 'platform', 'machine')
+PYTHON_ENVIRONMENT_PROBE = """
+import platform, sys
+
+def reprolab_python_environment():
+    return {
+        'python_version': platform.python_version(),
+        'implementation': platform.python_implementation(),
+        'platform': sys.platform,
+        'machine': platform.machine(),
+    }
+"""
+
+
+def valid_python_environment(environment):
+    return (isinstance(environment, dict) and environment.keys() == set(PYTHON_ENVIRONMENT_FIELDS)
+            and all(isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.+-]{1,80}', value)
+                    for value in environment.values())
+            and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:[a-z][a-z0-9.]*)?', environment['python_version']) is not None)
 
 
 def child_environment():

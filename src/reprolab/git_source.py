@@ -11,14 +11,20 @@ import tempfile
 from .runner import EXCLUDED, MAX_BYTES, MAX_ENTRIES, run_case
 from .case import parse_test_target
 from .project_snapshot_scope import in_source_scope
+from .runtime import child_environment
 
 
-def _git(repo, *args, data=None):
+def _git(repo, *args, data=None, local_only=False):
+    env = dict(child_environment() if local_only else os.environ,
+               GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0")
+    if local_only:
+        # Disable lazy fetch and all transports, including on Git versions that ignore the lazy-fetch flag.
+        env.update(GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="")
     try:
         result = subprocess.run(
             ["git", "--no-optional-locks", "-C", str(repo), *args],
             input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=dict(os.environ, GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0"),
+            env=env,
             timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -28,10 +34,11 @@ def _git(repo, *args, data=None):
     return result.stdout
 
 
-def resolve_commit(repo, ref):
+def resolve_commit(repo, ref, *, local_only=False):
     if not ref or ref.startswith("-"):
         raise ValueError("Git 版本不能为空或以连字符开头。")
-    sha = _git(repo, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}").decode().strip()
+    sha = _git(repo, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}",
+               local_only=local_only).decode().strip()
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
         raise ValueError("Git 没有返回有效的提交编号。")
     return sha
@@ -41,27 +48,29 @@ def excluded_source_path(path):
     return any(part in EXCLUDED or part.startswith('.env') for part in path.parts)
 
 
-def excluded_tracked_changes(repo, before, after=None, *, saved_baseline=False, snapshot_scope=None):
+def excluded_tracked_changes(repo, before, after=None, *, saved_baseline=False, snapshot_scope=None, local_only=False):
     """Count changes omitted by the snapshot policy without saving paths or contents."""
     if before == after:
         return 0
     if saved_baseline:
         try:
-            resolve_commit(repo, before)
+            resolve_commit(repo, before, local_only=local_only)
         except ValueError:
             # Rechecks can use the saved baseline after history has been rewritten.
             return None
     revisions = [before] if after is None else [before, after]
     changed = _git(repo, 'diff', '--name-only', '--no-renames', '--no-ext-diff', '--no-textconv',
-                   '-z', *revisions, '--')
+                   '--ignore-submodules=none', '--no-relative',
+                   '-z', *revisions, '--', local_only=local_only)
     paths = (PurePosixPath(os.fsdecode(name)) for name in changed.split(b'\0') if name)
     return sum(excluded_source_path(path) or not in_source_scope(path, snapshot_scope) for path in paths)
 
 
-def export_revision(repo, sha, destination, *, snapshot_scope=None):
+def export_revision(repo, sha, destination, *, snapshot_scope=None, local_only=False):
     # Raw blobs avoid git archive export-ignore silently removing tested code.
     entries, size_total = [], 0
-    for record in _git(repo, "ls-tree", "-r", "-l", "-z", "--full-tree", sha).split(b"\0"):
+    tree = _git(repo, "ls-tree", "-r", "-l", "-z", "--full-tree", sha, local_only=local_only)
+    for record in tree.split(b"\0"):
         if not record:
             continue
         metadata, raw_name = record.split(b"\t", 1)
@@ -90,7 +99,7 @@ def export_revision(repo, sha, destination, *, snapshot_scope=None):
     if not entries:
         return
     request = b"".join(oid + b"\n" for _, oid, _, _ in entries)
-    stream = io.BytesIO(_git(repo, "cat-file", "--batch", data=request))
+    stream = io.BytesIO(_git(repo, "cat-file", "--batch", data=request, local_only=local_only))
     physical_directories = {}
 
     def mkdir_checked(relative):

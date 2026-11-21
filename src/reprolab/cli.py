@@ -183,7 +183,7 @@ def main(argv=None):
     problem.add_argument("--issue")
     problem.add_argument("--issue-file", type=Path)
     prepare.add_argument("--context", action="append", help="相关文件的仓库内路径，可重复")
-    prepare.add_argument("--drafts", type=Path, required=True, help="独立草稿根目录，例如 work/reprolab/drafts")
+    prepare.add_argument("--drafts", type=Path, required=True, help="被测仓库之外的独立草稿根目录")
     prepare.add_argument("--python", help="验收用 Python 环境")
     prepare.add_argument("--json", action="store_true")
     for name in ("generate", "import"):

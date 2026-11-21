@@ -139,7 +139,7 @@ def prepare_draft(repository, before_ref, after_ref="HEAD", *, issue=None, issue
     root, context = collect_context(repository, before_ref, after_ref, issue, paths)
     drafts_root = Path(drafts_root).expanduser().resolve()
     if drafts_root.is_relative_to(root):
-        raise ValueError("草稿必须保存在被测 Git 仓库之外，例如 work/reprolab/drafts。")
+        raise ValueError("草稿必须保存在被测 Git 仓库之外。")
     runtime = choose_runtime(python_executable)
     folder = drafts_root / (datetime.now(timezone.utc).strftime("draft-%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8])
     folder.mkdir(parents=True, exist_ok=False)

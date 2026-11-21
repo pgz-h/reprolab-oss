@@ -87,7 +87,69 @@ def test_wheel_markdown_puts_late_failure_ahead_of_unchanged_cases():
                              'phase_basis': {'before': 'legacy_pytest_junit', 'after': 'legacy_pytest_junit'},
                              'required_improvements': [], 'issues': {'before': {}, 'after': {}},
                              'entries': [*stable, regression]}}
-    text = render_wheel_markdown(result)
+    text = render_wheel_markdown(result, exit_policy='Comparison gate', exit_code=1)
     assert 'late_regression' in text and 'case_0' not in text
     assert 'Showing 1 of 71 individual results' in text and '--format json' in text
     assert len(result['comparison']['entries']) == 71
+
+
+def test_verify_wheels_preflights_pip_only_on_confirmed_run(tmp_path, capsys, monkeypatch):
+    import subprocess
+
+    from reprolab import project_wheels
+
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    git = ['git', '-C', str(repo), '-c', 'user.name=Reviewer',
+           '-c', 'user.email=review@example.invalid', '-c', 'commit.gpgsign=false']
+    subprocess.run([*git, 'init', '-q'], check=True)
+    subprocess.run([*git, 'commit', '--allow-empty', '-qm', 'downstream'], check=True)
+    artifact = tmp_path / 'example-1.0-py3-none-any.whl'
+    artifact.touch()
+    output = tmp_path / 'output-parent' / 'evidence'
+    python = str(tmp_path / 'unseeded' / 'python')
+    calls = []
+    real_run = subprocess.run
+
+    def run(command, *args, **kwargs):
+        if command[0] != python:
+            return real_run(command, *args, **kwargs)
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 1, '', f'{python}: No module named pip')
+
+    monkeypatch.setattr(project_wheels, 'choose_runtime', lambda path: {'executable': str(path)})
+    monkeypatch.setattr(subprocess, 'run', run)
+    argv = ['verify-wheels', str(repo), '--before-wheel', str(artifact), '--after-wheel', str(artifact),
+            '--test', 'test_receipt.py::test_ok', '--module', 'example', '--python', python,
+            '--output', str(output)]
+    assert main(argv) == 0
+    assert json.loads(capsys.readouterr().out)['status'] == 'ready'
+    assert main([*argv, '--format', 'markdown']) == 0
+    assert json.loads(capsys.readouterr().out)['status'] == 'ready'
+    assert calls == []
+    assert main([*argv, '--confirm-run']) == 2
+    message = json.loads(capsys.readouterr().err)['error']['message']
+    assert calls == [[python, '-I', '-m', 'pip', '--version']]
+    assert python in message and '缺少 pip' in message
+    assert not output.parent.exists()
+
+
+@pytest.mark.parametrize('options', [
+    ['--gate', 'legacy'], ['--gate', 'regression'], ['--gate', 'no-new-failures'],
+    ['--require-improvement', 'test_receipt.py::test_ok'],
+    ['--gate', 'regression', '--require-improvement', 'test_receipt.py::test_ok'],
+])
+def test_verify_wheels_requires_confirmation_for_explicit_gate(tmp_path, capsys, monkeypatch, options):
+    from reprolab import project_wheels
+
+    def unexpected_run(*args, **kwargs):
+        pytest.fail('A gated preview must stop before calling run_wheels')
+
+    monkeypatch.setattr(project_wheels, 'run_wheels', unexpected_run)
+    output = tmp_path / 'uncreated' / 'evidence'
+    argv = ['verify-wheels', str(tmp_path), '--before-wheel', 'before.whl', '--after-wheel', 'after.whl',
+            '--test', 'test_receipt.py::test_ok', '--module', 'example', '--output', str(output)]
+    assert main([*argv, *options]) == 2
+    error = json.loads(capsys.readouterr().err)['error']
+    assert error['type'] == 'argument_error' and '--confirm-run' in error['message']
+    assert not output.parent.exists()

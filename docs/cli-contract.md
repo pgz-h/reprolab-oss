@@ -61,7 +61,7 @@ reprolab project summary "$received_zip" --acceptance-plan "$output/reviewed pla
 
 ## 对比安装后的下游 wheel
 
-用 `verify-wheels` 在可信的固定下游项目上实际安装、导入并测试两份 wheel。省略 `--confirm-run` 时仅给出执行预览。首次比较与已有证据重算可以使用同一套逐项门禁。
+用 `verify-wheels` 在可信的固定下游项目上实际安装、导入并测试两份 wheel。省略 `--confirm-run` 时仅给出执行预览。显式提供 `--gate`（含 `legacy`）或 `--require-improvement` 时必须确认执行，缺少确认返回 2。单独选择 `--format` 不改变预览的退出行为。默认使用已有 Python 环境中的 pytest 和 pip，分别安装两份 wheel 时使用 `--no-deps`。该环境缺少 pip 时，确认运行会在生成证据前报告所选解释器路径。首次比较与已有证据重算可以使用同一套逐项门禁。
 
 ```sh
 reprolab project verify-wheels "$downstream" --ref HEAD \
@@ -77,13 +77,153 @@ reprolab project check-wheels "$evidence" --gate no-new-failures --format json
 - 直接调用 `verify-wheels` 仍返回原聚合及其门禁。直接调用 `check-wheels` 仍只按材料核对退出。两者默认输出原 JSON。
 - 显式使用 `--gate regression` 时，有确认新增失败返回 `1`。仅有通过和改善返回 `0`。已有失败、未观察或不确定项使门禁返回 `2`。已有明确新增失败时仍保留 `1`，并同时展示范围问题。
 - `--gate no-new-failures` 允许已核对的既有失败。需要相同测试 ID、已记录的失败位置与类型，以及精确匹配的失败记录。两版都红仍可出现在逐项结果中；位置、异常或文本变化与证据不足均受阻。
+- 当两侧 wheel 文件名与 SHA-256 都相同，且固定下游测试出现红绿反转时，逐项报告保留两次结果并标记 `same_wheel_divergence`。逐项门禁与必验改善项会受阻。旧聚合状态按原规则读取。
 - `--require-improvement TEST_ID` 可重复指定不同的必验目标；参数化用例须包含完整参数后缀。目标未观察时受阻，已观察但没有由失败变为通过时失败。提供此选项时默认逐项 `regression` 门禁。
 - 逐项输出的顶层 `status` 保留旧聚合。`integrity` 表示材料核对结果，业务判定见 `comparison.gate`。使用显式门禁时，`check-wheels` 也按该业务门禁退出。仅改用 `--format markdown` 或 `--format json` 时，核对仍按材料一致性退出。
 - 逐项 JSON 和 Markdown 保留相对测试地址并对参数后缀使用指纹。`--include-test-ids` 可显示原始参数 ID。逐项输出省略日志、异常文本、主机名和本机路径；交接原证据前应审阅 ZIP 内的原始内容。
 
+### 隔离功能测试
+
+发布前可把 `--test-wheelhouse "$trusted_test_wheelhouse"` 加入 `verify-wheels` 命令。ReproLab 将可信本地 wheelhouse 暂存一次。基线和候选各用一个最初无第三方分发的 venv，通过同一次 pip 解析安装各自的 wheel、默认声明依赖和 `pytest>=8,<10`，随后运行原有选测。所选 Python 须支持创建 venv 和启动 pip 工具环境。wheelhouse 须包含适用于该 Python 的 pytest、工具依赖及两端需要的运行依赖，遵循[干净安装的本地输入约束](#检查候选-wheel-的干净安装)。文件出现在 wheelhouse 中只表示可供解析，只有解析选中的包进入目标环境。pytest 及其依赖属于两端测试环境。
+
+隔离模式检查导入的 `--module` 位于对应 venv，且其文件可由已安装分发的 RECORD 唯一归属于对应 wheel。对命名空间包，请选择有实体文件的子模块。依赖安装、工具准备或模块归属受阻时返回 `2`，可查阅相应一侧的 `install.log` 或 `pytest.log`。通过的工具初始化日志附在同一侧的 `install.log` 中。venv 分离 Python 包环境，执行仍依赖可信的解释器、制品和下游测试代码。
+
+### 接收方验收 wheel 发布证据
+
+维护者在证据之外维护发布计划。使用从可信制品取得的文件名和 SHA-256、审阅过的下游提交及选测范围填好计划。接收方另外准备含该提交、树和 blob 的可信本地 Git 仓库（也可用裸仓库）。
+
+```sh
+reprolab project check-wheels "$received_zip" \
+  --review-plan "$maintainer_plan" \
+  --verify-git-repository "$trusted_downstream_git" --format markdown
+```
+
+证据目录也可代替 ZIP。两个验收选项须同时使用。`--gate` 和 `--require-improvement` 只能通过计划提供。验收 Markdown 始终对参数 ID 使用指纹。
+
+```json
+{
+  "kind": "reprolab_wheel_review_plan",
+  "schema_version": 1,
+  "wheel_artifacts": {
+    "before": {
+      "filename": "my_package-1.0-py3-none-any.whl",
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "after": {
+      "filename": "my_package-2.0-py3-none-any.whl",
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  },
+  "downstream_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "module": "my_package",
+  "selected_tests": [
+    "tests/test_example.py::test_smoke",
+    "tests/test_example.py::test_behavior[expected-case]"
+  ],
+  "gate": "regression",
+  "required_improvements": []
+}
+```
+
+- 把示例中的提交、摘要、文件名、模块及测试替换为实际的期望值。提交须为 40 或 64 个小写十六进制字符，wheel 摘要须为 64 个小写十六进制字符。每端只用 wheel 的文件名。
+- `selected_tests` 是非空、无重复的有序 pytest 选择器列表。验收按发送方 `verify-wheels --test` 的记录逐项原样比较，交换顺序也会受阻。函数选择器可覆盖其参数化用例，需要固定具体参数时应在计划中逐项列出完整 node ID。这个顺序约定针对传给 pytest 的选择器，实际收集和运行顺序仍由 pytest 决定。
+- `gate` 可选 `regression` 或 `no-new-failures`。`required_improvements` 可省略或为空，指定时须列出无重复的完整 node ID，包括所需的参数后缀。计划使用严格的 UTF-8 JSON，拒绝未知字段、重复键和不支持的版本。
+- 可选的 `required_test_environment` 固定两端功能测试实际使用的环境，包含 `python_version`（完整版本）、`implementation`、`platform` 和 `machine`，字段格式与下节的安装环境相同。例如，`{"python_version":"3.11.18","implementation":"CPython","platform":"darwin","machine":"arm64"}`。分别使用两端 pytest 子进程写入、且通过证据指纹核对的 phase 记录。缺失、无法读出或任一端值不匹配时返回 `2`。历史证据照常支持旧计划。功能测试环境和干净安装环境可各自指定，摘要分别显示。
+- 可选的 `required_test_wheelhouse_sha256` 要求两端都启用隔离功能测试，并使用经维护者批准的同一份功能 wheelhouse。由维护者从独立可信的目录执行 `project fingerprint-wheelhouse DIRECTORY`，将输出的 `wheelhouse_sha256` 填入计划。证据保存暂存清单和两端已绑定的 phase 记录，wheelhouse 的 wheel 文件由维护者另行保管。接收方从清单重算指纹，再和两端 phase 记录分别核对。历史已有环境模式、任一端记录缺失、清单或指纹不符均返回 `2`。该字段可独立于 `required_test_environment` 和 `required_install_*` 使用。摘要单独报告功能依赖来源。
+
+接收方先核对证据指纹和计划范围，再用本地 Git 对象独立导出计划提交，核对冻结文件的内容和权限。Git 导出采用与执行端相同的源码范围。验收在范围匹配后重算计划门禁。JSON 的 `review_plan_acceptance` 记录计划 SHA-256 和验收结论，范围受阻时给出 `mismatched_fields`。计划与证据匹配且门禁通过返回 `0`，范围匹配且有确认的新增失败或必验改善失败返回 `1`，范围不符、Git 对象缺失或证据不足返回 `2`。
+
+离线验收可以判断已保存的结果是否覆盖维护者指定的 wheel 与下游输入，并满足所选门禁。运行记录的真实性取决于发送方或受信的执行来源。发送端在已有 Python 环境中用 `pip --no-deps` 安装 wheel。如发布还要求在空环境中完成依赖解析与安装，可把下节的检查纳入同一份计划。
+
+### 按维护者计划生成 wheel 功能证据
+
+发送方可用接收方提供的同一格式计划生成证据。
+
+```sh
+reprolab project verify-wheels "$downstream" --review-plan "$maintainer_plan" \
+  --before-wheel "$baseline_wheel" --after-wheel "$candidate_wheel" \
+  --python "$target_python" --test-wheelhouse "$local_test_wheelhouse" \
+  --confirm-run --output "$evidence" --format markdown
+```
+
+实际提交、模块、选测顺序、门禁和必验改善项取自一次读取的计划。计划执行拒绝同时传入 `--ref`、`--module`、`--test`、`--gate` 或 `--require-improvement`。手工模式的 `--ref` 默认仍为 `HEAD`。若计划要求 `required_test_wheelhouse_sha256`，须提供 `--test-wheelhouse`。隔离模式使用能创建 venv 的 Python，pytest 由功能 wheelhouse 提供。计划固定 Python 时，预检从实际所选解释器采集环境标识。
+
+执行前先暂存并核对两端 wheel 的文件名和 SHA-256，并核对暂存的功能 wheelhouse。两端制品都固定后才开始安装。省略 `--confirm-run` 只执行预检，成功只表示本次检查的输入符合计划。确认执行时会重新检查本次实际暂存的输入。执行完毕后，发送方还会从两端已核对指纹的 pytest 记录复核计划要求的实际功能环境和隔离范围。范围不符时保留证据、指出具体字段并返回 `2`。命令输出功能门禁结果和本次读取的计划 SHA-256。需要独立干净安装报告的发布计划，由接收方用 `check-wheels --install-check` 完成发布验收。
+
+### 在 CI 中保留 wheel 验收摘要和退出码
+
+Markdown 首屏显示决定命令退出码的规则及实际退出码，并单独显示业务门禁。普通 `check-wheels --format markdown` 按证据完整性退出，因此材料一致时可返回 `0`，即使业务门禁显示失败。要在流水线中应用普通业务门禁，传 `--gate`。接收方计划模式按发布验收退出，发送方计划模式按功能门禁退出。证据缺失、ZIP 无法读取或计划无效时，Markdown 提供简短受阻摘要，详细诊断仍写到标准错误。
+
+下面的 GitHub Actions 步骤假定工作流已提供 `EVIDENCE_ZIP`、`REVIEW_PLAN`、`TRUSTED_DOWNSTREAM_GIT` 和 `INSTALL_CHECK`。只验收功能且计划未要求干净安装时，移除 `--install-check` 参数。
+
+```yaml
+- name: Verify wheel release evidence
+  shell: bash
+  run: |
+    summary="$(mktemp)"
+    trap 'rm -f "$summary"' EXIT
+    status=0
+    reprolab project check-wheels "$EVIDENCE_ZIP" \
+      --review-plan "$REVIEW_PLAN" --verify-git-repository "$TRUSTED_DOWNSTREAM_GIT" \
+      --install-check "$INSTALL_CHECK" --format markdown >"$summary" || status=$?
+    if [ -s "$summary" ]; then
+      cat "$summary" >>"$GITHUB_STEP_SUMMARY"
+    else
+      printf '### ReproLab wheel check\n\n- Exit code · %s\n- Diagnostic details are on standard error.\n' "$status" >>"$GITHUB_STEP_SUMMARY"
+    fi
+    exit "$status"
+```
+
+### 检查候选 wheel 的干净安装
+
+```sh
+reprolab project verify-wheel-install "$candidate_wheel" \
+  --wheelhouse "$local_wheelhouse" --python "$target_python" \
+  --confirm-run --output "$new_install_report"
+```
+
+省略 `--confirm-run` 会预览候选文件名和可供解析的 wheel 数量。确认后，命令使用所选 Python 创建两个临时 venv。工具环境提供 pip，目标环境从空的第三方包集合开始。pip 将候选 wheel 和所需依赖装入目标环境，再在同一目标环境执行 `pip check`。省略 `--python` 时使用当前解释器。创建环境和 pip 检查共用 `--timeout`，默认 120 秒。
+
+本地 wheelhouse 可以为空，只读取其中的普通 wheel 文件。目录上限为 512 个条目、128 份 wheel、合计 1 GiB，单份 wheel 上限为 250 MiB。pip 使用本地暂存的 wheel，关闭索引、缓存和调用者的 pip 配置。候选和依赖的 `Requires-Dist` 若声明直接 URL 或路径引用会受阻。请提供可信制品和可信解释器。这个约定约束 pip 的制品来源，运行进程仍拥有操作系统授予的权限。
+
+输出目录内的 `wheel-install-check.json` 保存候选文件名和 SHA-256、实际 Python 版本、实现、平台、架构、pip 版本和各步骤结论，并附本机诊断日志。安装与 `pip check` 均通过返回 `0`，pip 报告安装或依赖检查失败返回 `1`，工具环境不可用、超时或输入超出本地安装约定返回 `2`。此检查覆盖指定解释器下的默认安装和适用的声明依赖，功能测试仍由 `verify-wheels` 提供。
+
+要让发布接收方强制验收一个目标环境，在上节计划顶层加入 `required_install_environment`。以下是 macOS arm64 上 CPython 3.11.18 的值，实际值可从目标环境生成的检查报告读取。
+
+```json
+{
+  "required_install_environment": {
+    "python_version": "3.11.18",
+    "implementation": "CPython",
+    "platform": "darwin",
+    "machine": "arm64"
+  }
+}
+```
+
+```sh
+reprolab project check-wheels "$received_zip" \
+  --review-plan "$maintainer_plan" --verify-git-repository "$trusted_downstream_git" \
+  --install-check "$trusted_install_report/wheel-install-check.json" --format markdown
+```
+
+接收方在功能证据之外提供自己执行或从受信执行方取得的报告。验收要求报告记录的候选文件名、SHA-256 及四项环境值逐一匹配，并且安装和 `pip check` 都通过。缺失、失败或不匹配会返回 `2`，报告与其他范围都匹配后才按功能门禁退出。摘要单独显示安装检查通过，JSON 的 `review_plan_acceptance.installation` 保存报告 SHA-256 和匹配的环境。验收只读取报告，报告真实性仍依赖执行来源。省略计划中的 `required_install_environment` 时，原有功能验收照常使用。
+
+### 固定安装检查使用的 wheelhouse
+
+```sh
+reprolab project fingerprint-wheelhouse "$trusted_wheelhouse"
+```
+
+维护者从独立可信的本地依赖目录生成期望值，把 JSON 输出的 `wheelhouse_sha256` 填入同一发布计划顶层的 `required_install_wheelhouse_sha256`，并保留 `required_install_environment`。接收方从安装报告记录的实际暂存输入清单重算指纹。即使候选和 Python 环境相同、安装也通过，来自不同 wheelhouse 的报告仍会返回 `2`。
+
+指纹覆盖目录顶层全部合规 wheel 的文件名和逐文件 SHA-256，复用安装检查的文件数量、大小和依赖声明约束。清单按文件名排序，条目使用排序后的 JSON 对象键和紧凑分隔符，取该 JSON 的 SHA-256。目录位置、输入顺序和普通非 wheel 文件不参与计算，空目录对应 `[]` 的 SHA-256。重复文件名（含仅大小写不同）、无效清单项、非法 wheel 文件或直接 URL 依赖会受阻。
+
+这是暂存给 pip 的可用依赖制品清单。实际选中的依赖仍由 pip 按目标环境和依赖声明解析，报告的真实性仍取决于可信执行来源。
+
 ## 原生测试试点 / Native test pilot
 
-固定 Git 两版后，`project native` 可构建并执行 Cargo 或 CMake/CTest。默认预览只解析 Git 版本，实际构建和运行须显式提供 `--confirm-run`。把源码和记录视为可信输入。每版在独立临时副本构建，证据保留两版源码、运行阶段和各自测试结果。
+固定 Git 两版后，`project native` 可构建并执行 Cargo 或 CMake/CTest。默认预览读取 Git 版本及遗漏改动计数，实际构建和运行须显式提供 `--confirm-run`。把源码和记录视为可信输入。每版在独立临时副本构建，证据保留两版源码、运行阶段和各自测试结果。
 
 ```sh
 reprolab project native "$repo" --runner cargo --before "$base" --after "$candidate" \
@@ -105,6 +245,10 @@ The gate compares exact IDs on both sides with identical declared definition fil
 reprolab project pack-native "$evidence" --output "$evidence_zip"
 reprolab project check-native "$evidence_zip"
 ```
+
+CI 可用 `check-native --verify-result` 直接按复核后的普通门禁退出，输出中的 `verified_result.rules` 标明当前或历史规则。接收方可用 `check-native --review-plan FILE` 按独立计划验收，并用 `--verify-git-repository REPOSITORY` 要求本地 Git 来源核对。完整命令与计划字段见[原生项目测试](native-languages.md#读结果--reading-the-gate)。
+
+当前 PR 的接收作业可用 `check-native ZIP --github-event FILE --pr-mode head|merge --policy-path PATH --verify-git-repository REPOSITORY`。它从接收方的事件与本地对象重建计划，要求证据记录相同的计划 SHA-256，并核对冻结 Git 快照。计划包含目标和 head 提交，目标分支单独前进也会阻止旧证据通过。纯离线复核可继续用原计划文件。参见[从 GitHub PR 事件生成验收计划](native-languages.md#从-github-pr-事件生成验收计划)。
 
 `check-native` 也接受证据目录。核对散列、原始运行记录及重算结果，全程不重跑构建或测试。核对命令的 `0` 表示材料一致，业务门禁见 `comparison.gate.exit_code`。证据 ZIP 含冻结源码与原始日志，交接前请审阅。
 

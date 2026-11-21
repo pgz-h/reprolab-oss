@@ -3,7 +3,6 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
-import sys
 from pathlib import Path
 
 from .platform_support import application_directories
@@ -42,12 +41,7 @@ def default_settings():
 
 
 def default_state_directory():
-    directory = application_directories()[0] / 'desktop'
-    if sys.platform == 'darwin' and not (directory / 'settings.json').exists():
-        legacy = Path.home() / '开源项目研究/work/reprolab/desktop'
-        if (legacy / 'settings.json').is_file():
-            return legacy
-    return directory
+    return application_directories()[0] / 'desktop'
 
 
 def read_json(path, limit=4 * 1024 * 1024):

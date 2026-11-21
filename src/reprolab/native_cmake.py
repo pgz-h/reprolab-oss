@@ -50,7 +50,7 @@ def _inventory(folder):
     return names
 
 
-def _settings_digest(row, roots):
+def _settings_digest(row, roots, *, schema_version=2):
     command = row.get('command')
     if not isinstance(command, list) or not command or not all(isinstance(arg, str) for arg in command):
         return None
@@ -68,16 +68,28 @@ def _settings_digest(row, roots):
             return {key: canonical(item) for key, item in value.items()}
         return value
 
-    settings = [row.get('config'), command, row.get('properties', [])]
-    data = json.dumps(canonical(settings), sort_keys=True, ensure_ascii=True, separators=(',', ':')).encode()
+    def argument(value):
+        option, separator, suffix = value.partition('=')
+        if schema_version >= 2 and separator and re.fullmatch(r'(?:--[\w-]+|-D[\w.-]+(?::[A-Za-z]+)?)', option):
+            normalized = canonical(suffix)
+            if normalized[0] == 'local-path' and '..' not in suffix.split('/'):
+                return ['path-option', option, normalized]
+        return canonical(value)
+
+    settings = [canonical(row.get('config')), [argument(arg) for arg in command],
+                canonical(row.get('properties', []))]
+    data = json.dumps(settings, sort_keys=True, ensure_ascii=True, separators=(',', ':')).encode()
     return hashlib.sha256(data).hexdigest()
 
 
-def _observations(folder, names, exit_code):
-    raw = _read(folder / 'results.xml')
+def _junit_suite(raw):
     if b'<!DOCTYPE' in raw or b'<!ENTITY' in raw:
         raise ValueError('Unsupported CTest XML.')
-    suite = ET.fromstring(raw.decode('utf-8-sig'))
+    return ET.fromstring(raw.decode('utf-8-sig'))
+
+
+def _observations(folder, names, exit_code):
+    suite = _junit_suite(_read(folder / 'results.xml'))
     cases = suite.findall('testcase')
     totals = {label: int(suite.attrib[label]) for label in ('tests', 'failures', 'disabled', 'skipped')}
     if (suite.tag != 'testsuite' or totals['tests'] != len(cases) or len(cases) != len(names)
@@ -115,7 +127,28 @@ def _observations(folder, names, exit_code):
     return observations
 
 
-def _side_result(folder, selected, phases):
+def check_failure_markers(path, digest, tests, markers):
+    """Match literal markers only against bound output of independently classified failures."""
+    checks = dict.fromkeys(markers, 'missing')
+    if not digest or not any(tests.get(name) == 'failed' for name in markers):
+        return checks
+    raw = _read(path)
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError('CTest 基线运行输出指纹发生变化。')
+    # The caller already validated this exact JUnit document and its failed test IDs.
+    suite = _junit_suite(raw)
+    for case in suite.findall('testcase'):
+        name = case.get('name')
+        if name not in markers or tests.get(name) != 'failed':
+            continue
+        outputs = [child.text for child in case if child.tag in ('system-out', 'system-err')
+                   and child.text and len(child) == 0]
+        if outputs:
+            checks[name] = 'matched' if any(markers[name] in output for output in outputs) else 'mismatch'
+    return checks
+
+
+def _side_result(folder, selected, phases, *, schema_version):
     def blocked(reason):
         return {'status': 'blocked', 'tests': {}, 'reason': reason}
 
@@ -145,16 +178,16 @@ def _side_result(folder, selected, phases):
                 or any(not isinstance(path, str) or not path or path.endswith('/') for paths in roots.values() for path in paths)):
             return blocked('invalid_ctest_path_record')
         result['test_settings'] = {name: digest for name, row in names.items()
-                                   if (digest := _settings_digest(row, roots)) is not None}
+                                   if (digest := _settings_digest(row, roots, schema_version=schema_version)) is not None}
     return result
 
 
-def read_cmake(evidence_dir, *, selected):
+def read_cmake(evidence_dir, *, selected, schema_version=2):
     try:
         phases = json.loads(_read(evidence_dir / 'commands.json'))
         if not isinstance(phases, dict):
             raise ValueError('Invalid CTest phase record.')
-        return _side_result(evidence_dir, selected, phases)
+        return _side_result(evidence_dir, selected, phases, schema_version=schema_version)
     except (ValueError, TypeError, OSError, KeyError, ET.ParseError, RecursionError):
         return {'status': 'blocked', 'tests': {}, 'reason': 'incomplete_ctest_evidence'}
 

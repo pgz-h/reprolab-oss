@@ -6,7 +6,7 @@ v0.3 直接读取同一个本地仓库里的两个提交，自动准备修复前
 
     python -m reprolab verify-git /path/to/project --before HEAD~1 --after HEAD --test /path/to/regression.py --failure-type ValueError --failure-message "reported bug" --output /path/outside/project/reports
 
-before/after 可以是提交编号、分支或标签，after 默认 HEAD。仓库需要已有提交。本机 work/reprolab/run.sh 入口会把报告放到独立 outputs 目录。
+before/after 可以是提交编号、分支或标签，after 默认 HEAD。仓库需要已有提交。
 
 ## 行为与边界
 

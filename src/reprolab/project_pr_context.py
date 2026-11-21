@@ -26,9 +26,9 @@ class PRComparisonBlocked(ValueError):
         self.reason = reason
 
 
-def _require_commit(root, sha, reason, message):
+def _require_commit(root, sha, reason, message, *, local_only):
     try:
-        if _sha(sha) and resolve_commit(root, sha) == sha:
+        if _sha(sha) and resolve_commit(root, sha, local_only=local_only) == sha:
             return
     except ValueError:
         pass
@@ -39,13 +39,16 @@ def _sha(value):
     return isinstance(value, str) and bool(re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', value))
 
 
-def github_pr_context(repository, location, mode, *, merge_commit=None):
+def github_pr_context(repository, location, mode, *, merge_commit=None, local_only=False):
     if mode not in ('head', 'merge'):
         raise ValueError('GitHub PR 事件须明确选择 head 或 merge。')
     path = Path(location).expanduser()
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
         raise ValueError('请选择实际保存、大小不超过 2 MiB 的 GitHub PR 事件。')
-    raw = path.read_bytes()
+    with path.open('rb') as stream:
+        raw = stream.read(2 * 1024 * 1024 + 1)
+    if len(raw) > 2 * 1024 * 1024:
+        raise ValueError('GitHub PR 事件超过 2 MiB。')
     event = json.loads(raw)
     pull = event.get('pull_request') if isinstance(event, dict) else None
     if not isinstance(pull, dict):
@@ -56,20 +59,27 @@ def github_pr_context(repository, location, mode, *, merge_commit=None):
         raise ValueError('PR 事件缺少目标或候选的完整 SHA。') from None
     if not (_sha(base) and _sha(head)):
         raise ValueError('PR 事件缺少有效完整 SHA。')
-    root = repository_root(repository)
+    root = Path(repository).expanduser().resolve() if local_only else repository_root(repository)
     for sha in (base, head):
-        _require_commit(root, sha, 'pr_parent_missing', '本地 Git 中缺少事件绑定的目标或 PR head 提交。')
+        _require_commit(root, sha, 'pr_parent_missing', '本地 Git 中缺少事件绑定的目标或 PR head 提交。',
+                        local_only=local_only)
     if mode == 'head':
         if merge_commit is not None:
             raise ValueError('head 模式无需提供合并结果。')
-        bases = _git(root, 'merge-base', '--all', base, head).decode().split()
+        if local_only and _git(root, 'rev-parse', '--is-shallow-repository', local_only=True).strip() != b'false':
+            raise PRComparisonBlocked('pr_history_shallow', '需要完整的本地提交历史才能确认唯一的 PR 共同基线。')
+        bases = _git(root, 'merge-base', '--all', base, head, local_only=local_only).decode().split()
         if len(bases) != 1 or not _sha(bases[0]):
             raise ValueError('无法为 PR 唯一确定共同基线。')
         before, after = bases[0], head
+        if local_only:
+            _require_commit(root, before, 'pr_merge_base_missing', '本地 Git 缺少共同基线提交。',
+                            local_only=True)
     else:
         after = merge_commit or pull.get('merge_commit_sha')
-        _require_commit(root, after, 'pr_merge_missing', '本地 Git 中缺少事件对应的合并结果提交。')
-        parents = _git(root, 'rev-list', '--parents', '-n', '1', after).decode().split()
+        _require_commit(root, after, 'pr_merge_missing', '本地 Git 中缺少事件对应的合并结果提交。',
+                        local_only=local_only)
+        parents = _git(root, 'rev-list', '--parents', '-n', '1', after, local_only=local_only).decode().split()
         if parents != [after, base, head]:
             raise PRComparisonBlocked('pr_merge_parent_mismatch', '指定合并结果的父提交与 PR 目标及 head 不一致。')
         before = base

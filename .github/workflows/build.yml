@@ -42,7 +42,7 @@ jobs:
           tests/test_environment_groups.py tests/test_project_diagnostics.py
           tests/test_project_progress.py tests/test_project_config.py tests/test_execution_settings.py
           tests/test_vitest_project.py tests/test_project_review_summary.py tests/test_project_suggest.py tests/test_project_test_changes.py tests/test_historical_review_summary.py tests/test_pytest_replay_environment.py
-          tests/test_acceptance_plan.py tests/test_project_plan_creation.py tests/test_wheel_results.py tests/test_wheel_archive.py tests/test_native_cargo.py tests/test_native_cmake.py tests/test_project_version_order.py tests/test_project_review_audit.py tests/test_project_audit_continuation.py
+          tests/test_acceptance_plan.py tests/test_project_plan_creation.py tests/test_wheel_results.py tests/test_wheel_archive.py tests/test_wheel_install.py tests/test_native_cargo.py tests/test_native_cmake.py tests/test_project_version_order.py tests/test_project_review_audit.py tests/test_project_audit_continuation.py
           tests/test_replay_verification.py tests/test_replay_stability.py tests/test_vitest_recheck.py
           tests/test_processing_history.py tests/test_release_preparation.py tests/test_desktop_store.py
           tests/test_runtime_environment.py
@@ -86,6 +86,23 @@ jobs:
           "$RUNNER_TEMP/reprolab-wheel-env/bin/python" -m pip install dist/*.whl '${{ matrix.pytest }}'
           "$RUNNER_TEMP/reprolab-wheel-env/bin/python" -I packaging/verify_install.py --output "$RUNNER_TEMP/reprolab-install-check"
           cat "$RUNNER_TEMP/reprolab-install-check/review-summary.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Send native CTest comparison evidence from the installed wheel
+        if: matrix.python == '3.14'
+        shell: bash
+        run: |
+          env_dir="$RUNNER_TEMP/reprolab-wheel-env"
+          "$env_dir/bin/python" -m pip install 'cmake>=3.29,<5'
+          PATH="$env_dir/bin:$PATH" "$env_dir/bin/python" -I packaging/verify_native_handoff.py send \
+            --reprolab "$env_dir/bin/reprolab" --work "$RUNNER_TEMP/native-sender" \
+            --bundles "$RUNNER_TEMP/native-handoff"
+          cp dist/*.whl "$RUNNER_TEMP/native-handoff/"
+      - uses: actions/upload-artifact@v7
+        if: matrix.python == '3.14'
+        with:
+          name: reprolab-native-handoff
+          path: ${{ runner.temp }}/native-handoff/
+          if-no-files-found: error
+          retention-days: 14
       - name: Stage the installed-wheel handoff fixture
         if: matrix.python == '3.14'
         shell: bash
@@ -174,3 +191,29 @@ jobs:
             ${{ runner.temp }}/reprolab-ci-handoff/stability/
           if-no-files-found: ignore
           retention-days: 14
+
+  verify-received-native-evidence:
+    needs: python-distribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # The synthetic acceptance recipe comes from this workflow's checkout, separate from the artifact.
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - uses: actions/download-artifact@v8
+        with:
+          name: reprolab-native-handoff
+          path: ${{ runner.temp }}/native-handoff
+      - name: Review received native evidence without running the tested project
+        shell: bash
+        run: |
+          env_dir="$RUNNER_TEMP/native-review-env"
+          handoff="$RUNNER_TEMP/native-handoff"
+          receipt="$RUNNER_TEMP/native-receiver"
+          python -m venv "$env_dir"
+          "$env_dir/bin/python" -m pip install "$handoff"/*.whl
+          "$env_dir/bin/python" -I packaging/verify_native_handoff.py receive \
+            --reprolab "$env_dir/bin/reprolab" --work "$receipt" --bundles "$handoff" --verify-git
+          cat "$receipt/native-summary.md" >> "$GITHUB_STEP_SUMMARY"

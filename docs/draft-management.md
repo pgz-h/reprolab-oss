@@ -47,11 +47,9 @@ v0.7 新生成或新导入的案例包含 draft_review：检查目标、预期�
 
 这些说明来自起草时，不会随着手工编辑的测试自动重写。报告继续显示实际测试指纹，并在与原草稿不一致时提示。说明会作类型/大小校验和 HTML 转义，不参与 verified 的判断。旧版本案例没有这个字段也可以照常运行，不自动编造说明。
 
-## 当前本机用法
+## 使用已保存的草稿
 
-    reprolab draft list
-    reprolab draft status /完整草稿目录
-    reprolab draft recover /完整草稿目录
-    reprolab draft verify /完整草稿目录
-
-本机入口为 list 自动提供 work/reprolab/drafts，为 draft verify 自动提供 outputs/reprolab/reports。源码仍在唯一 projects/reprolab 仓库，API 配置仍单独位于 work，不进入报告或 Git。
+    reprolab draft list /path/to/drafts
+    reprolab draft status /path/to/drafts/draft-ID
+    reprolab draft recover /path/to/drafts/draft-ID
+    reprolab draft verify /path/to/drafts/draft-ID --output /path/to/reports

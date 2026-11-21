@@ -1,4 +1,5 @@
 """Frozen Git comparisons for small native test runners."""
+from collections import Counter
 import hashlib
 import json
 import math
@@ -10,7 +11,7 @@ import stat
 import tempfile
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 
-from .git_source import export_revision, resolve_commit
+from .git_source import excluded_source_path, excluded_tracked_changes, export_revision, resolve_commit
 from .persistence import save_json
 from .project_archive import _MAX_BYTES, _MAX_ENTRIES, _archive_path, _extract
 from .recipes import repository_root
@@ -22,6 +23,11 @@ _RECORD = 'native-comparison.json'
 _OUTCOMES = {'passed', 'failed', 'skipped', 'blocked'}
 _EXIT = {'passed': 0, 'failed': 1, 'blocked': 2}
 _RECORD_LIMIT = 16 * 1024 * 1024
+_COMMIT = re.compile(r'(?:[0-9a-f]{40}|[0-9a-f]{64})')
+_REVIEW_PLAN_FIELDS = {
+    'schema_version', 'runner', 'commits', 'selected_tests', 'required_fixes',
+    'shared_test_sources', 'shared_test_inputs',
+}
 
 
 def _adapter(runner, *, replay):
@@ -177,10 +183,269 @@ def _compare(runs, definitions, selected, *, runner=None):
     }
 
 
+def _snapshot_scope(commits, sources, excluded):
+    if type(excluded) is not int or excluded < 0 or (commits['before'] == commits['after'] and excluded):
+        raise ValueError('原生证据记录的 Git 遗漏改动数无效。')
+    same = sources['before'] == sources['after']
+    return {
+        'requested': 'git_commit_pair',
+        'excluded_tracked_changes': excluded,
+        'excluded_changes_only': same and excluded > 0,
+        'snapshots_match': same,
+        'git_diff_evidence': 'sender_reported',
+    }
+
+
+def _scoped_comparison(runs, definitions, selected, *, runner, scope, inputs, attested):
+    comparison = _compare(runs, definitions, selected, runner=runner)
+    if scope['snapshots_match']:
+        for row in comparison['entries']:
+            if {row['before'], row['after']} == {'passed', 'failed'}:
+                row['status'] = 'same_snapshot_divergence'
+        comparison['counts'] = dict(Counter(row['status'] for row in comparison['entries']))
+    if scope['excluded_changes_only'] or comparison['counts'].get('same_snapshot_divergence'):
+        comparison['gate'] = {'status': 'blocked', 'exit_code': 2}
+    check_files = definitions + inputs
+    if any(not row['matches'] for row in check_files):
+        coverage = 'changed_or_missing'
+    else:
+        coverage = 'sender_attested' if attested and definitions else 'unknown'
+    comparison['test_input_coverage'] = coverage
+    comparison['review_summary'] = (
+        '测试结果属于声明范围内的观察。指定修复验收需要 --require-fix 和匹配的测试输入证据。'
+    )
+    return comparison
+
+
+def native_fix_acceptance(record, required):
+    required = _targets(required)
+    comparison = record['comparison']
+    scope = record.get('snapshot_scope')
+    rows = {row['test_id']: row['status'] for row in comparison['entries']}
+    targets = {name: rows.get(name, 'missing') for name in required}
+    if comparison['gate']['status'] == 'failed':
+        status, reason = 'failed', 'regression_detected'
+    elif record['schema_version'] == 1:
+        status, reason = 'blocked', 'historical_scope_unknown'
+    elif scope['excluded_tracked_changes']:
+        status, reason = 'blocked', 'excluded_tracked_changes'
+    elif comparison['test_input_coverage'] != 'sender_attested':
+        status, reason = 'blocked', 'test_inputs_' + comparison['test_input_coverage']
+    elif comparison['gate']['status'] != 'passed':
+        status, reason = 'blocked', 'comparison_blocked'
+    elif any(outcome != 'improved' for outcome in targets.values()):
+        status, reason = 'blocked', 'required_improvement_missing'
+    else:
+        status, reason = 'passed', 'required_fixes_observed'
+    return {'status': status, 'reason': reason, 'targets': targets, 'exit_code': _EXIT[status]}
+
+
+def _read_review_plan(path):
+    if not path.is_file() or path.stat().st_size > _RECORD_LIMIT:
+        raise ValueError('请选择有效的原生验收计划 JSON 文件。')
+    with path.open('rb') as stream:
+        raw = stream.read(_RECORD_LIMIT + 1)
+    if len(raw) > _RECORD_LIMIT:
+        raise ValueError('原生验收计划文件过大。')
+
+    plan = _parse_plan_json(raw)
+    _validate_review_plan(plan)
+    return plan, hashlib.sha256(raw).hexdigest()
+
+
+def _parse_plan_json(raw):
+    def unique_keys(pairs):
+        result = dict(pairs)
+        if len(result) != len(pairs):
+            raise ValueError('原生验收计划或策略的 JSON 对象含有重复键。')
+        return result
+
+    return json.loads(raw, object_pairs_hook=unique_keys)
+
+
+def _validate_review_plan(plan):
+    if not isinstance(plan, dict) or type(plan.get('schema_version')) is not int:
+        raise ValueError('原生验收计划需指定 schema_version。')
+    version = plan['schema_version']
+    fields = _REVIEW_PLAN_FIELDS | ({'baseline_failure_markers'} if version == 2 else set())
+    if (version not in (1, 2) or plan.keys() - {'pr_context'} != fields
+            or plan['runner'] not in RUNNERS or not isinstance(plan['commits'], dict)
+            or set(plan['commits']) != set(SIDES)
+            or any(not isinstance(commit, str) or not _COMMIT.fullmatch(commit)
+                   for commit in plan['commits'].values())):
+        raise ValueError('原生验收计划需要受支持的执行器和两端完整 Git 提交。')
+    if 'pr_context' in plan:
+        pr = plan['pr_context']
+        if (not isinstance(pr, dict) or pr.keys() != {'mode', 'base', 'head'}
+                or pr['mode'] not in ('head', 'merge')
+                or any(not isinstance(pr[key], str) or not _COMMIT.fullmatch(pr[key]) for key in ('base', 'head'))
+                or (pr['mode'] == 'head' and pr['head'] != plan['commits']['after'])
+                or (pr['mode'] == 'merge' and pr['base'] != plan['commits']['before'])):
+            raise ValueError('原生验收计划的 PR 上下文与固定提交不一致。')
+    selected = _targets(plan['selected_tests'])
+    required = _targets(plan['required_fixes'])
+    if not (selected and required and set(required).issubset(selected)):
+        raise ValueError('原生验收计划需要非空的选测和必验修复列表，必验修复必须包含在选测中。')
+    sources = _definitions(plan['shared_test_sources'])
+    inputs = _definitions(plan['shared_test_inputs'])
+    if not sources:
+        raise ValueError('原生验收计划至少需要一个共同测试定义文件。')
+    if any(excluded_source_path(Path(path)) for path in sources + inputs):
+        raise ValueError('原生验收计划中的测试文件须在冻结快照范围内。')
+    if version == 2:
+        markers = plan['baseline_failure_markers']
+        if (not isinstance(markers, dict) or set(markers) != set(required)
+                or any(not isinstance(marker, str) or not marker.strip() or len(marker) > 500
+                       or not marker.isprintable() for marker in markers.values())):
+            raise ValueError('原生验收计划须为每个必验目标提供 1–500 个可打印字符的基线故障标记。')
+    return plan
+
+
+def _verify_native_git(record, commits, repository, *, control):
+    receipt = {'trust': 'receiver_supplied_local_git'}
+    if record['commits'] != commits:
+        return {**receipt, 'status': 'blocked', 'reason': 'declared_commits_mismatch'}
+    repo = Path(repository).expanduser().resolve()
+    snapshots, resolved = {}, set()
+    with tempfile.TemporaryDirectory(prefix='reprolab-native-git-') as temporary:
+        for side in SIDES:
+            control.check()
+            try:
+                commit = commits[side]
+                if resolve_commit(repo, commit, local_only=True) != commit:
+                    raise ValueError('Git did not resolve the exact commit.')
+                resolved.add(side)
+                snapshot = Path(temporary) / side
+                export_revision(repo, commit, snapshot, local_only=True)
+                source = _source_record(snapshot)
+            except (OSError, ValueError):
+                snapshots[side] = {'content': 'unavailable', 'mode': 'unavailable'}
+                continue
+            saved = record['source_snapshots'][side]
+            snapshots[side] = {
+                'content': 'matched' if source['sha256'] == saved['sha256'] else 'mismatch',
+                'mode': 'matched' if source['mode_sha256'] == saved['mode_sha256'] else 'mismatch',
+            }
+
+    control.check()
+    recorded = record['snapshot_scope']['excluded_tracked_changes']
+    observed = None
+    if len(resolved) == len(SIDES):
+        try:
+            observed = excluded_tracked_changes(repo, commits['before'], commits['after'], local_only=True)
+        except (OSError, ValueError):
+            pass
+    if observed is None:
+        omission = 'unavailable'
+    elif recorded is None:
+        omission = 'unrecorded'
+    else:
+        omission = 'matched' if observed == recorded else 'mismatch'
+
+    checks = {value for row in snapshots.values() for value in row.values()}
+    if 'unavailable' in checks or omission == 'unavailable':
+        status, reason = 'blocked', 'git_objects_unavailable'
+    elif 'mismatch' in checks:
+        status, reason = 'blocked', 'git_snapshot_mismatch'
+    elif omission == 'mismatch':
+        status, reason = 'blocked', 'git_omitted_changes_mismatch'
+    elif omission == 'unrecorded':
+        status, reason = 'partial', 'git_omitted_changes_unrecorded'
+    else:
+        status, reason = 'matched', 'git_snapshots_and_omissions_matched'
+    return {**receipt, 'status': status, 'reason': reason, 'snapshots': snapshots,
+            'excluded_tracked_changes': {'status': omission, 'recorded': recorded, 'observed': observed}}
+
+
+def _review_native_result(record, plan, sha256):
+    markers = plan.get('baseline_failure_markers')
+    marker_checks = record.pop('baseline_marker_checks', None)
+    result = {'plan_sha256': sha256, 'plan_schema_version': plan['schema_version'],
+              'status': 'blocked', 'exit_code': 2}
+    if 'pr_context' in plan:
+        result['pr_context'] = plan['pr_context']
+    if record['schema_version'] == 1:
+        result['reason'] = 'historical_scope_unknown'
+    elif 'review_plan_sha256' in record and record['review_plan_sha256'] != sha256:
+        result['reason'] = 'review_plan_digest_mismatch'
+    elif 'pr_context' in plan and 'review_plan_sha256' not in record:
+        result['reason'] = 'pr_review_plan_unrecorded'
+    else:
+        definitions = record['shared_test_files']
+        inputs = record['shared_test_inputs']
+        # check_native has already recomputed each declared file's bytes and permissions from both snapshots.
+        matches = {
+            'runner': record['runner'] == plan['runner'],
+            'commits': record['commits'] == plan['commits'],
+            'selected_tests': set(record['selected_tests'] or ()) == set(plan['selected_tests']),
+            'shared_test_sources': {row['path'] for row in definitions} == set(plan['shared_test_sources']),
+            'shared_test_inputs': {row['path'] for row in inputs} == set(plan['shared_test_inputs']),
+        }
+        if not all(matches.values()):
+            result.update(reason='review_plan_scope_mismatch',
+                          mismatched_fields=[field for field, match in matches.items() if not match])
+        elif unmatched := [row['path'] for row in definitions + inputs if not row['matches']]:
+            result.update(reason='review_plan_test_files_changed_or_missing', unmatched_test_files=unmatched)
+        else:
+            result.update(native_fix_acceptance(record, plan['required_fixes']))
+            if markers and result['exit_code'] == 0:
+                if marker_checks is None:
+                    result.update(status='blocked', exit_code=2, reason='baseline_failure_markers_unsupported')
+                else:
+                    result['baseline_marker_checks'] = marker_checks
+                    if any(status != 'matched' for status in marker_checks.values()):
+                        result.update(status='blocked', exit_code=2, reason='baseline_failure_marker_unverified')
+    return result
+
+
+def review_native(location, plan_file, *, git_repository=None, control):
+    path = Path(location).expanduser().resolve()
+    plan_path = Path(plan_file).expanduser().resolve()
+    if plan_path.is_relative_to(path):
+        raise ValueError('原生验收计划须位于证据目录或 ZIP 之外，由接收方提供。')
+    plan, sha256 = _read_review_plan(plan_path)
+    return review_native_plan(location, plan, sha256, git_repository=git_repository, control=control)
+
+
+def review_native_plan(location, plan, sha256, *, git_repository=None, control):
+    if git_repository is not None and Path(git_repository).expanduser().resolve().is_relative_to(
+            Path(location).expanduser().resolve()):
+        raise ValueError('用于核对的 Git 仓库须位于证据目录或 ZIP 之外，由接收方提供。')
+    markers = plan.get('baseline_failure_markers')
+    record = check_native(location, baseline_markers=markers, control=control)
+    result = _review_native_result(record, plan, sha256)
+    if git_repository is not None:
+        git_check = _verify_native_git(record, plan['commits'], git_repository, control=control)
+        record = {**record, 'git_verification': git_check}
+        if git_check['status'] != 'matched' and result['exit_code'] != 2:
+            result.update(status='blocked', exit_code=2, reason=git_check['reason'])
+    return {**record, 'review_plan_acceptance': result}, result['exit_code']
+
+
+def _reported(record):
+    if record['schema_version'] == 1:
+        return {**record, 'snapshot_scope': {'excluded_tracked_changes': None, 'git_diff_evidence': 'unknown'},
+                'test_input_coverage': 'unknown',
+                'review_summary': '历史证据按原规则复核。Git 改动遗漏及测试输入覆盖情况未知。'}
+    return record
+
+
+def run_native_plan(repository, plan_file, output, *, timeout, cargo, attest_test_inputs, control):
+    plan, sha256 = _read_review_plan(Path(plan_file).expanduser())
+    return run_native(
+        repository, plan['commits']['before'], plan['commits']['after'], output,
+        runner=plan['runner'], selected=plan['selected_tests'], shared_sources=plan['shared_test_sources'],
+        test_inputs=plan['shared_test_inputs'], timeout=timeout, cargo=cargo, confirmed=True,
+        attest_test_inputs=attest_test_inputs, review_plan=(plan, sha256), control=control,
+    )
+
+
 def run_native(repository, before, after, output, *, runner, selected=None, shared_sources=(),
-               timeout=120, cargo=None, confirmed=False, control):
+               timeout=120, cargo=None, confirmed=False, test_inputs=(), attest_test_inputs=False,
+               review_plan=None, control):
     selected = _targets(selected)
     paths = _definitions(list(shared_sources))
+    input_paths = _definitions(list(test_inputs))
     if runner not in RUNNERS or cargo is not None and runner != 'cargo':
         raise ValueError('请选择有效的原生执行器；--cargo 仅用于 cargo。')
     if type(timeout) not in (int, float) or not math.isfinite(timeout) or not .1 <= timeout <= 3600:
@@ -189,8 +454,12 @@ def run_native(repository, before, after, output, *, runner, selected=None, shar
         raise ValueError('Cargo 的共享测试定义清单须至少声明一个 .rs 文件。')
     root = repository_root(repository)
     commits = {side: resolve_commit(root, rev) for side, rev in (('before', before), ('after', after))}
+    if review_plan and commits != review_plan[0]['commits']:
+        raise ValueError('本地 Git 未解析到验收计划指定的完整提交。')
+    excluded = excluded_tracked_changes(root, commits['before'], commits['after'])
     if not confirmed:
-        return {'status': 'ready', 'runner': runner, 'commits': commits, 'selected_tests': selected}, 0
+        return {'status': 'ready', 'runner': runner, 'commits': commits, 'selected_tests': selected,
+                'excluded_tracked_changes': excluded}, 0
     requested = Path(output).expanduser()
     target = requested.resolve()
     if target.is_relative_to(root) or target.exists() or requested.is_symlink():
@@ -216,31 +485,48 @@ def run_native(repository, before, after, output, *, runner, selected=None, shar
                                                 timeout=timeout, control=control, **options))
             hashes[side] = _files(evidence)
         definitions = _definition_record(stage, paths)
-        comparison = _compare(runs, definitions, selected, runner=runner)
+        scope = _snapshot_scope(commits, sources, excluded)
+        inputs = _definition_record(stage, input_paths)
+        comparison = _scoped_comparison(runs, definitions, selected, runner=runner,
+                                        scope=scope, inputs=inputs, attested=attest_test_inputs)
         record = {
-            'kind': 'project_native_comparison', 'schema_version': 1,
+            'kind': 'project_native_comparison', 'schema_version': 2,
             'runner': runner, 'commits': commits, 'selected_tests': selected,
             'source_snapshots': sources, 'shared_test_files': definitions, 'runs': runs,
+            'snapshot_scope': scope, 'shared_test_inputs': inputs, 'test_inputs_attested': attest_test_inputs,
             'evidence_sha256': hashes, 'comparison': comparison,
         }
+        plan, sha256 = review_plan if review_plan else (None, None)
+        if plan is not None:
+            record['review_plan_sha256'] = sha256
         save_json(stage / _RECORD, record)
-        _checked_native(stage, control)
+        checked = _checked_native(stage, control, baseline_markers=plan.get('baseline_failure_markers') if plan else None)
+        if plan is not None:
+            acceptance = _review_native_result(checked, plan, sha256)
+            result, code = {**record, 'integrity': 'consistent', 'review_plan_acceptance': acceptance}, acceptance['exit_code']
+        else:
+            result, code = record, comparison['gate']['exit_code']
         control.commit()
         if target.exists() or target.is_symlink():
             raise ValueError('证据目标已存在。')
         stage.rename(target)
-    return {**record, 'directory': str(target)}, comparison['gate']['exit_code']
+    return {**result, 'directory': str(target)}, code
 
 
-def _checked_native(folder, control):
+def _checked_native(folder, control, *, baseline_markers=None):
     folder = Path(folder).resolve()
     record = _read_json(folder / _RECORD)
     if (record.get('kind') != 'project_native_comparison' or type(record.get('schema_version')) is not int
-            or record['schema_version'] != 1 or record.get('runner') not in RUNNERS
+            or record['schema_version'] not in (1, 2) or record.get('runner') not in RUNNERS
             or set(record['commits']) != set(SIDES)
-            or any(not isinstance(commit, str) or not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', commit)
+            or any(not isinstance(commit, str) or not _COMMIT.fullmatch(commit)
                    for commit in record['commits'].values())):
         raise ValueError('原生比较证据格式无效。')
+    if 'review_plan_sha256' in record:
+        digest = record['review_plan_sha256']
+        if (record['schema_version'] != 2 or not isinstance(digest, str)
+                or not re.fullmatch(r'[0-9a-f]{64}', digest)):
+            raise ValueError('原生比较证据中的验收计划指纹无效。')
     selected = _targets(record['selected_tests'])
     paths = _definitions([row['path'] for row in record['shared_test_files']])
     reader = _adapter(record['runner'], replay=True)
@@ -248,27 +534,53 @@ def _checked_native(folder, control):
         raise ValueError('Cargo 共享源证据缺少 Rust 测试定义。')
     if (folder / 'inputs').is_symlink():
         raise ValueError('原生源码快照目录不能是链接。')
+    schema = record['schema_version']
+    reader_options = {'schema_version': schema} if record['runner'] == 'cmake' else {}
     for side in SIDES:
         control.check()
         if (_source_record(folder / 'inputs' / side) != record['source_snapshots'][side]
                 or _files(folder / side) != record['evidence_sha256'][side]):
             raise ValueError('原生比较源码或运行证据指纹不一致。')
         facts = _run_facts(record['runs'][side])
-        if _run_facts(reader(folder / side, selected=selected)) != facts:
+        if _run_facts(reader(folder / side, selected=selected, **reader_options)) != facts:
             raise ValueError('原生运行记录与原始证据重算结果不一致。')
     definitions = _definition_record(folder, paths)
-    if (definitions != record['shared_test_files']
-            or _compare(record['runs'], definitions, selected, runner=record['runner']) != record['comparison']):
+    if schema == 1:
+        comparison = _compare(record['runs'], definitions, selected, runner=record['runner'])
+    else:
+        scope = _snapshot_scope(record['commits'], record['source_snapshots'],
+                                record['snapshot_scope']['excluded_tracked_changes'])
+        inputs = _definition_record(folder, _definitions([row['path'] for row in record['shared_test_inputs']]))
+        attested = record['test_inputs_attested']
+        if (scope != record['snapshot_scope'] or inputs != record['shared_test_inputs']
+                or type(attested) is not bool):
+            raise ValueError('原生测试输入或快照范围与固定记录不一致。')
+        comparison = _scoped_comparison(record['runs'], definitions, selected, runner=record['runner'],
+                                        scope=scope, inputs=inputs, attested=attested)
+    if definitions != record['shared_test_files'] or comparison != record['comparison']:
         raise ValueError('原生对照结果与固定记录不一致。')
+    if baseline_markers and schema == 2 and record['runner'] == 'cargo':
+        from .native_cargo import check_failure_markers
+
+        record['baseline_marker_checks'] = check_failure_markers(
+            folder / 'before', record['evidence_sha256']['before'], record['runs']['before'], baseline_markers,
+        )
+    if baseline_markers and schema == 2 and record['runner'] == 'cmake':
+        from .native_cmake import check_failure_markers
+
+        record['baseline_marker_checks'] = check_failure_markers(
+            folder / 'before' / 'results.xml', record['evidence_sha256']['before'].get('results.xml'),
+            record['runs']['before']['tests'], baseline_markers,
+        )
     return record
 
 
-def check_native(location, *, control):
+def check_native(location, *, baseline_markers=None, control):
     path = Path(location).expanduser()
     if path.is_symlink():
         raise ValueError('请选择普通证据目录或 ZIP。')
     if path.is_dir():
-        return {**_checked_native(path, control), 'integrity': 'consistent'}
+        return {**_reported(_checked_native(path, control, baseline_markers=baseline_markers)), 'integrity': 'consistent'}
     if not path.is_file() or path.stat().st_size > _MAX_BYTES:
         raise ValueError('请选择有效的原生证据目录或 ZIP。')
     with tempfile.TemporaryDirectory(prefix='reprolab-native-evidence-') as temporary:
@@ -276,7 +588,7 @@ def check_native(location, *, control):
             root = _extract(path, Path(temporary), control, _MAX_BYTES)
         except (BadZipFile, NotImplementedError) as exc:
             raise ValueError('无法读取原生证据 ZIP。') from exc
-        return {**_checked_native(root, control), 'integrity': 'consistent'}
+        return {**_reported(_checked_native(root, control, baseline_markers=baseline_markers)), 'integrity': 'consistent'}
 
 
 def pack_native(directory, output, *, control):
@@ -303,7 +615,7 @@ def pack_native(directory, output, *, control):
                 _archive_path(name)
                 archive.write(folder / path, name)
         restored = check_native(stage, control=control)
-        if restored != {**record, 'integrity': 'consistent'}:
+        if restored != {**_reported(record), 'integrity': 'consistent'}:
             raise ValueError('打包期间原生证据发生变化。')
         digest = _sha(stage)
         control.commit()

@@ -33,14 +33,10 @@
 
 这些结论仍只覆盖各案例的测试，不代表整个项目没有其他问题。错误配置、环境问题和实际未通过会分别显示。
 
-## 在当前本机工作区使用
+## 从命令行管理案例
 
-进入 /path/to/reprolab-work 后：
-
-    ./run.sh cases cases
-    ./run.sh batch cases
-
-启动入口会自动把报告放进独立 outputs/reprolab/reports，源码和工作文件仍分开。
+    reprolab cases /path/to/cases
+    reprolab batch /path/to/cases --output /path/to/reports
 
 ## AI 草稿案例
 

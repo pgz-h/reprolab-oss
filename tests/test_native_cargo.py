@@ -46,7 +46,8 @@ def rust_project(tmp_path):
     (root / 'Cargo.toml').write_text('[package]\nname = "native_fixture"\nversion = "0.1.0"\nedition = "2021"\n')
     (root / 'Cargo.lock').write_text('version = 3\n\n[[package]]\nname = "native_fixture"\nversion = "0.1.0"\n')
     (src / 'tests.rs').write_text(
-        '#[test] fn improves() { assert_eq!(super::value(), 2); }\n'
+        '#[test] fn improves() { match super::value() { 3 => panic!("fixture unavailable"), '
+        '1 => panic!("receipt price differs"), _ => {} } }\n'
         '#[test] fn regresses() { assert_eq!(super::value(), 1); }\n'
         '#[test] fn remains_green() { assert!(super::value() > 0); }\n'
         '#[test] #[ignore = "fixture"] fn ignored() { panic!(); }\n')
@@ -68,12 +69,14 @@ def rust_project(tmp_path):
     return root, before, after, git, tool
 
 
-def _run(rust_project, out, capsys, *, expected, revision=None, sources=('src/tests.rs',), targets=(), confirm=True):
+def _run(rust_project, out, capsys, *, expected, revision=None, sources=('src/tests.rs',), targets=(), confirm=True, attest=False):
     root, before, after, _, tool = rust_project
     args = ['native', str(root), '--runner', 'cargo', '--before', before, '--after', revision or after,
             '--cargo', tool, '--output', str(out)]
     if confirm:
         args.append('--confirm-run')
+    if attest:
+        args.append('--attest-test-inputs')
     for source in sources:
         args.extend(('--shared-test-source', source))
     for name in targets:
@@ -94,8 +97,68 @@ def test_real_cargo_comparison_has_improvement_regression_and_ignored_with_read_
     assert report['runs']['before']['tests']['tests::ignored'] == 'skipped'
     assert report['comparison']['shared_count'] == 4
     passing = _run(rust_project, tmp_path / 'selected comparison', capsys, expected=0,
-                   targets=('tests::improves', 'tests::remains_green'))
+                   targets=('tests::improves', 'tests::remains_green'), attest=True)
     assert passing['comparison']['counts'] == {'improved': 1, 'regression_passed': 1}
+    plan = tmp_path / 'marker-plan.json'
+    plan.write_text(json.dumps({
+        'schema_version': 2, 'runner': 'cargo', 'commits': passing['commits'],
+        'selected_tests': passing['selected_tests'], 'required_fixes': ['tests::improves'],
+        'shared_test_sources': ['src/tests.rs'], 'shared_test_inputs': [],
+        'baseline_failure_markers': {'tests::improves': 'receipt price differs'},
+    }))
+    marked_zip = tmp_path / 'marked-cargo.zip'
+    assert main(['pack-native', passing['directory'], '--output', str(marked_zip)]) == 0
+    capsys.readouterr()
+    for marker, expected in [('receipt price differs', 0), ('another panic', 2), ('0 passed; 1 failed', 2)]:
+        payload = json.loads(plan.read_bytes())
+        payload['baseline_failure_markers']['tests::improves'] = marker
+        variant = plan if expected == 0 else tmp_path / 'negative-marker-plan.json'
+        if expected != 0:
+            variant.write_text(json.dumps(payload))
+        assert main(['check-native', str(marked_zip), '--review-plan', str(variant)]) == expected
+        marked = json.loads(capsys.readouterr().out)
+        assert marked['review_plan_acceptance']['baseline_marker_checks'] == {
+            'tests::improves': 'matched' if expected == 0 else 'mismatch',
+        }
+        assert marked['comparison']['counts']['improved'] == 1
+
+    root, _, after, git, cargo = rust_project
+    (root / 'src/lib.rs').write_text('fn value() -> i32 { 3 }\n#[cfg(test)] mod tests;\n')
+    git('commit', '-qam', 'alternate baseline panic')
+    alternate_before = git('rev-parse', 'HEAD')
+    alternate = _run((root, alternate_before, after, git, cargo), tmp_path / 'alternate', capsys,
+                     expected=0, targets=('tests::improves', 'tests::remains_green'), attest=True)
+    payload = json.loads(plan.read_bytes())
+    payload.update(commits=alternate['commits'], baseline_failure_markers={'tests::improves': 'receipt price differs'})
+    alternate_plan = tmp_path / 'alternate-marker-plan.json'
+    alternate_plan.write_text(json.dumps(payload))
+    alternate_zip = tmp_path / 'alternate-cargo.zip'
+    assert main(['pack-native', alternate['directory'], '--output', str(alternate_zip)]) == 0
+    capsys.readouterr()
+    assert main(['check-native', str(alternate_zip), '--review-plan', str(alternate_plan)]) == 2
+    wrong_failure = json.loads(capsys.readouterr().out)
+    assert wrong_failure['comparison']['counts']['improved'] == 1
+    assert wrong_failure['review_plan_acceptance']['reason'] == 'baseline_failure_marker_unverified'
+    assert main(['check-native', str(alternate_zip), '--review-plan', str(alternate_plan), '--format', 'markdown']) == 2
+    summary = capsys.readouterr().out
+    assert '0/1 matched' in summary
+    assert 'receipt price differs' not in summary and 'fixture unavailable' not in summary
+
+    regression_plan = tmp_path / 'planned-regression.json'
+    regression_plan.write_text(json.dumps({
+        **json.loads(plan.read_bytes()), 'selected_tests': ['tests::improves', 'tests::regresses'],
+    }))
+    regression_dir = tmp_path / 'planned-regression'
+    assert main(['native', str(root), '--review-plan', str(regression_plan), '--confirm-run',
+                 '--attest-test-inputs', '--output', str(regression_dir)]) == 1
+    regression_sender = json.loads(capsys.readouterr().out)
+    regression_zip = tmp_path / 'planned-regression.zip'
+    assert main(['pack-native', str(regression_dir), '--output', str(regression_zip)]) == 0
+    capsys.readouterr()
+    assert main(['check-native', str(regression_zip), '--review-plan', str(regression_plan)]) == 1
+    regression_receiver = json.loads(capsys.readouterr().out)
+    assert regression_sender['review_plan_acceptance'] == regression_receiver['review_plan_acceptance']
+    assert regression_receiver['review_plan_acceptance']['reason'] == 'regression_detected'
 
     archive = tmp_path / 'portable.zip'
     (out / 'unrelated.txt').write_text('must not archive')

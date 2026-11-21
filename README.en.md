@@ -1,6 +1,6 @@
 # ReproLab
 
-**0.19.0a25 Alpha** · [Published releases and downloads](https://github.com/pgz-h/reprolab-oss/releases)
+**0.19.0a26 Alpha candidate** · [Published releases and downloads](https://github.com/pgz-h/reprolab-oss/releases)
 
 **Check a fix or project change with real tests, and keep replayable evidence.**
 
@@ -8,7 +8,9 @@ ReproLab freezes the source before and after a change, runs the same selected te
 
 [中文](README.md) · [Documentation index](docs/README.md) · [Installation](INSTALL.md) · [Project Workbench](docs/project-workbench.md) · [Changelog](CHANGELOG.md)
 
-The CLI also compares Rust library tests and C/C++ projects registered with CTest. See [native runners and the pinned zlib walkthrough](docs/native-languages.md).
+The CLI also compares Rust library tests and C/C++ projects registered with CTest. See [native PR review and the pinned zlib walkthrough](docs/native-languages.md).
+
+Python wheel maintainers can run isolated downstream tests from a release plan and independently check the artifact, environment, dependency inputs, and installation evidence. See the [wheel release verification workflow](docs/cli-contract.md#按维护者计划生成-wheel-功能证据).
 
 ## Choose tests for your own PR
 

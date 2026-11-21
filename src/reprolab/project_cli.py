@@ -419,39 +419,90 @@ def _parser():
     candidates.add_argument('--plan', type=Path)
     candidates.add_argument('--gate', choices=('strict', 'no-new-failures'), default='strict')
 
+    native_pr = commands.add_parser('plan-native-pr', help='从 GitHub PR 事件和目标提交生成原生验收计划')
+    native_pr.add_argument('repository', type=Path)
+    native_pr.add_argument('--github-event', required=True, type=Path)
+    native_pr.add_argument('--pr-mode', required=True, choices=('head', 'merge'))
+    native_pr.add_argument('--merge-commit')
+    native_pr.add_argument('--policy-path', required=True, help='目标提交中受审阅的 JSON 策略仓库相对路径')
+    native_pr.add_argument('--output', required=True, type=Path)
+
     native = commands.add_parser('native', help='比较固定 Git 两版的 Cargo 或 CMake/CTest 测试')
     native.add_argument('repository', type=Path)
-    native.add_argument('--runner', required=True, choices=('cargo', 'cmake'))
-    native.add_argument('--before', required=True)
-    native.add_argument('--after', required=True)
+    native.add_argument('--review-plan', type=Path, metavar='FILE', help='使用同一份验收计划执行比较并检查指定修复')
+    native.add_argument('--runner', choices=('cargo', 'cmake'))
+    native.add_argument('--before')
+    native.add_argument('--after')
     native.add_argument('--test', action='append', help='完整测试名，可重复；省略时使用发现范围')
     native.add_argument('--shared-test-source', action='append', default=[], metavar='PATH',
                         help='声明定义所选测试的仓库相对文件，核对两版内容与权限')
+    native.add_argument('--shared-test-input', action='append', default=[], metavar='PATH',
+                        help='测试支持文件或数据的仓库相对路径，可重复')
+    native.add_argument('--attest-test-inputs', action='store_true',
+                        help='声明共享定义及输入清单覆盖所选测试依赖的仓库内测试输入')
+    native.add_argument('--require-fix', action='append', metavar='TEST',
+                        help='按严格规则验收指定完整测试名的红转绿，可重复，需要 --confirm-run')
     native.add_argument('--timeout', type=_timeout, default=120, help='每版构建、发现和执行的总秒数')
     native.add_argument('--cargo', type=Path, help='显式指定 Cargo 可执行文件')
     native.add_argument('--confirm-run', action='store_true', help='确认运行可信项目的构建和测试')
     native.add_argument('--output', required=True, type=Path)
     native_check = commands.add_parser('check-native', help='离线核对原生证据目录或 ZIP 并重算比较')
     native_check.add_argument('directory', type=Path)
+    native_check.add_argument('--format', choices=('json', 'markdown'), default='json',
+                              help='输出 JSON 或可用于评审的 Markdown 摘要')
+    native_check_mode = native_check.add_mutually_exclusive_group()
+    native_check_mode.add_argument('--verify-result', action='store_true',
+                                   help='按复核后的普通比较门禁退出')
+    native_check_mode.add_argument('--review-plan', type=Path, metavar='FILE',
+                                   help='按接收方在证据之外提供的 JSON 计划验收指定修复')
+    native_check_mode.add_argument('--github-event', type=Path, metavar='FILE',
+                                   help='从接收方的 GitHub PR 事件与本地 Git 对象重建验收计划')
+    native_check_mode.add_argument('--require-fix', action='append', metavar='TEST',
+                              help='从证据离线验收指定完整测试名的红转绿，可重复')
+    native_check.add_argument('--pr-mode', choices=('head', 'merge'), help='从 GitHub PR 事件验收时必填')
+    native_check.add_argument('--policy-path', help='GitHub PR 目标提交中的 JSON 策略仓库相对路径')
+    native_check.add_argument('--merge-commit', help='显式提供 GitHub PR 的本地合并结果 SHA')
+    native_check.add_argument('--verify-git-repository', type=Path, metavar='REPOSITORY',
+                              help='用接收方的本地 Git 对象核对冻结源码与遗漏计数；事件验收时必填')
     native_pack = commands.add_parser('pack-native', help='导出原生两版比较证据 ZIP')
     native_pack.add_argument('directory', type=Path)
     native_pack.add_argument('--output', required=True, type=Path)
 
     wheels = commands.add_parser('verify-wheels', help='安装两份 wheel 并运行同一固定下游测试')
     wheels.add_argument('repository', type=Path)
-    wheels.add_argument('--ref', default='HEAD')
+    wheels.add_argument('--ref', help='下游 Git 版本，手工模式默认 HEAD')
     wheels.add_argument('--before-wheel', required=True, type=Path)
     wheels.add_argument('--after-wheel', required=True, type=Path)
-    wheels.add_argument('--module', required=True)
-    wheels.add_argument('--test', required=True, action='append')
+    wheels.add_argument('--module')
+    wheels.add_argument('--test', action='append')
+    wheels.add_argument('--review-plan', type=Path, metavar='FILE',
+                        help='按维护者计划固定制品和下游范围，执行功能门禁')
+    wheels.add_argument('--test-wheelhouse', type=Path, metavar='DIRECTORY',
+                        help='从可信本地 wheelhouse 解析制品依赖及 pytest，在各自的空 venv 中运行功能测试')
     wheels.add_argument('--confirm-run', action='store_true')
     wheels.add_argument('--output', required=True, type=Path)
     _runtime_options(wheels)
+    wheel_install = commands.add_parser('verify-wheel-install', help='在全新 Python venv 中核对 wheel 安装和声明依赖')
+    wheel_install.add_argument('wheel', type=Path)
+    wheel_install.add_argument('--wheelhouse', required=True, type=Path, metavar='DIRECTORY',
+                               help='用于解析声明依赖的可信本地 wheel 目录，可为空')
+    wheel_install.add_argument('--python', help='目标 Python 解释器路径，默认当前解释器')
+    wheel_install.add_argument('--timeout', type=_timeout, default=120, help='创建环境和 pip 检查的总超时秒数，默认 120')
+    wheel_install.add_argument('--confirm-run', action='store_true', help='确认在全新临时 venv 安装可信制品')
+    wheel_install.add_argument('--output', required=True, type=Path, help='新的检查报告目录')
+    wheelhouse_fingerprint = commands.add_parser('fingerprint-wheelhouse', help='计算可信本地依赖 wheel 清单的指纹')
+    wheelhouse_fingerprint.add_argument('directory', type=Path)
     wheel_pack = commands.add_parser('pack-wheels', help='将已核验的 wheel 比较目录导出为便携 ZIP')
     wheel_pack.add_argument('directory', type=Path)
     wheel_pack.add_argument('--output', type=Path, required=True)
     wheel_check = commands.add_parser('check-wheels', help='离线核对安装制品、下游源码和测试记录')
     wheel_check.add_argument('directory', type=Path)
+    wheel_check.add_argument('--review-plan', type=Path, metavar='FILE',
+                             help='按接收方在证据之外提供的 JSON 发布计划验收')
+    wheel_check.add_argument('--verify-git-repository', type=Path, metavar='REPOSITORY',
+                             help='从接收方本地 Git 对象核对下游快照，与 --review-plan 配套使用')
+    wheel_check.add_argument('--install-check', type=Path, metavar='FILE',
+                             help='计划要求干净安装时，提供可信来源的 wheel-install-check.json')
     for command in (wheels, wheel_check):
         command.add_argument('--gate', choices=('legacy', 'regression', 'no-new-failures'),
                              help='可选逐项门禁；默认沿用旧汇总')
@@ -815,16 +866,69 @@ def _dispatch(args, *, network_isolation=None):
         return run_candidates(args.repository, args.before, args.candidate, args.output, selected=selected,
                               plan=plan, python_executable=args.python, timeout=args.timeout,
                               confirmed=args.confirm_run, control=control)
-    if args.command == 'native':
-        from .native_project import run_native
+    if args.command == 'plan-native-pr':
+        from .native_pr_plan import plan_native_pr
 
-        return run_native(args.repository, args.before, args.after, args.output, runner=args.runner,
-                          selected=args.test, shared_sources=args.shared_test_source, timeout=args.timeout,
-                          cargo=args.cargo, confirmed=args.confirm_run, control=control)
-    if args.command == 'check-native':
-        from .native_project import check_native
+        return plan_native_pr(args.repository, args.github_event, args.pr_mode, args.policy_path,
+                              args.output, merge_commit=args.merge_commit), 0
+    if args.command in ('native', 'check-native'):
+        from .native_project import (
+            _targets, check_native, native_fix_acceptance, review_native, run_native, run_native_plan,
+        )
 
-        return check_native(args.directory, control=control), 0
+        required = _targets(args.require_fix)
+        if args.command == 'check-native' and args.github_event is None and any(
+                value is not None for value in (args.pr_mode, args.policy_path, args.merge_commit)):
+            raise _UsageError('--pr-mode、--policy-path 和 --merge-commit 需要 --github-event。')
+        if args.command == 'native':
+            if args.review_plan:
+                if (any(value is not None for value in (args.runner, args.before, args.after, args.test, required))
+                        or args.shared_test_source or args.shared_test_input):
+                    raise _UsageError('native --review-plan 不能与手工指定的执行器、提交、选测、共享文件或 --require-fix 同用。')
+                if not args.confirm_run:
+                    raise _UsageError('native --review-plan 需要 --confirm-run。')
+                return run_native_plan(
+                    args.repository, args.review_plan, args.output, timeout=args.timeout, cargo=args.cargo,
+                    attest_test_inputs=args.attest_test_inputs, control=control,
+                )
+            if None in (args.runner, args.before, args.after):
+                raise _UsageError('native 需要 --runner、--before 和 --after，或提供 --review-plan。')
+            if required and not args.confirm_run:
+                raise _UsageError('--require-fix 需要 --confirm-run。')
+            record, code = run_native(
+                args.repository, args.before, args.after, args.output, runner=args.runner,
+                selected=args.test, shared_sources=args.shared_test_source, timeout=args.timeout,
+                cargo=args.cargo, confirmed=args.confirm_run, test_inputs=args.shared_test_input,
+                attest_test_inputs=args.attest_test_inputs, control=control,
+            )
+        elif args.github_event is not None:
+            from .native_pr_plan import review_native_pr
+
+            if None in (args.pr_mode, args.policy_path, args.verify_git_repository):
+                raise _UsageError('check-native --github-event 需要 --pr-mode、--policy-path 和 --verify-git-repository。')
+            record, code = review_native_pr(
+                args.directory, args.verify_git_repository, args.github_event, args.pr_mode, args.policy_path,
+                merge_commit=args.merge_commit, control=control,
+            )
+        elif args.review_plan:
+            record, code = review_native(args.directory, args.review_plan,
+                                         git_repository=args.verify_git_repository, control=control)
+        else:
+            if args.verify_git_repository is not None:
+                raise _UsageError('--verify-git-repository 需要 --review-plan 或 --github-event。')
+            record, code = check_native(args.directory, control=control), 0
+            if args.verify_result:
+                rules = 'historical_schema_1' if record['schema_version'] == 1 else 'current_schema_2'
+                result = {'rules': rules, **record['comparison']['gate']}
+                record, code = {**record, 'verified_result': result}, result['exit_code']
+        if required:
+            acceptance = native_fix_acceptance(record, required)
+            record, code = {**record, 'fix_acceptance': acceptance}, acceptance['exit_code']
+        if args.command == 'check-native' and args.format == 'markdown':
+            from .native_summary import render_native_markdown
+
+            return render_native_markdown(record), code
+        return record, code
     if args.command == 'pack-native':
         from .native_project import pack_native
 
@@ -833,21 +937,75 @@ def _dispatch(args, *, network_isolation=None):
         from .wheel_archive import pack_wheel_evidence
 
         return pack_wheel_evidence(args.directory, args.output, control=control), 0
+    if args.command == 'verify-wheel-install':
+        from .wheel_install import verify_wheel_install
+
+        return verify_wheel_install(args.wheel, args.wheelhouse, args.output, python_executable=args.python,
+                                    timeout=args.timeout, confirmed=args.confirm_run, control=control)
+    if args.command == 'fingerprint-wheelhouse':
+        from .wheel_install import fingerprint_wheelhouse
+
+        return fingerprint_wheelhouse(args.directory, control=control), 0
+    if args.command == 'check-wheels':
+        if (args.review_plan is None) != (args.verify_git_repository is None):
+            raise _UsageError('check-wheels 的 --review-plan 和 --verify-git-repository 须同时提供。')
+        if args.install_check is not None and args.review_plan is None:
+            raise _UsageError('check-wheels --install-check 需要指定接收方验收计划。')
+        if args.review_plan is not None:
+            from .wheel_results import render_wheel_markdown
+            from .wheel_review_plan import review_wheel_release
+
+            if args.gate is not None or args.require_improvement:
+                raise _UsageError('check-wheels --review-plan 的门禁和必验改善须在计划中指定。')
+            if args.format == 'markdown' and args.include_test_ids:
+                raise _UsageError('发布验收的 Markdown 摘要使用指纹显示参数 ID。')
+            result, code = review_wheel_release(args.directory, args.review_plan, args.verify_git_repository,
+                                                install_check=args.install_check, include_ids=args.include_test_ids,
+                                                control=control)
+            return (render_wheel_markdown(result, exit_policy=_wheel_exit_policy(args), exit_code=code)
+                    if args.format == 'markdown' else result), code
     if args.command in ('verify-wheels', 'check-wheels'):
+        if (args.command == 'verify-wheels' and not args.confirm_run
+                and (args.gate is not None or args.require_improvement)):
+            raise _UsageError('verify-wheels 使用 --gate 或 --require-improvement 时需要 --confirm-run。')
+
         from .project_wheels import check_wheels, review_wheels, run_wheels
         from .wheel_results import render_wheel_markdown, wheel_requirements
 
+        plan, digest = None, None
+        if args.command == 'verify-wheels' and args.review_plan is not None:
+            from .wheel_review_plan import read_wheel_review_plan
+
+            if any(value is not None for value in (args.ref, args.module, args.test, args.gate)) or args.require_improvement:
+                raise _UsageError('verify-wheels --review-plan 的提交、模块、测试和门禁须由计划提供。')
+            plan, digest = read_wheel_review_plan(args.review_plan.expanduser())
         if args.require_improvement and args.gate == 'legacy':
             raise _UsageError('必验改善目标须使用逐项门禁。')
-        required = wheel_requirements(args.require_improvement)
-        detail = args.gate is not None or args.format or required or args.include_test_ids
-        policy = args.gate or ('regression' if args.require_improvement else 'legacy')
+        required = wheel_requirements(plan.get('required_improvements', ()) if plan else args.require_improvement)
+        detail = plan is not None or args.gate is not None or args.format or required or args.include_test_ids
+        policy = plan['gate'] if plan else args.gate or ('regression' if args.require_improvement else 'legacy')
         if args.command == 'verify-wheels':
-            record, code = run_wheels(args.repository, args.ref, args.before_wheel, args.after_wheel, args.output,
-                                      module=args.module, selected=args.test, python_executable=args.python,
-                                      timeout=args.timeout, confirmed=args.confirm_run, control=control)
+            if plan is None and (args.module is None or args.test is None):
+                raise _UsageError('verify-wheels 需要 --module 和 --test，或提供 --review-plan。')
+            ref, module, selected = ((plan['downstream_commit'], plan['module'], plan['selected_tests']) if plan
+                                     else (args.ref if args.ref is not None else 'HEAD', args.module, args.test))
+            record, code = run_wheels(args.repository, ref, args.before_wheel, args.after_wheel, args.output,
+                                      module=module, selected=selected, python_executable=args.python,
+                                      timeout=args.timeout, confirmed=args.confirm_run, control=control,
+                                      test_wheelhouse=args.test_wheelhouse, review_plan=plan)
             if not detail or not args.confirm_run:
+                if digest is not None:
+                    record['functional_review_plan_sha256'] = digest
+                    if args.format == 'markdown':
+                        return render_wheel_markdown(record, exit_policy=_wheel_exit_policy(args), exit_code=code), code
                 return record, code
+            if plan is not None:
+                from .wheel_review_plan import review_wheel_functional_execution
+
+                result, code = review_wheel_functional_execution(record['directory'], plan, digest,
+                                                                 include_ids=args.include_test_ids, control=control)
+                return (render_wheel_markdown(result, exit_policy=_wheel_exit_policy(args), exit_code=code)
+                        if args.format == 'markdown' else result), code
             result = review_wheels(record['directory'], policy=policy, required=required,
                                    include_ids=args.include_test_ids, control=control)
         else:
@@ -861,7 +1019,8 @@ def _dispatch(args, *, network_isolation=None):
         gate_code = result['comparison']['gate']['exit_code']
         if args.command == 'check-wheels' and args.gate is None and not args.require_improvement:
             gate_code = 0
-        return (render_wheel_markdown(result) if args.format == 'markdown' else result), gate_code
+        return (render_wheel_markdown(result, exit_policy=_wheel_exit_policy(args), exit_code=gate_code)
+                if args.format == 'markdown' else result), gate_code
     if args.command == 'capture-behavior':
         from .project_behavior import capture_behavior
 
@@ -1392,6 +1551,18 @@ def _emit(result, *, stream=None):
           file=stream or sys.stdout)
 
 
+def _wheel_exit_policy(args):
+    if args.command == 'check-wheels':
+        if args.review_plan is not None:
+            return 'Receiver release plan'
+        if args.gate is None and not args.require_improvement:
+            return 'Evidence integrity'
+        return 'Comparison gate'
+    if not args.confirm_run:
+        return 'Sender plan preflight' if args.review_plan is not None else 'Execution preview'
+    return 'Sender plan functional gate' if args.review_plan is not None else 'Comparison gate'
+
+
 def main(argv=None, *, _network_isolation=None) -> int:
     """Run arguments after ``reprolab project`` and return a shell exit code."""
     args = None
@@ -1437,6 +1608,14 @@ def main(argv=None, *, _network_isolation=None) -> int:
         if command == "review" and hasattr(args, "directory"):
             error["project_directory"] = args.directory
         _emit(error, stream=sys.stderr)
+        if command == 'check-native' and args.format == 'markdown':
+            from .native_summary import render_native_review_error
+
+            sys.stdout.write(render_native_review_error(error.get('reason'), cancelled=cancelled))
+        if command in ('check-wheels', 'verify-wheels') and args.format == 'markdown':
+            from .wheel_results import render_wheel_error_markdown
+
+            sys.stdout.write(render_wheel_error_markdown(exit_policy=_wheel_exit_policy(args), cancelled=cancelled))
         return 2
 
 

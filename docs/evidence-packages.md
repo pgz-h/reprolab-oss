@@ -76,7 +76,7 @@ case.zip
 
 ## 当前本机目录
 
-证据包建议放在 `/path/to/reprolab-outputs/bundles`；导入目录放在 `outputs/reprolab/imported`。安装后可直接使用 `reprolab report check/pack/unpack`。
+证据包建议放在 `/path/to/reprolab-outputs/bundles`；为导入结果选择一个独立目录。安装后可直接使用 `reprolab report check/pack/unpack`。
 
 
 0.19.0a5 的项目报告增加每版 `*.progress.jsonl` 逐项事件，纳入原有内容校验和 ZIP 交付。新报告的进度摘要与中断观察会从原始事件重新核对；序号、选择来源或最终事件不一致不能产生通过结论。中断时仅忽略最后一条尚未写完的行，其他格式错误会明确显示。旧报告没有这些字段时继续按原有事件核对，不补造实时进度。含中断观察的新报告应使用 0.19.0a5 或更新版本读取。

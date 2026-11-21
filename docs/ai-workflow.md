@@ -128,11 +128,11 @@ draft-ID/
 
 这个命令不调用模型；它校验并保存你提供的响应，来源标为 external，不能当作 ReproLab 已自动接通该模型的证据。
 
-## 当前本机入口
+## 准备草稿
 
-    reprolab draft prepare /path/to/project --before BEFORE --after AFTER --issue "问题描述"
+    reprolab draft prepare /path/to/project --before BEFORE --after AFTER --issue "问题描述" --drafts /path/to/drafts
 
-本机 run.sh 自动给 prepare 使用 `work/reprolab/drafts`，给 generate 使用存在的 `work/reprolab/ai.local.json`，并继续把 verify/batch 报告放到 outputs/reprolab/reports。显式参数优先。
+将草稿和报告保存到被测源码仓库之外。
 
 接口依据：[OpenAI Chat Completions 文档](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)。仅验证兼容协议不代表任何第三方服务可用；真实模型接通情况应查阅本次版本验收记录。
 

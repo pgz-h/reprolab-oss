@@ -1,4 +1,5 @@
 """Cargo single-package library unit tests using the stable libtest console protocol."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,11 +21,13 @@ _SUMMARY = re.compile(
 )
 
 
-def _read_log(path):
+def _read_log(path, *, digest=None):
     with path.open('rb') as stream:
         payload = stream.read(_MAX_LOG + 1)
     if len(payload) > _MAX_LOG:
         return None
+    if digest is not None and hashlib.sha256(payload).hexdigest() != digest:
+        raise ValueError('Cargo 运行证据指纹发生变化。')
     try:
         return payload.decode('utf-8')
     except UnicodeError:
@@ -92,6 +95,36 @@ def _case_outcome(name, phase, text, *, catalog_size):
             and counts[:3] == (0, 0, 1) and phase['exit_code'] == 0):
         return 'skipped'
     return 'blocked'
+
+
+def _failure_output(name, text):
+    lines = text.strip('\r\n').splitlines()
+    start = ['running 1 test', f'test {name} ... FAILED', '', 'failures:', '', f'---- {name} stdout ----']
+    if (len(lines) <= len(start) + 4 or lines[:len(start)] != start
+            or lines[-4:-1] != ['failures:', f'    {name}', ''] or not _SUMMARY.fullmatch(lines[-1])):
+        return None
+    body = lines[len(start):-4]
+    if any(line == 'failures:' or re.fullmatch(r'---- .* (stdout|stderr) ----', line) for line in body):
+        return None
+    return '\n'.join(body).strip('\n') or None
+
+
+def check_failure_markers(evidence, hashes, run, markers):
+    checks = dict.fromkeys(markers, 'missing')
+    if not any(run['tests'].get(name) == 'failed' for name in markers) or _RECORD not in hashes:
+        return checks
+    record = json.loads(_read_log(evidence / _RECORD, digest=hashes[_RECORD]) or '')
+    for index, phase in enumerate(record['cases'], start=1):
+        name = phase['name']
+        log = f'test-{index:04d}.log'
+        if name not in markers or run['tests'].get(name) != 'failed' or log not in hashes:
+            continue
+        text = _read_log(evidence / log, digest=hashes[log])
+        if _case_outcome(name, phase, text, catalog_size=run['discovered_count']) == 'failed':
+            output = _failure_output(name, text)
+            if output:
+                checks[name] = 'matched' if markers[name] in output else 'mismatch'
+    return checks
 
 
 def _phase_ok(phase):

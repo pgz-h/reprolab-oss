@@ -1,6 +1,6 @@
 # ReproLab
 
-**0.19.0a25 Alpha** · [已发布版本与下载](https://github.com/pgz-h/reprolab-oss/releases)
+**0.19.0a26 Alpha 候选** · [已发布版本与下载](https://github.com/pgz-h/reprolab-oss/releases)
 
 **用实际测试核对一次修复，或比较一次项目改动，并留下可重放的证据。**
 
@@ -8,7 +8,9 @@ ReproLab 冻结改动前后的源码，在两版上运行同一份选定测试�
 
 [English](README.en.md) · [文档导航](docs/README.md) · [第一次使用](docs/first-run.md) · [安装](INSTALL.md) · [项目工作台](docs/project-workbench.md) · [CLI 与 CI](docs/cli-contract.md) · [更新记录](CHANGELOG.md)
 
-Rust、C 和 C++ 项目可用 Cargo 与 CMake/CTest 入口。见[支持范围与真实 zlib 复跑](docs/native-languages.md)。
+Rust、C 和 C++ 项目可用 Cargo 与 CMake/CTest 执行和复核 PR 测试。见[原生测试与 CI 接入](docs/native-languages.md)。
+
+Python wheel 发布可按维护者计划执行隔离的下游测试，并由接收方独立核对制品、环境、依赖输入和安装报告。见[wheel 功能证据与发布验收](docs/cli-contract.md#按维护者计划生成-wheel-功能证据)。
 
 ## 给自己的 PR 选测试
 

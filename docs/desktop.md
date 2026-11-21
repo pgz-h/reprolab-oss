@@ -1,4 +1,4 @@
-# ReproLab 桌面端（0.18.0a3.dev1 未发布验证版）
+# ReproLab 桌面端
 
 教学案例只随完整源码提供。安装包用于检查你自己的项目或接收已有证据。源码侧示例命令请在仓库根目录使用 `PYTHONPATH=src python -m reprolab`。
 
@@ -62,15 +62,7 @@
 
 “选择案例文件…”可以添加现有 JSON；文件仍保留在原位置，不复制或改写原案例。设置和最近选择会在退出后保存。案例、测试、快照源码或 Git 提交变化后，刷新列表会把旧结果标为历史；依赖环境变化不在指纹检查范围内，需要实际重跑。
 
-在这台已有工作区的 Mac 上，自动使用：
-
-- 案例：~/开源项目研究/work/reprolab/cases
-- 草稿：~/开源项目研究/work/reprolab/drafts
-- 报告：~/开源项目研究/outputs/reprolab/reports
-- 导入：~/开源项目研究/outputs/reprolab/imported
-- 桌面设置和活动记录：~/开源项目研究/work/reprolab/desktop
-
-其他安装默认把工作材料和设置放在 ~/Library/Application Support/ReproLab，报告放在 ~/Documents/ReproLab。目录均可在设置页选择；安装包不包含本机案例、用户模型配置、Key 或开发日志。内置教学案例与 humanize 单模块历史样例是项目自带的可公开示例。
+macOS 默认将案例、草稿和桌面设置保存在 `~/Library/Application Support/ReproLab`，将报告和导入材料保存在 `~/Documents/ReproLab`。目录可在设置中选择。已有独立桌面设置目录时，通过 `reprolab-desktop --state-dir /path/to/settings` 显式打开。教学案例随完整源码提供。
 
 ## 草稿与模型
 

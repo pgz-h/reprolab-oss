@@ -31,22 +31,24 @@ def test_defaults_use_standard_directories_even_with_a_development_workspace(tmp
     assert module.default_state_directory() == work / "desktop"
 
 
-def test_macos_preserves_existing_legacy_desktop_settings(tmp_path, monkeypatch):
+def test_existing_development_state_requires_explicit_directory(tmp_path, monkeypatch):
     module = store_module()
-    monkeypatch.setattr(module.sys, 'platform', 'darwin')
     monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path / 'AppData/Local'))
+    monkeypatch.setenv('XDG_DATA_HOME', str(tmp_path / '.local/share'))
     legacy = tmp_path / '开源项目研究/work/reprolab/desktop'
     legacy.mkdir(parents=True)
     settings = '{"reports":"existing-reports"}'
     (legacy / 'settings.json').write_text(settings)
-    restored = module.DesktopStore()
+    default = module.DesktopStore()
+    assert default.directory == module.application_directories()[0] / 'desktop'
+    assert default.settings['reports'] != 'existing-reports'
+    restored = module.DesktopStore(legacy)
     assert restored.directory == legacy
     assert restored.settings['reports'] == 'existing-reports'
     assert (legacy / 'settings.json').read_text() == settings
 
-    standard = tmp_path / 'Library/Application Support/ReproLab/desktop'
-    standard.mkdir(parents=True)
-    (standard / 'settings.json').write_text('{"reports":"new-reports"}')
+    (default.directory / 'settings.json').write_text('{"reports":"new-reports"}')
     assert module.DesktopStore().settings['reports'] == 'new-reports'
 
 

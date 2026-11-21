@@ -3,11 +3,14 @@ from collections import Counter, defaultdict
 import hashlib
 import html
 import json
+from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
 
+from .acceptance_plan import _unique_fields
 from .case import parse_test_target
 from .project_selections import validate_selection
+from .runtime import valid_python_environment
 
 MAX_RECORD_BYTES = 16 * 1024 * 1024
 PHASE_FILE = 'pytest-phases.json'
@@ -16,6 +19,7 @@ OUTCOMES = {
     'regression_passed': 'Passed on both',
     'regression_detected': 'New failure',
     'baseline_failure': 'Failed on both',
+    'same_wheel_divergence': 'Pass/fail diverged on the same wheel',
     'inconclusive': 'Uncertain',
 }
 EXIT_CODES = {'passed': 0, 'failed': 1, 'blocked': 2}
@@ -25,7 +29,10 @@ EXIT_CODES = {'passed': 0, 'failed': 1, 'blocked': 2}
 PHASE_PROBE = """
 import json
 class ReproLabPhases:
-    def __init__(self):
+    def __init__(self, environment, pytest_version, test_installation):
+        self.environment = environment
+        self.pytest_version = pytest_version
+        self.test_installation = test_installation
         self.events = []
         self.truncated = False
     def pytest_runtest_logreport(self, report):
@@ -36,7 +43,9 @@ class ReproLabPhases:
     def pytest_sessionfinish(self, session, exitstatus):
         truncated = self.truncated or len(session.items) > 10000
         data = {'schema_version': 1, 'exit_code': int(exitstatus), 'truncated': truncated,
-                'selected': [item.nodeid for item in session.items[:10000] if len(item.nodeid) <= 4000], 'events': self.events}
+                'selected': [item.nodeid for item in session.items[:10000] if len(item.nodeid) <= 4000],
+                'events': self.events, 'environment': self.environment, 'pytest_version': self.pytest_version,
+                'test_installation': self.test_installation}
         raw = json.dumps(data).encode('utf-8')
         if len(raw) > 16 * 1024 * 1024:
             raw = b'{"schema_version":1,"truncated":true}'
@@ -184,6 +193,32 @@ def _phase_index(payload, exit_code, files):
         return None
 
 
+def recorded_test_context(payload, run):
+    """Read execution details bound to a completed, hash-checked phase record."""
+    exit_code = run.get('exit_code')
+    if (not payload or run.get('status') != 'completed' or type(exit_code) is not int
+            or exit_code not in (0, 1)):
+        return {}
+    try:
+        data = json.loads(payload, object_pairs_hook=_unique_fields)
+        if (type(data['schema_version']) is not int or data['schema_version'] != 1
+                or data['truncated'] is not False
+                or type(data['exit_code']) is not int or data['exit_code'] != exit_code):
+            return {}
+        environment = data.get('environment')
+        installation = data.get('test_installation')
+        context = {'environment': environment} if valid_python_environment(environment) else {}
+        if installation == {'mode': 'existing_environment'}:
+            context['installation'] = installation
+        elif (isinstance(installation, dict) and installation.keys() == {'mode', 'wheelhouse_sha256'}
+              and installation['mode'] == 'isolated_venv' and isinstance(installation['wheelhouse_sha256'], str)
+              and re.fullmatch(r'[0-9a-f]{64}', installation['wheelhouse_sha256'])):
+            context['installation'] = installation
+        return context
+    except (KeyError, TypeError, ValueError, RecursionError):
+        return {}
+
+
 def _phase_outcome(events):
     if ([row[0] for row in events] != ['setup', 'call', 'teardown'] or any(row[2] for row in events)
             or events[0][1] != 'passed' or events[2][1] != 'passed'):
@@ -196,6 +231,8 @@ def _observations(run, document, phase_payload, selections, files):
     if run.get('install_status') != 'completed' or run.get('install_exit_code') != 0:
         return {}, {'installation_incomplete': 1}
     exit_code = run.get('exit_code')
+    if run.get('status') == 'completed' and exit_code == 74 and not phase_payload:
+        return {}, {'module_origin_unverified': 1}
     if run.get('status') != 'completed' or type(exit_code) is not int or exit_code not in (0, 1):
         return {}, {'pytest_incomplete': 1}
     parsed = _junit_cases(document)
@@ -295,6 +332,10 @@ def compare_wheel_results(record, snapshot, documents, phases, *, policy, requir
 
     labels = {('failed', 'passed'): 'improved', ('passed', 'passed'): 'regression_passed',
               ('passed', 'failed'): 'regression_detected', ('failed', 'failed'): 'baseline_failure'}
+    left_wheel, right_wheel = (record['wheel_artifacts'][side] for side in ('before', 'after'))
+    same_wheel = (left_wheel['sha256'] == right_wheel['sha256']
+                  and Path(left_wheel['file']).name == Path(right_wheel['file']).name)
+    uncertain = {'inconclusive', 'same_wheel_divergence'}
     entries = []
     verdicts = {}
     existing = Counter()
@@ -303,6 +344,8 @@ def compare_wheel_results(record, snapshot, documents, phases, *, policy, requir
         left, right = (outcomes[side].get(node, ('unobserved', None)) for side in ('before', 'after'))
         before, after = left[0], right[0]
         verdict = labels.get((before, after), 'inconclusive')
+        if same_wheel and verdict in ('improved', 'regression_detected'):
+            verdict = 'same_wheel_divergence'
         verdicts[node] = verdict
         entry = {'test_id': _visible(node, include_ids), 'before': before, 'after': after, 'status': verdict}
         if verdict == 'baseline_failure':
@@ -315,11 +358,11 @@ def compare_wheel_results(record, snapshot, documents, phases, *, policy, requir
     required_rows = []
     for node in targets:
         outcome = verdicts.get(node, 'inconclusive')
-        status = ('passed' if outcome == 'improved' else 'blocked' if outcome == 'inconclusive' else 'failed')
+        status = ('passed' if outcome == 'improved' else 'blocked' if outcome in uncertain else 'failed')
         required_rows.append({'test_id': _visible(node, include_ids), 'status': status, 'outcome': outcome})
     if counts.get('regression_detected') or any(row['status'] == 'failed' for row in required_rows):
         decision = 'failed'
-    elif (any(issues.values()) or not nodes or counts.get('inconclusive')
+    elif (any(issues.values()) or not nodes or uncertain.intersection(counts)
           or any(row['status'] == 'blocked' for row in required_rows)
           or existing['changed'] or existing['unverified']
           or (policy == 'regression' and counts.get('baseline_failure'))):
@@ -340,15 +383,85 @@ def _markdown_identity(value):
             .replace('`', '&#96;').replace('\n', ' ').replace('\r', ' '))
 
 
-def render_wheel_markdown(result):
-    comparison = result['comparison']
-    gate = comparison['gate']
-    lines = ['### ReproLab downstream wheel comparison', '']
+def _environment_description(environment):
+    if environment is None:
+        return 'unknown'
+    return (f'{environment["implementation"]} {environment["python_version"]} · '
+            f'{environment["platform"]}/{environment["machine"]}')
+
+
+def render_wheel_error_markdown(*, exit_policy, cancelled):
+    status = 'cancelled' if cancelled else 'blocked'
+    return ('### ReproLab wheel check\n\n'
+            f'- Exit policy · {exit_policy} · {status} · 2\n'
+            '- Business gate · unavailable\n'
+            '- Diagnostic details are on standard error.\n')
+
+
+def render_wheel_markdown(result, *, exit_policy, exit_code):
+    acceptance = result.get('review_plan_acceptance')
+    sender_plan = result.get('functional_review_plan_sha256')
+    execution = result.get('functional_plan_execution')
+    if acceptance:
+        title = 'ReproLab wheel release acceptance'
+    elif sender_plan:
+        title = 'ReproLab planned wheel functional check'
+    else:
+        title = 'ReproLab downstream wheel comparison'
+    exit_status = 'ready' if result.get('preflight_only') else {0: 'passed', 1: 'failed', 2: 'blocked'}[exit_code]
+    lines = [f'### {title}', '', f'- Exit policy · {exit_policy} · {exit_status} · {exit_code}']
+    comparison = result.get('comparison')
+    if comparison is not None:
+        gate = comparison['gate']
+        lines.append(f'- Business gate ({gate["policy"]}) · {gate["status"]} · {gate["exit_code"]}')
+    else:
+        lines.append('- Business gate · pending execution' if result.get('preflight_only')
+                     else '- Business gate · unavailable')
+    if sender_plan:
+        lines.append(f'- Sender plan · `{sender_plan}`')
+        if result.get('preflight_only'):
+            return '\n'.join(lines) + '\n'
+        if execution.get('receiver_install_check_required'):
+            lines.append('- Required clean installation · supply the report at receiver verification')
+    if acceptance:
+        lines.append(f'- Receiver plan · `{acceptance["plan_sha256"]}`')
+        if acceptance.get('scope') == 'matched':
+            lines.append('- Receiver scope and local Git snapshot · matched')
+    scope = acceptance or execution
+    if scope:
+        test = scope.get('test_environment', {})
+        observed = test.get('observed', {})
+        lines.append('- Functional test environment · before ' + _environment_description(observed.get('before'))
+                     + ' · after ' + _environment_description(observed.get('after')))
+        if test.get('required'):
+            lines.append('- Required functional test environment · ' + _environment_description(test['required']))
+        if test_install := scope.get('test_installation'):
+            sources = test_install.get('observed', {})
+            names = {'isolated_venv': 'isolated venv', 'existing_environment': 'existing environment'}
+            lines.append('- Functional dependency source · before '
+                         + names.get((sources.get('before') or {}).get('mode'), 'unknown') + ' · after '
+                         + names.get((sources.get('after') or {}).get('mode'), 'unknown'))
+            if fingerprint := test_install.get('required_wheelhouse_sha256'):
+                lines.append(f'- Required functional wheelhouse inputs · `{fingerprint}`')
+        if installation := scope.get('installation'):
+            lines.append('- Clean installation · passed · ' + _environment_description(installation['environment']))
+            if wheelhouse := installation.get('wheelhouse_sha256'):
+                lines.append(f'- Approved clean-install wheelhouse inputs · `{wheelhouse}`')
+        elif scope.get('required_install_environment'):
+            lines.append('- Required clean installation environment · '
+                         + _environment_description(scope['required_install_environment']))
+        if 'mismatched_fields' in scope:
+            lines.append(f'- Reason · `{scope["reason"]}`')
+            lines.extend(f'- Scope check blocked · `{field}`' for field in scope['mismatched_fields'])
+            return '\n'.join(lines) + '\n'
+        lines.append('')
+    else:
+        lines += ['- Comparison uses inputs declared by the evidence.']
+
     if 'integrity' in result:
         lines.append(f'- Evidence integrity · {result["integrity"]}')
     lines += [
         f'- Legacy aggregate · {result["status"]}',
-        f'- Gate ({gate["policy"]}) · {gate["status"]} · {gate["exit_code"]}',
         '',
         '| Outcome | Cases |',
         '| --- | ---: |',
@@ -374,7 +487,7 @@ def render_wheel_markdown(result):
             lines.append(f'- {len(goals) - limit} additional requirements in the JSON comparison.')
 
     entries = comparison['entries']
-    priority = {'regression_detected': 0, 'inconclusive': 1, 'improved': 2, 'baseline_failure': 3,
+    priority = {'regression_detected': 0, 'same_wheel_divergence': 1, 'inconclusive': 1, 'improved': 2, 'baseline_failure': 3,
                 'regression_passed': 4}
     detail = entries if len(entries) <= limit else [row for row in entries if row['status'] != 'regression_passed']
     visible = sorted(detail, key=lambda row: priority[row['status']])[:limit]
